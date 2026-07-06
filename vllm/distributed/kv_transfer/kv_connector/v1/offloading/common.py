@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -9,6 +10,65 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.v1.kv_offload.base import LoadStoreSpec
 
 ReqId = str
+
+FANOUT_LAYERWISE_LOAD_AUTO = "auto"
+DEFAULT_FANOUT_LAYERWISE_LOAD_THRESHOLD_BYTES = 256 * 1024 * 1024
+
+
+def parse_fanout_layerwise_load(value: object) -> bool | None:
+    """Parse fanout_layerwise_load.
+
+    Returns:
+        True/False for explicit modes, or None for auto.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == FANOUT_LAYERWISE_LOAD_AUTO:
+            return None
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(
+        f"fanout_layerwise_load must be a boolean or 'auto', got {value!r}"
+    )
+
+
+def resolve_fanout_layerwise_load(
+    value: object,
+    *,
+    fanout_offload: bool,
+    has_full_cudagraphs: bool,
+    estimated_load_bytes: int = 0,
+    threshold_bytes: int = DEFAULT_FANOUT_LAYERWISE_LOAD_THRESHOLD_BYTES,
+) -> bool:
+    parsed = parse_fanout_layerwise_load(value)
+    if parsed is not None:
+        return parsed
+    if not fanout_offload:
+        return False
+    # FULL cudagraph replay was faster than layerwise overlap for the long
+    # fanout workload we profiled. Keep it unless the user explicitly asks for
+    # layerwise load.
+    if has_full_cudagraphs:
+        return False
+    if threshold_bytes <= 0:
+        return True
+    return estimated_load_bytes >= threshold_bytes
+
+
+def fanout_profiling_enabled(
+    extra_config: dict[str, Any],
+    vllm_config: Any,
+) -> bool:
+    if bool(extra_config.get("fanout_profile", False)):
+        return True
+    profiler_config = getattr(vllm_config, "profiler_config", None)
+    return getattr(profiler_config, "profiler", None) is not None
 
 
 @dataclass(slots=True)

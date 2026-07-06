@@ -211,6 +211,145 @@ def test_transfer(
         mmap_region.cleanup()
 
 
+@torch.inference_mode()
+def test_layerwise_load(default_vllm_config) -> None:
+    num_layers = 3
+    layer_names = tuple(f"model.layers.{idx}.self_attn" for idx in range(num_layers))
+    layer_page_size_bytes = 256
+    page_size_bytes = num_layers * layer_page_size_bytes
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+
+    gpu_tensor = torch.zeros(
+        (num_gpu_blocks, page_size_bytes),
+        dtype=torch.int8,
+        device=f"{DEVICE_TYPE}:0",
+    )
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(
+                tensor=gpu_tensor,
+                page_size_bytes=page_size_bytes,
+            )
+        ],
+        group_data_refs=[
+            [
+                CanonicalKVCacheRef(
+                    tensor_idx=0,
+                    page_size_bytes=page_size_bytes,
+                )
+            ]
+        ],
+    )
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches,
+        block_size_factor=1,
+        num_cpu_blocks=num_cpu_blocks,
+    )
+    assert worker.configure_layerwise_load(layer_names)
+
+    cpu_blocks = [2, 3]
+    gpu_blocks = [5, 6]
+    worker.cpu_tensors[0].random_()
+    expected = worker.cpu_tensors[0][cpu_blocks].clone()
+
+    assert worker.submit_load(
+        11,
+        CPULoadStoreSpec(cpu_blocks),
+        GPULoadStoreSpec(
+            gpu_blocks,
+            group_sizes=(len(gpu_blocks),),
+            block_indices=(0,),
+        ),
+    )
+    transfer = worker._load_handler._transfers[0]
+    assert len(transfer.layer_events) == num_layers
+
+    for layer_name in layer_names:
+        worker.wait_for_layer_load(layer_name)
+    worker.wait({11})
+
+    torch.testing.assert_close(gpu_tensor[gpu_blocks].cpu(), expected)
+    finished = worker.get_finished()
+    assert len(finished) == 1
+    assert finished[0].job_id == 11
+    assert finished[0].transfer_size == len(gpu_blocks) * page_size_bytes
+    worker.shutdown()
+
+
+@torch.inference_mode()
+def test_layerwise_load_separate_tensors(default_vllm_config) -> None:
+    num_layers = 3
+    layer_names = tuple(f"model.layers.{idx}.self_attn" for idx in range(num_layers))
+    page_size_bytes = 256
+    num_gpu_blocks = 8
+    num_cpu_blocks = 16
+
+    gpu_tensors = [
+        torch.zeros(
+            (num_gpu_blocks, page_size_bytes),
+            dtype=torch.int8,
+            device=f"{DEVICE_TYPE}:0",
+        )
+        for _ in range(num_layers)
+    ]
+    kv_caches = CanonicalKVCaches(
+        tensors=[
+            CanonicalKVCacheTensor(
+                tensor=tensor,
+                page_size_bytes=page_size_bytes,
+            )
+            for tensor in gpu_tensors
+        ],
+        group_data_refs=[
+            [
+                CanonicalKVCacheRef(
+                    tensor_idx=idx,
+                    page_size_bytes=page_size_bytes,
+                )
+                for idx in range(num_layers)
+            ]
+        ],
+    )
+    worker = CPUOffloadingWorker(
+        kv_caches=kv_caches,
+        block_size_factor=1,
+        num_cpu_blocks=num_cpu_blocks,
+    )
+    assert worker.configure_layerwise_load(layer_names)
+
+    cpu_blocks = [2, 3]
+    gpu_blocks = [5, 6]
+    expected = []
+    for tensor in worker.cpu_tensors:
+        tensor.random_()
+        expected.append(tensor[cpu_blocks].clone())
+
+    assert worker.submit_load(
+        12,
+        CPULoadStoreSpec(cpu_blocks),
+        GPULoadStoreSpec(
+            gpu_blocks,
+            group_sizes=(len(gpu_blocks),),
+            block_indices=(0,),
+        ),
+    )
+    transfer = worker._load_handler._transfers[0]
+    assert len(transfer.layer_events) == num_layers
+
+    for layer_name in layer_names:
+        worker.wait_for_layer_load(layer_name)
+    worker.wait({12})
+
+    for gpu_tensor, expected_tensor in zip(gpu_tensors, expected):
+        torch.testing.assert_close(gpu_tensor[gpu_blocks].cpu(), expected_tensor)
+    finished = worker.get_finished()
+    assert len(finished) == 1
+    assert finished[0].job_id == 12
+    assert finished[0].transfer_size == (len(gpu_blocks) * page_size_bytes * num_layers)
+    worker.shutdown()
+
+
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
 @pytest.mark.parametrize("num_mappings_per_group", NUM_MAPPINGS_PER_GROUP)
 @pytest.mark.parametrize("gpu_page_size_bytes", GPU_PAGE_SIZES)

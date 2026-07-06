@@ -470,6 +470,14 @@ class OffloadingWorker(ABC):
     @abstractmethod
     def wait(self, job_ids: set[int]) -> None: ...
 
+    def configure_layerwise_load(self, layer_names: tuple[str, ...]) -> bool:
+        """Configure layer-ordered loads when supported by the worker."""
+        return False
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        """Make the current compute stream wait for a loaded layer."""
+        return
+
     def shutdown(self) -> None:
         return
 

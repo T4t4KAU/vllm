@@ -69,6 +69,7 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    layer_events: tuple[torch.Event, ...] = ()
 
 
 def compute_sub_block_ptrs(
@@ -209,8 +210,50 @@ class SingleDirectionOffloadingHandler:
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
+        self._layer_event_pool: list[torch.Event] = []
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._layer_names: tuple[str, ...] = ()
+        self._layer_page_size_bytes = 0
+        self._cross_layer_tensor = False
+
+    def configure_layerwise_load(self, layer_names: tuple[str, ...]) -> bool:
+        if self.gpu_to_cpu or not layer_names:
+            return False
+        if len(self.kv_cache_groups_data_refs) != 1:
+            return False
+
+        data_refs = self.kv_cache_groups_data_refs[0]
+        if len(data_refs) == len(layer_names):
+            self._layer_names = layer_names
+            return True
+
+        if len(self.src_tensors) != 1 or len(self.dst_tensors) != 1:
+            return False
+        if len(data_refs) != 1:
+            return False
+
+        data_ref = data_refs[0]
+        if data_ref.tensor_idx != 0 or data_ref.page_size_bytes % len(layer_names):
+            return False
+
+        self._layer_names = layer_names
+        self._layer_page_size_bytes = data_ref.page_size_bytes // len(layer_names)
+        self._cross_layer_tensor = True
+        return True
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._layer_names:
+            return
+        try:
+            layer_idx = self._layer_names.index(layer_name)
+        except ValueError:
+            return
+
+        compute_stream = current_platform.current_stream()
+        for transfer in self._transfers:
+            if transfer.layer_events:
+                compute_stream.wait_event(transfer.layer_events[layer_idx])
 
     def transfer_async(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
@@ -261,18 +304,23 @@ class SingleDirectionOffloadingHandler:
         ):
             num_copy_ops += group_size * len(group_data_refs)
 
+        num_layers = len(self._layer_names) or 1
+        num_descriptors = (
+            num_copy_ops * num_layers if self._cross_layer_tensor else num_copy_ops
+        )
+
         # reuse a pooled buffer set, growing it if this transfer needs more room
         batch_src, batch_dst, batch_sizes = (
             self._buffer_pool.pop()
             if self._buffer_pool
-            else _new_descriptor_buffers(num_copy_ops)
+            else _new_descriptor_buffers(num_descriptors)
         )
-        if batch_src.numel() < num_copy_ops:
-            batch_src, batch_dst, batch_sizes = _new_descriptor_buffers(num_copy_ops)
+        if batch_src.numel() < num_descriptors:
+            batch_src, batch_dst, batch_sizes = _new_descriptor_buffers(num_descriptors)
 
-        src = batch_src[:num_copy_ops]
-        dst = batch_dst[:num_copy_ops]
-        sizes = batch_sizes[:num_copy_ops]
+        src = batch_src[:num_descriptors]
+        dst = batch_dst[:num_descriptors]
+        sizes = batch_sizes[:num_descriptors]
         all_src = src.numpy()
         all_dst = dst.numpy()
         all_sizes = sizes.numpy()
@@ -338,6 +386,17 @@ class SingleDirectionOffloadingHandler:
         assert dst_offset == num_dst_blocks
         assert op_idx == num_copy_ops
 
+        if self._cross_layer_tensor:
+            layer_bytes = self._layer_page_size_bytes
+            base_src = all_src[:num_copy_ops].copy()
+            base_dst = all_dst[:num_copy_ops].copy()
+            for layer_idx in range(num_layers):
+                start = layer_idx * num_copy_ops
+                end = start + num_copy_ops
+                all_src[start:end] = base_src + layer_idx * layer_bytes
+                all_dst[start:end] = base_dst + layer_idx * layer_bytes
+                all_sizes[start:end] = layer_bytes
+
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )
@@ -367,15 +426,40 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
+        layer_events: list[torch.Event] = []
         with current_platform.stream(stream):
             start_event.record(stream)
             if num_copy_ops > 0:
-                self._swap_blocks_batch(
-                    src,
-                    dst,
-                    sizes,
-                    is_src_access_order_any=is_src_access_order_any,
-                )
+                if self._layer_names:
+                    descriptors_per_layer = (
+                        num_copy_ops
+                        if self._cross_layer_tensor
+                        else num_copy_ops // num_layers
+                    )
+                    assert descriptors_per_layer * num_layers == num_descriptors
+                    for layer_idx in range(num_layers):
+                        start = layer_idx * descriptors_per_layer
+                        end = start + descriptors_per_layer
+                        self._swap_blocks_batch(
+                            src[start:end],
+                            dst[start:end],
+                            sizes[start:end],
+                            is_src_access_order_any=is_src_access_order_any,
+                        )
+                        layer_event = (
+                            self._layer_event_pool.pop()
+                            if self._layer_event_pool
+                            else torch.Event()
+                        )
+                        layer_event.record(stream)
+                        layer_events.append(layer_event)
+                else:
+                    self._swap_blocks_batch(
+                        src,
+                        dst,
+                        sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -389,6 +473,7 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                layer_events=tuple(layer_events),
             )
         )
 
@@ -413,6 +498,7 @@ class SingleDirectionOffloadingHandler:
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
+            self._layer_event_pool.extend(transfer.layer_events)
             self._buffer_pool.append(
                 (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
             )
@@ -432,6 +518,7 @@ class SingleDirectionOffloadingHandler:
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()
+        self._layer_event_pool.clear()
         self._buffer_pool.clear()
 
         if self._pin_thread is not None:
@@ -594,6 +681,12 @@ class CPUOffloadingWorker(OffloadingWorker):
     ) -> bool:
         """Async CPU -> GPU."""
         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
+
+    def configure_layerwise_load(self, layer_names: tuple[str, ...]) -> bool:
+        return self._load_handler.configure_layerwise_load(layer_names)
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        self._load_handler.wait_for_layer_load(layer_name)
 
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()

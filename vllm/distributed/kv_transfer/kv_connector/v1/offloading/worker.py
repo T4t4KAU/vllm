@@ -6,9 +6,11 @@ from dataclasses import replace
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    DEFAULT_FANOUT_LAYERWISE_LOAD_THRESHOLD_BYTES,
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
+    resolve_fanout_layerwise_load,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
@@ -36,9 +38,46 @@ class OffloadingConnectorWorker:
     def __init__(self, spec: OffloadingSpec):
         self.spec = spec
         self.worker: OffloadingWorker | None = None
+        extra_config = getattr(spec, "extra_config", {})
+        if not isinstance(extra_config, dict):
+            extra_config = {}
+        layerwise_threshold_bytes = int(
+            extra_config.get(
+                "fanout_layerwise_load_threshold_bytes",
+                DEFAULT_FANOUT_LAYERWISE_LOAD_THRESHOLD_BYTES,
+            )
+        )
+        fanout_offload = bool(
+            extra_config.get(
+                "fanout_offload",
+                getattr(
+                    getattr(spec.vllm_config, "attention_config", None),
+                    "backend",
+                    None,
+                )
+                is not None
+                and spec.vllm_config.attention_config.backend.name == "FORK_ATTN",
+            )
+        )
+        estimated_load_bytes = int(
+            extra_config.get(
+                "fanout_budget_blocks",
+                64,
+            )
+        ) * int(getattr(spec, "kv_bytes_per_offloaded_block", 0) or 0)
+        self._layerwise_load = resolve_fanout_layerwise_load(
+            extra_config.get("fanout_layerwise_load", "auto"),
+            fanout_offload=fanout_offload,
+            has_full_cudagraphs=(
+                spec.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ),
+            estimated_load_bytes=estimated_load_bytes,
+            threshold_bytes=layerwise_threshold_bytes,
+        )
 
         # job_id -> req_id for in-flight loads.
         self._load_jobs: dict[int, ReqId] = {}
+        self._synchronous_load_jobs: set[int] = set()
         self._unsubmitted_store_jobs: list[
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
@@ -220,6 +259,18 @@ class OffloadingConnectorWorker:
         )
 
         self._init_worker(canonical_kv_caches)
+        if self._layerwise_load:
+            kv_cache_groups = kv_cache_config.kv_cache_groups
+            if len(kv_cache_groups) != 1:
+                raise ValueError(
+                    "fanout_layerwise_load requires one uniform attention KV group"
+                )
+            layer_names = tuple(kv_cache_groups[0].layer_names)
+            assert self.worker is not None
+            if not self.worker.configure_layerwise_load(layer_names):
+                raise ValueError(
+                    "fanout_layerwise_load could not map KV tensors to layers"
+                )
 
     def register_cross_layers_kv_cache(
         self, kv_cache: torch.Tensor, attn_backend: type[AttentionBackend]
@@ -267,6 +318,14 @@ class OffloadingConnectorWorker:
         )
 
         self._init_worker(canonical_kv_caches)
+        if self._layerwise_load:
+            layer_names = tuple(kv_cache_groups[0].layer_names)
+            assert self.worker is not None
+            if not self.worker.configure_layerwise_load(layer_names):
+                raise ValueError(
+                    "fanout_layerwise_load requires one uniform cross-layer "
+                    "attention KV cache"
+                )
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
@@ -287,9 +346,16 @@ class OffloadingConnectorWorker:
 
         for job_id, entry in metadata.load_jobs.items():
             self._load_jobs[job_id] = entry.req_id
+            if self._layerwise_load:
+                self._synchronous_load_jobs.add(job_id)
             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
             success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
             assert success
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if self._layerwise_load:
+            assert self.worker is not None
+            self.worker.wait_for_layer_load(layer_name)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for job_id, entry in metadata.store_jobs.items():
@@ -333,7 +399,9 @@ class OffloadingConnectorWorker:
 
             self._connector_worker_meta.mark_completed(job_id)
             req_id = self._load_jobs.pop(job_id, None)
-            if req_id is not None:
+            is_synchronous_load = job_id in self._synchronous_load_jobs
+            self._synchronous_load_jobs.discard(job_id)
+            if req_id is not None and not is_synchronous_load:
                 finished_recving.add(req_id)
 
         return set(), finished_recving
@@ -349,6 +417,7 @@ class OffloadingConnectorWorker:
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
+        self._synchronous_load_jobs.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
         if self.worker is not None:
             self.worker.shutdown()

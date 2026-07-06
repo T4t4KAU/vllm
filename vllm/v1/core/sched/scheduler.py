@@ -3,10 +3,11 @@
 import itertools
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -63,6 +64,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+FORK_ATTN_BACKEND_NAME = "FORK_ATTN"
 
 
 class Scheduler(SchedulerInterface):
@@ -182,6 +185,11 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+        (
+            self.fork_fanout_admission_window,
+            self.fork_fanout_admission_max_bypasses,
+        ) = self._init_fork_fanout_admission_config()
+        self.fork_fanout_admission_bypass_counts: dict[str, int] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -935,6 +943,7 @@ class Scheduler(SchedulerInterface):
                         )
 
                 request = request_queue.pop_request()
+                self.fork_fanout_admission_bypass_counts.pop(request_id, None)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1842,7 +1851,10 @@ class Scheduler(SchedulerInterface):
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
-            return self.skipped_waiting or self.waiting or None
+            if self.skipped_waiting:
+                return self.skipped_waiting
+            self._promote_fanout_waiting_request()
+            return self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
@@ -1851,6 +1863,133 @@ class Scheduler(SchedulerInterface):
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
+
+    def _init_fork_fanout_admission_config(self) -> tuple[int, int]:
+        backend = self.vllm_config.attention_config.backend
+        if getattr(backend, "name", None) != FORK_ATTN_BACKEND_NAME:
+            return 0, 0
+
+        extra_config: dict[str, Any] = {}
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is not None:
+            raw_extra_config = kv_transfer_config.kv_connector_extra_config
+            if isinstance(raw_extra_config, dict):
+                extra_config = raw_extra_config
+
+        window = int(
+            extra_config.get(
+                "fanout_admission_window",
+                envs.VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW,
+            )
+        )
+        max_bypasses = int(
+            extra_config.get(
+                "fanout_admission_max_bypasses",
+                envs.VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES,
+            )
+        )
+        if window < 0:
+            raise ValueError("fanout_admission_window must be >= 0")
+        if max_bypasses < 0:
+            raise ValueError("fanout_admission_max_bypasses must be >= 0")
+        return window, max_bypasses
+
+    def _promote_fanout_waiting_request(self) -> None:
+        window = self.fork_fanout_admission_window
+        if window <= 1 or not self.running or not self.waiting:
+            return
+
+        running_block_hashes = [
+            request.block_hashes for request in self.running if request.block_hashes
+        ]
+        if not running_block_hashes:
+            return
+
+        head_request = self.waiting.peek_request()
+        head_request_id = head_request.request_id
+        max_bypasses = self.fork_fanout_admission_max_bypasses
+        if (
+            max_bypasses > 0
+            and self.fork_fanout_admission_bypass_counts.get(head_request_id, 0)
+            >= max_bypasses
+        ):
+            self.fork_fanout_admission_bypass_counts.pop(head_request_id, None)
+            return
+
+        best_request: Request | None = None
+        best_priority: tuple[int, int, int, int, float, int] | None = None
+        best_reuse_score = 0
+        best_queue_index = 0
+
+        waiting_window = itertools.islice(self.waiting, window)
+        for queue_index, request in enumerate(waiting_window):
+            reuse_score, prefix_blocks, fanout = self._fanout_admission_score(
+                request.block_hashes,
+                running_block_hashes,
+            )
+            suffix_blocks = max(0, len(request.block_hashes) - prefix_blocks)
+            priority = (
+                -reuse_score,
+                -fanout,
+                -prefix_blocks,
+                suffix_blocks,
+                request.arrival_time,
+                queue_index,
+            )
+            if best_priority is None or priority < best_priority:
+                best_request = request
+                best_priority = priority
+                best_reuse_score = reuse_score
+                best_queue_index = queue_index
+
+        if best_request is None or best_queue_index == 0 or best_reuse_score <= 0:
+            return
+
+        self.fork_fanout_admission_bypass_counts[head_request_id] = (
+            self.fork_fanout_admission_bypass_counts.get(head_request_id, 0) + 1
+        )
+        self.fork_fanout_admission_bypass_counts.pop(best_request.request_id, None)
+        self.waiting.remove_request(best_request)
+        self.waiting.prepend_request(best_request)
+
+    @classmethod
+    def _fanout_admission_score(
+        cls,
+        request_block_hashes: Sequence[Any],
+        running_block_hashes: Sequence[Sequence[Any]],
+    ) -> tuple[int, int, int]:
+        common_prefixes = sorted(
+            (
+                cls._common_block_prefix_len(request_block_hashes, block_hashes)
+                for block_hashes in running_block_hashes
+            ),
+            reverse=True,
+        )
+        best_reuse_score = 0
+        best_prefix_blocks = 0
+        best_fanout = 0
+        for index, prefix_blocks in enumerate(common_prefixes):
+            if prefix_blocks <= 0:
+                break
+            fanout = index + 2
+            reuse_score = prefix_blocks * fanout
+            if reuse_score > best_reuse_score:
+                best_reuse_score = reuse_score
+                best_prefix_blocks = prefix_blocks
+                best_fanout = fanout
+        return best_reuse_score, best_prefix_blocks, best_fanout
+
+    @staticmethod
+    def _common_block_prefix_len(
+        left: Sequence[Any],
+        right: Sequence[Any],
+    ) -> int:
+        common = 0
+        for left_hash, right_hash in zip(left, right):
+            if left_hash != right_hash:
+                break
+            common += 1
+        return common
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""

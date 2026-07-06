@@ -5,8 +5,10 @@ from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
 
+import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
@@ -14,16 +16,21 @@ from vllm.config import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
+    AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -451,6 +458,187 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+def _is_fork_attention_backend(vllm_config: VllmConfig) -> bool:
+    attention_config = getattr(vllm_config, "attention_config", None)
+    backend = getattr(attention_config, "backend", None)
+    return getattr(backend, "name", None) == "FORK_ATTN"
+
+
+def get_fork_cudagraph_prefix_info(
+    vllm_config: VllmConfig,
+    attn_groups: list[list[AttentionGroup]],
+    num_reqs: int,
+    uniform_token_count: int | None,
+    num_common_prefix_blocks: Sequence[int] | None,
+) -> tuple[int, int] | None:
+    if not _is_fork_attention_backend(vllm_config):
+        return None
+    if uniform_token_count != 1 or num_reqs <= 0:
+        return None
+    if not num_common_prefix_blocks:
+        return None
+
+    try:
+        num_sms = current_platform.num_compute_units()
+    except NotImplementedError:
+        num_sms = 1
+
+    query_lens = np.ones(num_reqs, dtype=np.int32)
+    for i, groups in enumerate(attn_groups):
+        if i >= len(num_common_prefix_blocks) or num_common_prefix_blocks[i] <= 0:
+            continue
+        for attn_group in groups:
+            if attn_group.backend.get_name() != "FORK_ATTN":
+                continue
+            kv_cache_spec = attn_group.kv_cache_spec
+            if not isinstance(kv_cache_spec, AttentionSpec):
+                continue
+            common_prefix_len = num_common_prefix_blocks[i] * kv_cache_spec.block_size
+            use_sliding_window = isinstance(kv_cache_spec, SlidingWindowSpec) or (
+                isinstance(kv_cache_spec, FullAttentionSpec)
+                and kv_cache_spec.sliding_window is not None
+            )
+            use_local_attention = isinstance(
+                kv_cache_spec, ChunkedLocalAttentionSpec
+            ) or (
+                isinstance(kv_cache_spec, FullAttentionSpec)
+                and kv_cache_spec.attention_chunk_size is not None
+            )
+            builder = attn_group.get_metadata_builder(0)
+            num_query_heads = getattr(builder, "num_heads_q", 0)
+            if num_query_heads <= 0 or kv_cache_spec.num_kv_heads <= 0:
+                continue
+            if not builder.use_cascade_attention(
+                common_prefix_len=common_prefix_len,
+                query_lens=query_lens,
+                num_query_heads=num_query_heads,
+                num_kv_heads=kv_cache_spec.num_kv_heads,
+                use_alibi=False,
+                use_sliding_window=use_sliding_window,
+                use_local_attention=use_local_attention,
+                num_sms=num_sms,
+                dcp_world_size=1,
+            ):
+                continue
+            return num_common_prefix_blocks[i], kv_cache_spec.block_size
+    return None
+
+
+def get_fork_attention_block_size(
+    vllm_config: VllmConfig,
+    attn_groups: list[list[AttentionGroup]],
+) -> int | None:
+    if not _is_fork_attention_backend(vllm_config):
+        return None
+    for groups in attn_groups:
+        for attn_group in groups:
+            if attn_group.backend.get_name() != "FORK_ATTN":
+                continue
+            kv_cache_spec = attn_group.kv_cache_spec
+            if isinstance(kv_cache_spec, AttentionSpec):
+                return kv_cache_spec.block_size
+    return None
+
+
+def should_use_fork_dynamic_forest(
+    vllm_config: VllmConfig,
+    num_reqs: int,
+    uniform_token_count: int | None,
+    fork_prefix_chunk_bucket: int | None,
+    fork_forest_cta_bucket: int | None = None,
+) -> bool:
+    if not envs.VLLM_FORK_ATTN_ENABLE_FOREST:
+        return False
+    if not _is_fork_attention_backend(vllm_config):
+        return False
+    if uniform_token_count != 1 or num_reqs <= 1:
+        return False
+    return fork_prefix_chunk_bucket is None and fork_forest_cta_bucket is None
+
+
+def set_fork_cudagraph_prefix_bucket(
+    attn_groups: list[list[AttentionGroup]],
+    fork_prefix_chunk_bucket: int | None,
+    fork_forest_cta_bucket: int | None = None,
+) -> None:
+    for groups in attn_groups:
+        for attn_group in groups:
+            if attn_group.backend.get_name() != "FORK_ATTN":
+                continue
+            for builder in attn_group.metadata_builders:
+                builder_with_bucket = cast(Any, builder)
+                builder_with_bucket._fork_cudagraph_prefix_chunk_bucket = (
+                    fork_prefix_chunk_bucket
+                )
+                builder_with_bucket._fork_cudagraph_forest_cta_bucket = (
+                    fork_forest_cta_bucket
+                )
+
+
+def _compute_fork_common_prefix_len(
+    num_common_prefix_blocks: int,
+    common_attn_metadata: CommonAttentionMetadata,
+    kv_cache_spec: KVCacheSpec,
+    attn_metadata_builder: AttentionMetadataBuilder,
+) -> int:
+    if num_common_prefix_blocks <= 0:
+        return 0
+    if not isinstance(kv_cache_spec, AttentionSpec):
+        return 0
+
+    block_size = kv_cache_spec.block_size
+    common_prefix_len = num_common_prefix_blocks * block_size
+    padded_query_lens_cpu = (
+        common_attn_metadata.query_start_loc_cpu[1 : common_attn_metadata.num_reqs + 1]
+        - common_attn_metadata.query_start_loc_cpu[: common_attn_metadata.num_reqs]
+    )
+    num_active_reqs = common_attn_metadata.num_active_reqs()
+    if num_active_reqs <= 0:
+        return 0
+    query_lens_cpu = padded_query_lens_cpu[:num_active_reqs]
+    if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+        seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound[:num_active_reqs]
+    else:
+        seq_lens_cpu = common_attn_metadata.seq_lens[:num_active_reqs].cpu()
+    num_computed_tokens = seq_lens_cpu - query_lens_cpu
+    common_prefix_len = min(common_prefix_len, int(num_computed_tokens.min().item()))
+    common_prefix_len = common_prefix_len // block_size * block_size
+    if common_prefix_len <= 0:
+        return 0
+
+    num_query_heads = getattr(attn_metadata_builder, "num_heads_q", 0)
+    num_kv_heads = kv_cache_spec.num_kv_heads
+    if num_query_heads <= 0 or num_kv_heads <= 0:
+        return 0
+
+    use_sliding_window = isinstance(kv_cache_spec, SlidingWindowSpec) or (
+        isinstance(kv_cache_spec, FullAttentionSpec)
+        and kv_cache_spec.sliding_window is not None
+    )
+    use_local_attention = isinstance(kv_cache_spec, ChunkedLocalAttentionSpec) or (
+        isinstance(kv_cache_spec, FullAttentionSpec)
+        and kv_cache_spec.attention_chunk_size is not None
+    )
+    dcp_world_size = 2 if common_attn_metadata.dcp_local_seq_lens is not None else 1
+    try:
+        num_sms = current_platform.num_compute_units()
+    except NotImplementedError:
+        num_sms = 1
+
+    use_cascade = attn_metadata_builder.use_cascade_attention(
+        common_prefix_len=common_prefix_len,
+        query_lens=query_lens_cpu.numpy(),
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        use_alibi=False,
+        use_sliding_window=use_sliding_window,
+        use_local_attention=use_local_attention,
+        num_sms=num_sms,
+        dcp_world_size=dcp_world_size,
+    )
+    return common_prefix_len if use_cascade else 0
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -470,6 +658,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    num_common_prefix_blocks: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -513,6 +702,18 @@ def build_attn_metadata(
                     common_attn_metadata
                 )
             else:
+                common_prefix_len = 0
+                if (
+                    attn_group.backend.get_name() == "FORK_ATTN"
+                    and num_common_prefix_blocks is not None
+                    and i < len(num_common_prefix_blocks)
+                ):
+                    common_prefix_len = _compute_fork_common_prefix_len(
+                        num_common_prefix_blocks[i],
+                        common_attn_metadata,
+                        attn_group.kv_cache_spec,
+                        attn_metadata_builder,
+                    )
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
                         attn_metadata_builder,
@@ -522,7 +723,7 @@ def build_attn_metadata(
                     else {}
                 )
                 metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
+                    common_prefix_len=common_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )

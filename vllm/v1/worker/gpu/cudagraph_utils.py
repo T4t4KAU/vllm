@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, NamedTuple, Protocol
@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import (
     BreakableCUDAGraphWrapper,
     is_breakable_cudagraph_enabled,
@@ -28,7 +29,10 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.attn_utils import (
+    build_slot_mappings_by_layer,
+    set_fork_cudagraph_prefix_bucket,
+)
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -36,6 +40,59 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _get_fork_prefix_chunk_blocks(block_size: int, max_blocks: int) -> int:
+    requested_tokens = envs.VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE
+    if requested_tokens <= 0:
+        raise ValueError("VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE must be positive")
+    requested_blocks = max(1, (requested_tokens + block_size - 1) // block_size)
+    min_blocks = max(1, (max_blocks + 7) // 8)
+    return max(requested_blocks, min_blocks)
+
+
+def _get_fork_forest_max_splits(block_size: int, max_model_len: int) -> int:
+    max_splits = envs.VLLM_FORK_ATTN_FOREST_MAX_SPLITS
+    if max_splits > 0:
+        if max_splits > 32:
+            raise ValueError("VLLM_FORK_ATTN_FOREST_MAX_SPLITS must be <= 32")
+        return max_splits
+    max_blocks = (max_model_len + block_size - 1) // block_size
+    chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
+    return min(32, (max_blocks + chunk_blocks - 1) // chunk_blocks + 4)
+
+
+def _estimate_fork_forest_ctas(
+    seq_lens: Sequence[int],
+    block_size: int,
+    max_model_len: int,
+) -> int | None:
+    if not seq_lens:
+        return None
+    if any(seq_len <= 0 for seq_len in seq_lens):
+        return None
+
+    complete_blocks = [seq_len // block_size for seq_len in seq_lens]
+    partial_segments = [1 if seq_len % block_size else 0 for seq_len in seq_lens]
+    max_complete_blocks = max(complete_blocks)
+    if max_complete_blocks <= 0 and not any(partial_segments):
+        return None
+
+    chunk_blocks = _get_fork_prefix_chunk_blocks(
+        block_size,
+        max(1, max_complete_blocks),
+    )
+    max_splits = _get_fork_forest_max_splits(block_size, max_model_len)
+    branch_slack = min(4, max_splits)
+    estimated_ctas = 0
+    for blocks, has_partial in zip(complete_blocks, partial_segments):
+        splits = 0
+        if blocks > 0:
+            splits += (blocks + chunk_blocks - 1) // chunk_blocks
+        splits += has_partial
+        splits = min(max_splits, splits + branch_slack)
+        estimated_ctas += max(1, splits)
+    return estimated_ctas
 
 
 class AttentionState(NamedTuple):
@@ -58,6 +115,8 @@ class BatchExecutionDescriptor:
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
     num_active_loras: int = 0
+    fork_prefix_chunk_bucket: int | None = None
+    fork_forest_cta_bucket: int | None = None
 
 
 class CreateForwardFn(Protocol):
@@ -78,6 +137,8 @@ def _is_compatible(
     num_tokens: int,
     uniform_token_count: int | None,
     num_active_loras: int,
+    fork_prefix_chunk_bucket: int | None,
+    fork_forest_cta_bucket: int | None,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -89,6 +150,8 @@ def _is_compatible(
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
+        and desc.fork_prefix_chunk_bucket == fork_prefix_chunk_bucket
+        and desc.fork_forest_cta_bucket == fork_forest_cta_bucket
     )
 
 
@@ -130,6 +193,9 @@ class CudaGraphManager:
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank
         self.lora_capture_cases = lora_capture_cases or [0]
+        self._uses_fork_attention = self._is_fork_attention_backend()
+        self._fork_prefix_chunk_buckets = self._init_fork_prefix_chunk_buckets()
+        self._fork_forest_cta_buckets = self._init_fork_forest_cta_buckets()
         # Precompute actual num_active_loras -> captured case mapping so that
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
@@ -180,6 +246,100 @@ class CudaGraphManager:
         # Counts above the largest captured case clamp to it.
         return self._lora_dispatch_map.get(num_active_loras, self._max_lora_case)
 
+    def _is_fork_attention_backend(self) -> bool:
+        attention_config = getattr(self.vllm_config, "attention_config", None)
+        backend = getattr(attention_config, "backend", None)
+        return getattr(backend, "name", None) == "FORK_ATTN"
+
+    def _init_fork_prefix_chunk_buckets(self) -> tuple[int, ...]:
+        if not self._uses_fork_attention:
+            return (0,)
+        buckets: set[int] = set()
+        for raw_bucket in envs.VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS.split(","):
+            raw_bucket = raw_bucket.strip()
+            if not raw_bucket:
+                continue
+            bucket = int(raw_bucket)
+            if bucket <= 0:
+                raise ValueError(
+                    "VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS must contain positive integers"
+                )
+            buckets.add(bucket)
+        if not buckets:
+            raise ValueError("VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS must not be empty")
+        return tuple(sorted(buckets))
+
+    def get_fork_prefix_chunk_bucket(
+        self,
+        prefix_blocks: int,
+        block_size: int,
+    ) -> int | None:
+        if not self._uses_fork_attention or prefix_blocks <= 0:
+            return None
+        requested_tokens = envs.VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE
+        if requested_tokens <= 0:
+            raise ValueError("VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE must be positive")
+        requested_blocks = max(1, (requested_tokens + block_size - 1) // block_size)
+        max_blocks = (
+            self.vllm_config.model_config.max_model_len + block_size - 1
+        ) // block_size
+        chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
+        assert chunk_blocks >= requested_blocks
+        num_chunks = (prefix_blocks + chunk_blocks - 1) // chunk_blocks
+        for bucket in self._fork_prefix_chunk_buckets:
+            if bucket >= num_chunks:
+                return bucket
+        return None
+
+    def _init_fork_forest_cta_buckets(self) -> tuple[int, ...]:
+        if (
+            not self._uses_fork_attention
+            or not envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH
+        ):
+            return ()
+        buckets: set[int] = set()
+        for raw_bucket in envs.VLLM_FORK_ATTN_FOREST_CTA_BUCKETS.split(","):
+            raw_bucket = raw_bucket.strip()
+            if not raw_bucket:
+                continue
+            bucket = int(raw_bucket)
+            if bucket <= 0:
+                raise ValueError(
+                    "VLLM_FORK_ATTN_FOREST_CTA_BUCKETS must contain positive integers"
+                )
+            buckets.add(bucket)
+        if not buckets:
+            raise ValueError("VLLM_FORK_ATTN_FOREST_CTA_BUCKETS must not be empty")
+        return tuple(sorted(buckets))
+
+    def get_fork_forest_cta_bucket(
+        self,
+        num_reqs: int,
+        block_size: int,
+        seq_lens: Sequence[int] | None = None,
+    ) -> int | None:
+        if (
+            not self._uses_fork_attention
+            or not envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH
+            or num_reqs <= 1
+        ):
+            return None
+        max_model_len = self.vllm_config.model_config.max_model_len
+        required_ctas = None
+        if seq_lens is not None:
+            required_ctas = _estimate_fork_forest_ctas(
+                seq_lens[:num_reqs],
+                block_size,
+                max_model_len,
+            )
+        if required_ctas is None:
+            max_splits = _get_fork_forest_max_splits(block_size, max_model_len)
+            required_ctas = num_reqs * max_splits
+        for bucket in self._fork_forest_cta_buckets:
+            if bucket >= required_ctas:
+                return bucket
+        return None
+
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
@@ -207,15 +367,34 @@ class CudaGraphManager:
                 and decode_mode
                 and self.decode_query_len <= num_tokens <= max_decode_tokens
             ):
-                desc = BatchExecutionDescriptor(
-                    cg_mode=decode_mode,
-                    num_tokens=num_tokens,
-                    num_reqs=num_tokens // self.decode_query_len,
-                    uniform_token_count=self.decode_query_len,
-                    num_active_loras=num_active_loras,
+                fork_graph_buckets: tuple[tuple[int | None, int | None], ...] = (
+                    (None, None),
                 )
-                descs_by_mode[decode_mode].append(desc)
-                descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
+                if self._uses_fork_attention:
+                    fork_graph_buckets += tuple(
+                        (prefix_bucket, None)
+                        for prefix_bucket in self._fork_prefix_chunk_buckets
+                    )
+                    if envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:
+                        fork_graph_buckets += tuple(
+                            (None, forest_bucket)
+                            for forest_bucket in self._fork_forest_cta_buckets
+                        )
+                for (
+                    fork_prefix_chunk_bucket,
+                    fork_forest_cta_bucket,
+                ) in fork_graph_buckets:
+                    desc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=num_tokens // self.decode_query_len,
+                        uniform_token_count=self.decode_query_len,
+                        num_active_loras=num_active_loras,
+                        fork_prefix_chunk_bucket=fork_prefix_chunk_bucket,
+                        fork_forest_cta_bucket=fork_forest_cta_bucket,
+                    )
+                    descs_by_mode[decode_mode].append(desc)
+                    descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
 
             if mixed_mode:
                 # for PIECEWISE graphs there is no limit on requests when replaying
@@ -335,6 +514,8 @@ class CudaGraphManager:
         num_tokens: int,
         uniform_token_count: int | None,
         num_active_loras: int,
+        fork_prefix_chunk_bucket: int | None = None,
+        fork_forest_cta_bucket: int | None = None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
@@ -348,6 +529,8 @@ class CudaGraphManager:
                     num_tokens,
                     uniform_token_count,
                     effective_loras,
+                    fork_prefix_chunk_bucket,
+                    fork_forest_cta_bucket,
                 ):
                     return desc
         return BatchExecutionDescriptor(
@@ -355,6 +538,8 @@ class CudaGraphManager:
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
+            fork_prefix_chunk_bucket=fork_prefix_chunk_bucket,
+            fork_forest_cta_bucket=fork_forest_cta_bucket,
         )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
@@ -441,6 +626,11 @@ class ModelCudaGraphManager(CudaGraphManager):
             # Set LoRA state before capture so kernels see correct adapters.
             if lora_capture_hook is not None:
                 lora_capture_hook(desc.num_active_loras, num_reqs, num_tokens)
+            set_fork_cudagraph_prefix_bucket(
+                attn_groups,
+                desc.fork_prefix_chunk_bucket,
+                desc.fork_forest_cta_bucket,
+            )
 
             num_tokens_across_dp = (
                 torch.full((self.dp_size,), num_tokens, dtype=torch.int32, device="cpu")

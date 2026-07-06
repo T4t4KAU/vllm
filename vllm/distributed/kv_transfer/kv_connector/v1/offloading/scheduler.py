@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import islice
@@ -9,10 +10,13 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    DEFAULT_FANOUT_LAYERWISE_LOAD_THRESHOLD_BYTES,
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
     ReqId,
     TransferJob,
+    fanout_profiling_enabled,
+    resolve_fanout_layerwise_load,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
     OffloadingEventGroupSpec,
@@ -44,10 +48,44 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.fanout_planner import (
+    FanoutBlock,
+    FanoutChunkPlanner,
+)
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+DEFAULT_FANOUT_CHUNK_TOKENS = 2048
+
+
+def _resolve_fanout_chunk_blocks(
+    extra_config: dict[str, Any],
+    *,
+    min_offloaded_block_size: int,
+    fanout_budget_blocks: int,
+) -> int:
+    if "fanout_chunk_blocks" in extra_config:
+        chunk_blocks = int(extra_config["fanout_chunk_blocks"])
+        if chunk_blocks <= 0:
+            raise ValueError("fanout_chunk_blocks must be positive")
+        if 0 < fanout_budget_blocks < chunk_blocks:
+            raise ValueError(
+                "fanout_chunk_blocks must be <= fanout_budget_blocks"
+            )
+        return chunk_blocks
+
+    chunk_tokens = int(
+        extra_config.get("fanout_chunk_tokens", DEFAULT_FANOUT_CHUNK_TOKENS)
+    )
+    if chunk_tokens <= 0:
+        raise ValueError("fanout_chunk_tokens must be positive")
+
+    chunk_blocks = max(1, cdiv(chunk_tokens, min_offloaded_block_size))
+    if fanout_budget_blocks > 0:
+        chunk_blocks = min(chunk_blocks, fanout_budget_blocks)
+    return chunk_blocks
 
 
 @dataclass(slots=True)
@@ -129,6 +167,13 @@ class SchedulerOffloadConfig(NamedTuple):
     block_size_factor: int
     num_workers: int
     offload_prompt_only: bool
+    fanout_offload: bool
+    fanout_chunk_blocks: int
+    fanout_budget_blocks: int
+    fanout_min_fanout: int
+    fanout_recent_tail_blocks: int
+    fanout_layerwise_load: bool
+    fanout_profile: bool
 
     @classmethod
     def from_spec(cls, spec: OffloadingSpec) -> "SchedulerOffloadConfig":
@@ -188,6 +233,77 @@ class SchedulerOffloadConfig(NamedTuple):
                 sorted(eagle_groups),
             )
 
+        backend = spec.vllm_config.attention_config.backend
+        fanout_offload = bool(
+            spec.extra_config.get(
+                "fanout_offload",
+                backend is not None and backend.name == "FORK_ATTN",
+            )
+        )
+        fanout_budget_blocks = int(spec.extra_config.get("fanout_budget_blocks", 64))
+        min_offloaded_block_size = min(
+            gpu_block_size * spec.block_size_factor
+            for gpu_block_size in spec.gpu_block_size
+        )
+        fanout_chunk_blocks = _resolve_fanout_chunk_blocks(
+            spec.extra_config,
+            min_offloaded_block_size=min_offloaded_block_size,
+            fanout_budget_blocks=fanout_budget_blocks,
+        )
+        fanout_min_fanout = int(spec.extra_config.get("fanout_min_fanout", 2))
+        fanout_recent_tail_blocks = int(
+            spec.extra_config.get("fanout_recent_tail_blocks", 1)
+        )
+        fanout_profile = fanout_profiling_enabled(
+            spec.extra_config,
+            spec.vllm_config,
+        )
+        if fanout_budget_blocks < 0:
+            raise ValueError("fanout_budget_blocks must be non-negative")
+        if fanout_min_fanout <= 0:
+            raise ValueError("fanout_min_fanout must be positive")
+        if fanout_recent_tail_blocks < 0:
+            raise ValueError("fanout_recent_tail_blocks must be non-negative")
+        layerwise_threshold_bytes = int(
+            spec.extra_config.get(
+                "fanout_layerwise_load_threshold_bytes",
+                DEFAULT_FANOUT_LAYERWISE_LOAD_THRESHOLD_BYTES,
+            )
+        )
+        estimated_load_bytes = fanout_budget_blocks * int(
+            getattr(spec, "kv_bytes_per_offloaded_block", 0) or 0
+        )
+        fanout_layerwise_load = resolve_fanout_layerwise_load(
+            spec.extra_config.get("fanout_layerwise_load", "auto"),
+            fanout_offload=fanout_offload,
+            has_full_cudagraphs=(
+                spec.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ),
+            estimated_load_bytes=estimated_load_bytes,
+            threshold_bytes=layerwise_threshold_bytes,
+        )
+        if fanout_layerwise_load and not fanout_offload:
+            raise ValueError("fanout_layerwise_load requires fanout_offload")
+        if fanout_offload and spec.block_size_factor != 1:
+            raise ValueError(
+                "Fanout chunk offloading currently requires offload block_size "
+                "to match the GPU block size"
+            )
+        if fanout_offload:
+            logger.info(
+                "Fanout KV offload enabled: layerwise_load=%s, "
+                "chunk_blocks=%d, budget_blocks=%d, min_fanout=%d, "
+                "estimated_load_bytes=%d, "
+                "threshold_bytes=%d, profile=%s",
+                fanout_layerwise_load,
+                fanout_chunk_blocks,
+                fanout_budget_blocks,
+                fanout_min_fanout,
+                estimated_load_bytes,
+                layerwise_threshold_bytes,
+                fanout_profile,
+            )
+
         return cls(
             num_workers=spec.vllm_config.parallel_config.world_size,
             kv_group_configs=tuple(
@@ -217,6 +333,13 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
+            fanout_offload=fanout_offload,
+            fanout_chunk_blocks=fanout_chunk_blocks,
+            fanout_budget_blocks=fanout_budget_blocks,
+            fanout_min_fanout=fanout_min_fanout,
+            fanout_recent_tail_blocks=fanout_recent_tail_blocks,
+            fanout_layerwise_load=fanout_layerwise_load,
+            fanout_profile=fanout_profile,
         )
 
 
@@ -229,6 +352,8 @@ class RequestGroupState:
     # number of offloaded blocks hit (including GPU prefix cache)
     # when the request first started
     num_hit_blocks: int = 0
+    # Logical offload-block indices considered by the fanout admission policy.
+    fanout_admitted_block_indices: set[int] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -373,6 +498,35 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+        self._fanout_planner = (
+            FanoutChunkPlanner(
+                self.config.fanout_chunk_blocks,
+                min_fanout=self.config.fanout_min_fanout,
+            )
+            if self.config.fanout_offload
+            else None
+        )
+        self._fanout_profile_steps = 0
+
+    def _profile_fanout(
+        self,
+        *,
+        candidates: int,
+        selected_chunks: int,
+        selected_blocks: int,
+    ) -> None:
+        if not self.config.fanout_profile:
+            return
+        self._fanout_profile_steps += 1
+        logger.info(
+            "Fanout offload profile: step=%d candidates=%d "
+            "selected_chunks=%d selected_blocks=%d layerwise_load=%s",
+            self._fanout_profile_steps,
+            candidates,
+            selected_chunks,
+            selected_blocks,
+            self.config.fanout_layerwise_load,
+        )
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -689,7 +843,8 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
-        return num_hit_tokens, bool(num_hit_tokens)
+        load_async = bool(num_hit_tokens) and not self.config.fanout_layerwise_load
+        return num_hit_tokens, load_async
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -722,12 +877,18 @@ class OffloadingConnectorScheduler:
             num_gpu_blocks = cdiv(num_cached_tokens, gpu_block_size)
 
             assert len(group_blocks) >= num_gpu_blocks
-            num_locally_computed_gpu_blocks = num_gpu_blocks
-            # Skip null placeholder blocks (used for sliding window or mamba padding).
-            for i, block in enumerate(group_blocks[:num_gpu_blocks]):
-                if not block.is_null and block.block_hash is None:
-                    num_locally_computed_gpu_blocks = i
-                    break
+            if self.config.fanout_layerwise_load:
+                num_locally_computed_gpu_blocks = cdiv(
+                    num_locally_computed_tokens,
+                    gpu_block_size,
+                )
+            else:
+                num_locally_computed_gpu_blocks = num_gpu_blocks
+                # Skip null placeholders used for sliding window or mamba padding.
+                for i, block in enumerate(group_blocks[:num_gpu_blocks]):
+                    if not block.is_null and block.block_hash is None:
+                        num_locally_computed_gpu_blocks = i
+                        break
 
             assert (
                 num_locally_computed_tokens
@@ -840,38 +1001,125 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
+    def _get_num_offloadable_tokens(
+        self,
+        req_status: RequestOffloadState,
+        num_scheduled_tokens: int,
+    ) -> int:
+        req = req_status.req
+        num_tokens = min(
+            req.num_computed_tokens + num_scheduled_tokens,
+            req.num_tokens,
+        )
+        if req_status.max_offload_tokens is not None:
+            num_tokens = min(num_tokens, req_status.max_offload_tokens)
+        if self.config.offload_prompt_only:
+            num_tokens = min(num_tokens, req.num_prompt_tokens)
+        return num_tokens
+
+    def _select_fanout_offload_keys(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> dict[str, set[OffloadKey]] | None:
+        planner = self._fanout_planner
+        if planner is None:
+            return None
+
+        fanout: Counter[tuple[int, int]] = Counter()
+        for tracked_req_status in self._req_status.values():
+            for group_config, group_state in zip(
+                self.config.kv_group_configs,
+                tracked_req_status.group_states,
+            ):
+                for block_id in group_state.block_ids:
+                    if block_id != 0:
+                        fanout[(group_config.group_idx, block_id)] += 1
+
+        candidates: list[FanoutBlock] = []
+        for (
+            req_id,
+            num_scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            candidate_req_status = self._req_status.get(req_id)
+            if candidate_req_status is None or candidate_req_status.transfer_jobs:
+                continue
+            num_offloadable_tokens = self._get_num_offloadable_tokens(
+                candidate_req_status,
+                num_scheduled_tokens,
+            )
+            for group_config, group_state in zip(
+                self.config.kv_group_configs,
+                candidate_req_status.group_states,
+            ):
+                num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
+                if group_config.is_eagle_group:
+                    num_blocks = max(0, num_blocks - 1)
+                tail_start = max(
+                    0,
+                    num_blocks - self.config.fanout_recent_tail_blocks,
+                )
+                for logical_idx in range(num_blocks):
+                    if logical_idx in group_state.fanout_admitted_block_indices:
+                        continue
+                    physical_idx = logical_idx * self.config.block_size_factor
+                    if physical_idx >= len(group_state.block_ids):
+                        break
+                    block_id = group_state.block_ids[physical_idx]
+                    if logical_idx >= len(group_state.offload_keys):
+                        break
+                    candidates.append(
+                        FanoutBlock(
+                            request_id=req_id,
+                            group_idx=group_config.group_idx,
+                            logical_block_idx=logical_idx,
+                            physical_block_id=block_id,
+                            offload_key=group_state.offload_keys[logical_idx],
+                            fanout=fanout[(group_config.group_idx, block_id)],
+                            prefix_position=(logical_idx + 1) / max(num_blocks, 1),
+                            last_access_time=float(
+                                candidate_req_status.req.num_computed_tokens
+                            ),
+                            is_active_tail=logical_idx >= tail_start,
+                        )
+                    )
+
+        plan = planner.select(candidates, self.config.fanout_budget_blocks)
+        selected: dict[str, set[OffloadKey]] = {}
+        for chunk in plan.chunks:
+            selected.setdefault(chunk.request_id, set()).update(chunk.offload_keys)
+        self._profile_fanout(
+            candidates=len(candidates),
+            selected_chunks=len(plan.chunks),
+            selected_blocks=plan.num_blocks,
+        )
+        return selected
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
         block_size_factor = self.config.block_size_factor
         store_jobs: dict[int, TransferJob] = {}
+        fanout_selected_keys = self._select_fanout_offload_keys(scheduler_output)
         for req_id in scheduler_output.num_scheduled_tokens:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
-            req = req_status.req
-
+            if req_status.transfer_jobs:
+                any_job_id = next(iter(req_status.transfer_jobs))
+                if not self._jobs[any_job_id].is_store:
+                    continue
             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_tokens_after_batch = req.num_computed_tokens + num_scheduled_tokens
-            # with async scheduling, some tokens may be missing
-            num_offloadable_tokens = min(num_tokens_after_batch, req.num_tokens)
-            max_offload_tokens = req_status.max_offload_tokens
-            if max_offload_tokens is not None:
-                num_offloadable_tokens = min(num_offloadable_tokens, max_offload_tokens)
-
-            # Skip decode-phase blocks: clamp to the prompt length so only
-            # prefill (prompt) blocks become eligible for store. next_stored_idx
-            # never advances past this boundary, so decode blocks are never
-            # queued in this or any later step.
-            if self.config.offload_prompt_only:
-                num_offloadable_tokens = min(
-                    num_offloadable_tokens, req.num_prompt_tokens
-                )
+            num_offloadable_tokens = self._get_num_offloadable_tokens(
+                req_status,
+                num_scheduled_tokens,
+            )
+            req = req_status.req
 
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
+            fanout_key_indices: dict[OffloadKey, tuple[RequestGroupState, int]] = {}
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -879,7 +1127,11 @@ class OffloadingConnectorScheduler:
                 if group_config.is_eagle_group:
                     num_blocks = max(0, num_blocks - 1)
 
-                start_block_idx = group_state.next_stored_block_idx
+                start_block_idx = (
+                    0
+                    if fanout_selected_keys is not None
+                    else group_state.next_stored_block_idx
+                )
                 if num_blocks <= start_block_idx:
                     continue
                 offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
@@ -901,6 +1153,12 @@ class OffloadingConnectorScheduler:
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
+                    logical_idx = start_block_idx + key_idx
+                    if (
+                        fanout_selected_keys is not None
+                        and offload_key not in fanout_selected_keys.get(req_id, set())
+                    ):
+                        continue
                     if block_id == 0:
                         continue
                     # Skip SWA blocks that can never serve a load hit:
@@ -910,14 +1168,20 @@ class OffloadingConnectorScheduler:
                     # tokens this reduces SWA stores by ~78%.
                     if alignment_block_count is not None:
                         assert tail is not None
-                        abs_block_idx = start_block_idx + key_idx
+                        abs_block_idx = logical_idx
                         pos_in_segment = abs_block_idx % alignment_block_count
                         if pos_in_segment < alignment_block_count - tail:
                             continue
                     new_offload_keys.append(offload_key)
+                    if fanout_selected_keys is not None:
+                        fanout_key_indices[offload_key] = (
+                            group_state,
+                            logical_idx,
+                        )
 
             if not new_offload_keys:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                if fanout_selected_keys is None:
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             store_output = self.manager.prepare_store(
@@ -927,8 +1191,15 @@ class OffloadingConnectorScheduler:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
+            for offload_key in new_offload_keys:
+                location = fanout_key_indices.get(offload_key)
+                if location is not None:
+                    group_state, logical_idx = location
+                    group_state.fanout_admitted_block_indices.add(logical_idx)
+
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                if fanout_selected_keys is None:
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             self._touch(req_status)
@@ -947,7 +1218,11 @@ class OffloadingConnectorScheduler:
                     group_config.sliding_window_size_in_blocks is not None
                 )
                 num_blocks = num_offloadable_tokens // group_config.offloaded_block_size
-                start_block_idx = group_state.next_stored_block_idx
+                start_block_idx = (
+                    0
+                    if fanout_selected_keys is not None
+                    else group_state.next_stored_block_idx
+                )
                 block_ids = group_state.block_ids
                 num_group_blocks = 0
                 start_gpu_block_idx: int | None = None
@@ -979,7 +1254,8 @@ class OffloadingConnectorScheduler:
 
                 group_sizes.append(num_group_blocks)
                 block_indices.append(start_gpu_block_idx or 0)
-                group_state.next_stored_block_idx = num_blocks
+                if fanout_selected_keys is None:
+                    group_state.next_stored_block_idx = num_blocks
 
             src_spec = GPULoadStoreSpec(
                 src_block_ids, group_sizes=group_sizes, block_indices=block_indices

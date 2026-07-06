@@ -114,6 +114,14 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+    VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE: int = 2048
+    VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS: str = "2,4,8"
+    VLLM_FORK_ATTN_ENABLE_FOREST: bool = True
+    VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH: bool = False
+    VLLM_FORK_ATTN_FOREST_CTA_BUCKETS: str = "64,128,256,384,512"
+    VLLM_FORK_ATTN_FOREST_MAX_SPLITS: int = 0
+    VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW: int = 16
+    VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES: int = 8
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1114,6 +1122,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+    ),
+    "VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE", "2048")
+    ),
+    "VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS": lambda: os.getenv(
+        "VLLM_FORK_ATTN_PREFIX_CHUNK_BUCKETS", "2,4,8"
+    ),
+    "VLLM_FORK_ATTN_ENABLE_FOREST": lambda: bool(
+        int(os.getenv("VLLM_FORK_ATTN_ENABLE_FOREST", "1"))
+    ),
+    "VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH", "0"))
+    ),
+    "VLLM_FORK_ATTN_FOREST_CTA_BUCKETS": lambda: os.getenv(
+        "VLLM_FORK_ATTN_FOREST_CTA_BUCKETS", "64,128,256,384,512"
+    ),
+    "VLLM_FORK_ATTN_FOREST_MAX_SPLITS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_FOREST_MAX_SPLITS", "0")
+    ),
+    "VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW", "16")
+    ),
+    "VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES", "8")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

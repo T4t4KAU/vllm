@@ -285,6 +285,44 @@ def merge_attn_states(
     )
 
 
+def fork_attention(
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    split_out: torch.Tensor,
+    split_lse: torch.Tensor,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    num_split_per_seq: torch.Tensor,
+    query_tables: list[torch.Tensor],
+    block_tables: list[torch.Tensor],
+    num_seqs_per_ctas: list[torch.Tensor],
+    cta_ranks: list[torch.Tensor],
+    kv_in_ctas: list[torch.Tensor],
+    mnw: list[int],
+    max_split_per_seq: int,
+    softmax_scale: float,
+) -> None:
+    torch.ops._C.fork_attention(
+        out,
+        softmax_lse,
+        split_out,
+        split_lse,
+        q,
+        k_cache,
+        v_cache,
+        num_split_per_seq,
+        query_tables,
+        block_tables,
+        num_seqs_per_ctas,
+        cta_ranks,
+        kv_in_ctas,
+        mnw,
+        max_split_per_seq,
+        softmax_scale,
+    )
+
+
 # pos encoding ops
 def rotary_embedding(
     positions: torch.Tensor,

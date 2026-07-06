@@ -1060,6 +1060,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     message(STATUS "Building hadacore")
   endif()
 
+  # Experimental ForkAttention decode kernel.
+  cuda_archs_loose_intersection(FORK_ARCHS "12.0+PTX" "${CUDA_ARCHS}")
+  if(FORK_ARCHS)
+    set(FORK_ATTN_SRCS
+      "csrc/libtorch_stable/attention/fork/fork_attention.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_fp16_sm120.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_bf16_sm120.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_fp16_sm120.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_bf16_sm120.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${FORK_ATTN_SRCS}"
+      CUDA_ARCHS "${FORK_ARCHS}")
+    list(APPEND VLLM_STABLE_EXT_SRC "${FORK_ATTN_SRCS}")
+    message(STATUS "Building experimental ForkAttention for archs: ${FORK_ARCHS}")
+  endif()
+
   # if CUDA endif
   endif()
 

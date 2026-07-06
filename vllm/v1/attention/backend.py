@@ -471,6 +471,13 @@ class CommonAttentionMetadata:
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]
 
+    def num_active_reqs(self) -> int:
+        query_lens = (
+            self.query_start_loc_cpu[1 : self.num_reqs + 1]
+            - self.query_start_loc_cpu[: self.num_reqs]
+        )
+        return int(torch.count_nonzero(query_lens).item())
+
     def naive_query_lens(self) -> torch.Tensor:
         """Naive because it assumes that query ends where the next query starts."""
         return self.query_start_loc[1:] - self.query_start_loc[:-1]

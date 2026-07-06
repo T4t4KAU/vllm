@@ -361,6 +361,26 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "    int!? prefill_tokens_with_context,"
       "    Tensor? output_scale=None) -> ()");
 
+  ops.def(
+      "fork_attention("
+      "    Tensor! out,"
+      "    Tensor! softmax_lse,"
+      "    Tensor! split_out,"
+      "    Tensor! split_lse,"
+      "    Tensor q,"
+      "    Tensor k_cache,"
+      "    Tensor v_cache,"
+      "    Tensor num_split_per_seq,"
+      "    Tensor[] query_tables,"
+      "    Tensor[] block_tables,"
+      "    Tensor[] num_seqs_per_ctas,"
+      "    Tensor[] cta_ranks,"
+      "    Tensor[] kv_in_ctas,"
+      "    int[] mnw,"
+      "    int max_split_per_seq,"
+      "    float softmax_scale"
+      ") -> ()");
+
   // Hadamard transforms
   // conditionally compiled so impl registration is in source file
   ops.def("hadacore_transform(Tensor! x, bool inplace) -> Tensor");
@@ -676,6 +696,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #endif
 
   ops.impl("merge_attn_states", TORCH_BOX(&merge_attn_states));
+  ops.impl("fork_attention", TORCH_BOX(&vllm::fork_attention::fork_attention));
 
   // Layernorm kernels (shared CUDA/ROCm)
   ops.impl("rms_norm", TORCH_BOX(&rms_norm));

@@ -55,9 +55,13 @@ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
+    get_fork_attention_block_size,
+    get_fork_cudagraph_prefix_info,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    set_fork_cudagraph_prefix_bucket,
+    should_use_fork_dynamic_forest,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -1159,6 +1163,57 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
+        fork_prefix_chunk_bucket = None
+        fork_forest_cta_bucket = None
+        if self.cudagraph_manager is not None and not dummy_run:
+            fork_prefix_info = get_fork_cudagraph_prefix_info(
+                self.vllm_config,
+                self.attn_groups,
+                num_reqs,
+                uniform_tok_count,
+                scheduler_output.num_common_prefix_blocks,
+            )
+            if fork_prefix_info is not None:
+                prefix_blocks, block_size = fork_prefix_info
+                fork_prefix_chunk_bucket = (
+                    self.cudagraph_manager.get_fork_prefix_chunk_bucket(
+                        prefix_blocks,
+                        block_size,
+                    )
+                )
+            elif uniform_tok_count == 1:
+                fork_block_size = get_fork_attention_block_size(
+                    self.vllm_config,
+                    self.attn_groups,
+                )
+                if fork_block_size is not None:
+                    fork_req_seq_lens = []
+                    scheduled_tokens = scheduler_output.num_scheduled_tokens
+                    for req_id, num_scheduled in scheduled_tokens.items():
+                        req_index = self.req_states.req_id_to_index.get(req_id)
+                        if req_index is None:
+                            fork_req_seq_lens = []
+                            break
+                        seq_len = (
+                            self.req_states.num_computed_tokens_np[req_index]
+                            + num_scheduled
+                        )
+                        fork_req_seq_lens.append(int(seq_len))
+                    fork_forest_cta_bucket = (
+                        self.cudagraph_manager.get_fork_forest_cta_bucket(
+                            num_reqs,
+                            fork_block_size,
+                            fork_req_seq_lens or None,
+                        )
+                    )
+
+        fork_dynamic_forest = not dummy_run and should_use_fork_dynamic_forest(
+            self.vllm_config,
+            num_reqs,
+            uniform_tok_count,
+            fork_prefix_chunk_bucket,
+            fork_forest_cta_bucket,
+        )
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
@@ -1173,9 +1228,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or fork_dynamic_forest,
             num_active_loras=num_active_loras,
+            fork_prefix_chunk_bucket=fork_prefix_chunk_bucket,
+            fork_forest_cta_bucket=fork_forest_cta_bucket,
         )
+        if hasattr(self, "attn_groups"):
+            set_fork_cudagraph_prefix_bucket(
+                self.attn_groups,
+                batch_desc.fork_prefix_chunk_bucket
+                if batch_desc.cg_mode == CUDAGraphMode.FULL
+                else None,
+                batch_desc.fork_forest_cta_bucket
+                if batch_desc.cg_mode == CUDAGraphMode.FULL
+                else None,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1228,6 +1295,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings,
                 self.attn_groups,
                 self.kv_cache_config,
+                num_common_prefix_blocks=None
+                if dummy_run
+                else scheduler_output.num_common_prefix_blocks,
             )
 
         input_ids = input_batch.input_ids

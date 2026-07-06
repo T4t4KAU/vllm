@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
+    parse_fanout_layerwise_load,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -92,7 +93,8 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.start_kv_transfers(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        pass
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,
@@ -181,6 +183,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
         return "HND"
+
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return (
+            parse_fanout_layerwise_load(
+                extra_config.get("fanout_layerwise_load", "auto")
+            )
+            is True
+        )
 
     def reset_cache(self) -> bool | None:
         assert self.connector_scheduler is not None
