@@ -279,12 +279,10 @@ class CudaGraphManager:
         requested_tokens = envs.VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE
         if requested_tokens <= 0:
             raise ValueError("VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE must be positive")
-        requested_blocks = max(1, (requested_tokens + block_size - 1) // block_size)
         max_blocks = (
             self.vllm_config.model_config.max_model_len + block_size - 1
         ) // block_size
         chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
-        assert chunk_blocks >= requested_blocks
         num_chunks = (prefix_blocks + chunk_blocks - 1) // chunk_blocks
         for bucket in self._fork_prefix_chunk_buckets:
             if bucket >= num_chunks:

@@ -71,9 +71,7 @@ def _resolve_fanout_chunk_blocks(
         if chunk_blocks <= 0:
             raise ValueError("fanout_chunk_blocks must be positive")
         if 0 < fanout_budget_blocks < chunk_blocks:
-            raise ValueError(
-                "fanout_chunk_blocks must be <= fanout_budget_blocks"
-            )
+            raise ValueError("fanout_chunk_blocks must be <= fanout_budget_blocks")
         return chunk_blocks
 
     chunk_tokens = int(
@@ -1521,6 +1519,7 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
+                group_state.fanout_admitted_block_indices.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

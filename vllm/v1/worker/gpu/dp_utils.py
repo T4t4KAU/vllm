@@ -74,14 +74,16 @@ def sync_cudagraph_and_dp_padding(
         uniform_token_counts_across_dp == synced_uniform_token_count
     ):
         synced_uniform_token_count = None
-    synced_fork_prefix_chunk_bucket = int(
-        fork_prefix_chunk_buckets_across_dp.max().item()
-    )
-    if synced_fork_prefix_chunk_bucket == 0:
+    # A rank with no common prefix (bucket == 0) cannot replay a prefix graph,
+    # so disable the prefix bucket across DP when any rank reports none.
+    # Otherwise use max so the synced graph is large enough for every rank.
+    if int(fork_prefix_chunk_buckets_across_dp.min().item()) == 0:
         synced_fork_prefix_chunk_bucket = None
-    synced_fork_forest_cta_bucket = int(
-        fork_forest_cta_buckets_across_dp.max().item()
-    )
+    else:
+        synced_fork_prefix_chunk_bucket = int(
+            fork_prefix_chunk_buckets_across_dp.max().item()
+        )
+    synced_fork_forest_cta_bucket = int(fork_forest_cta_buckets_across_dp.max().item())
     if synced_fork_forest_cta_bucket == 0:
         synced_fork_forest_cta_bucket = None
 

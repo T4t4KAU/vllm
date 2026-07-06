@@ -517,7 +517,7 @@ def get_fork_cudagraph_prefix_info(
                 use_sliding_window=use_sliding_window,
                 use_local_attention=use_local_attention,
                 num_sms=num_sms,
-                dcp_world_size=1,
+                dcp_world_size=getattr(builder, "dcp_world_size", 1),
             ):
                 continue
             return num_common_prefix_blocks[i], kv_cache_spec.block_size
@@ -596,10 +596,12 @@ def _compute_fork_common_prefix_len(
     if num_active_reqs <= 0:
         return 0
     query_lens_cpu = padded_query_lens_cpu[:num_active_reqs]
-    if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound[:num_active_reqs]
-    else:
-        seq_lens_cpu = common_attn_metadata.seq_lens[:num_active_reqs].cpu()
+    # Cascade needs exact per-row context lengths. seq_lens_cpu_upper_bound is
+    # optimistic for async-spec-decode rows (assumes every draft was accepted)
+    # and could let common_prefix_len exceed the actual computed KV, so always
+    # use the precise seq_lens here. This path only runs outside cudagraph
+    # capture, so the host sync is safe.
+    seq_lens_cpu = common_attn_metadata.seq_lens[:num_active_reqs].cpu()
     num_computed_tokens = seq_lens_cpu - query_lens_cpu
     common_prefix_len = min(common_prefix_len, int(num_computed_tokens.min().item()))
     common_prefix_len = common_prefix_len // block_size * block_size
