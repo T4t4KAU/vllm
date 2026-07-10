@@ -169,6 +169,7 @@ def test_select_can_backup_hot_shared_prefix_when_explicitly_allowed() -> None:
     plan = planner.select(
         blocks,
         budget_blocks=2,
+        pressure_level=FanoutPressureLevel.CRITICAL,
     )
 
     assert [chunk.request_id for chunk in plan.chunks] == ["hot_shared"]
@@ -204,20 +205,26 @@ def test_select_only_releases_cooling_prefix_under_pressure() -> None:
     assert [chunk.request_id for chunk in high_pressure_plan.chunks] == ["cooling"]
 
 
-def test_select_can_backup_hot_prefix_at_high_pressure() -> None:
+def test_select_defers_hot_prefix_until_critical_pressure() -> None:
     planner = FanoutChunkPlanner(allow_hot_shared_prefix_backup=True)
     blocks = [
         make_block(0, fanout=8, is_hot_shared_prefix=True),
         make_block(1, fanout=8, is_hot_shared_prefix=True),
     ]
 
-    plan = planner.select(
+    high_pressure_plan = planner.select(
         blocks,
         budget_blocks=2,
         pressure_level=FanoutPressureLevel.HIGH,
     )
+    critical_pressure_plan = planner.select(
+        blocks,
+        budget_blocks=2,
+        pressure_level=FanoutPressureLevel.CRITICAL,
+    )
 
-    assert [chunk.request_id for chunk in plan.chunks] == ["request"]
+    assert high_pressure_plan.chunks == ()
+    assert [chunk.request_id for chunk in critical_pressure_plan.chunks] == ["request"]
 
 
 def test_select_reports_protected_hot_shared_prefix_with_zero_store_budget() -> None:

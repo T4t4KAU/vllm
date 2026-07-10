@@ -57,6 +57,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_fork_attention_block_size,
     get_fork_cudagraph_prefix_info,
+    get_fork_execution_stats,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
@@ -1291,6 +1292,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         attn_metadata = None
         slot_mappings_by_layer = None
+        fork_execution_stats = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -1406,6 +1408,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        # ForkAttention builds its physical CTA plan during the model forward,
+        # so the execution summary is only available after attention runs.
+        if not (dummy_run and skip_attn_for_dummy_run):
+            fork_execution_stats = get_fork_execution_stats(self.attn_groups)
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1429,6 +1436,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            fork_execution_stats=fork_execution_stats,
         )
 
         if not self.is_last_pp_rank:
@@ -1451,6 +1459,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        fork_execution_stats = self.execute_model_state.fork_execution_stats
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1503,6 +1512,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            fork_execution_stats=fork_execution_stats,
         )
         # Start async output copy here so that it can overlap with speculator proposal.
         async_output = AsyncOutput(
@@ -1685,3 +1695,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    fork_execution_stats: tuple[str, int, int, int, int] | None

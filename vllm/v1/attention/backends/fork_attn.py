@@ -439,6 +439,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         metadata: FlashAttentionMetadata,
         num_active_reqs: int | None = None,
     ) -> dict[str, Any]:
+        self._fork_last_execution_stats = ("base", 0, 0, 0, 0)
         if num_active_reqs is None:
             num_active_reqs = metadata.num_actual_tokens
         cudagraph_bucket = self._get_cudagraph_prefix_chunk_bucket()
@@ -554,6 +555,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         if forest is None:
             return {}
         boxes, num_split_per_seq = forest
+        self._record_fork_execution_stats("eager", 0, boxes)
         hratio = self.num_heads_q // self.num_heads_kv
         device = metadata.block_table.device
 
@@ -604,6 +606,22 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             "fork_split_out": split_out,
             "fork_split_lse": split_lse,
         }
+
+    def _record_fork_execution_stats(
+        self,
+        kind: str,
+        capacity: int,
+        boxes: list[_ForkSegmentBox],
+    ) -> None:
+        shared_ctas = sum(len(box.q_ids) > 1 for box in boxes)
+        singleton_ctas = len(boxes) - shared_ctas
+        self._fork_last_execution_stats = (
+            kind,
+            capacity,
+            len(boxes),
+            shared_ctas,
+            singleton_ctas,
+        )
 
     def _build_fork_forest_boxes(
         self,
@@ -1180,6 +1198,15 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             workspace.num_seqs_per_ctas[1][:num_reqs]
         )
         workspace.num_split_per_seq[:num_reqs].mul_(num_prefix_chunks + 1)
+        shared_ctas = num_prefix_chunks * (prefix_cohorts if has_prefix else 0)
+        singleton_ctas = num_reqs if suffix_blocks > 0 else 0
+        self._fork_last_execution_stats = (
+            "common",
+            workspace.max_prefix_chunks,
+            shared_ctas + singleton_ctas,
+            shared_ctas,
+            singleton_ctas,
+        )
         return self._workspace_kwargs(workspace)
 
     def _update_cudagraph_forest_workspace(
@@ -1212,6 +1239,8 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         ):
             self._clear_cudagraph_workspace(workspace)
             return {}
+
+        self._record_fork_execution_stats("forest", workspace.max_ctas, boxes)
 
         self._clear_cudagraph_workspace(workspace)
         hratio = self.num_heads_q // self.num_heads_kv

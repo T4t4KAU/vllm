@@ -140,6 +140,8 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
+        self.fork_execution_stats: tuple[str, int, int, int, int] | None = None
+        self.kv_cache_usage = 0.0
 
 
 class DPCoordinatorProc:
@@ -273,7 +275,12 @@ class DPCoordinatorProc:
                         engine_req_counts_list = self._get_engine_counts()
                         stats_changed = False
 
-                    to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    to_publish = (
+                        engine_req_counts_list,
+                        current_wave,
+                        engines_running,
+                        self._get_engine_telemetry(),
+                    )
                     publish_front.send(msgspec.msgpack.encode(to_publish))
                     last_publish_time = int(time.time() * 1000)
                     continue
@@ -400,6 +407,11 @@ class DPCoordinatorProc:
                             )
                         stats[0] = scheduler_stats.num_waiting_reqs
                         stats[1] = scheduler_stats.num_running_reqs
+                        engine_state = self.engines[eng_index]
+                        engine_state.fork_execution_stats = (
+                            scheduler_stats.fork_execution_stats
+                        )
+                        engine_state.kv_cache_usage = scheduler_stats.kv_cache_usage
                         stats_changed = True
 
                     # Wave coordination: handle wave completion and start notifications
@@ -437,7 +449,12 @@ class DPCoordinatorProc:
                             self._send_start_wave(publish_back, wave, eng_index)
 
                 if wave_state_changed:
-                    message = (None, current_wave, engines_running)
+                    message = (
+                        None,
+                        current_wave,
+                        engines_running,
+                        self._get_engine_telemetry(),
+                    )
                     publish_front.send(msgspec.msgpack.encode(message))
 
     @staticmethod
@@ -457,3 +474,11 @@ class DPCoordinatorProc:
         if do_copy:
             return [copy.copy(e.request_counts) for e in self.engines]
         return [e.request_counts for e in self.engines]
+
+    def _get_engine_telemetry(
+        self,
+    ) -> list[tuple[tuple[str, int, int, int, int] | None, float]]:
+        return [
+            (engine.fork_execution_stats, engine.kv_cache_usage)
+            for engine in self.engines
+        ]

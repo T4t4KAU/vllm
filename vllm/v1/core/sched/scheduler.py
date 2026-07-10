@@ -88,6 +88,7 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self.fork_execution_stats: tuple[str, int, int, int, int] | None = None
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -1537,6 +1538,8 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        fork_execution_stats = model_runner_output.fork_execution_stats
+        self.fork_execution_stats = fork_execution_stats
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
@@ -1853,7 +1856,11 @@ class Scheduler(SchedulerInterface):
 
         if (
             stats := self.make_stats(
-                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+                spec_decoding_stats,
+                kv_connector_stats,
+                cudagraph_stats,
+                perf_stats,
+                fork_execution_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2684,6 +2691,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        fork_execution_stats: tuple[str, int, int, int, int] | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2714,6 +2722,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            fork_execution_stats=fork_execution_stats,
         )
 
     def make_spec_decoding_stats(

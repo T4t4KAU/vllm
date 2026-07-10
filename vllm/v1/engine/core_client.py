@@ -48,6 +48,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.prefix_router import PrefixAwareDPRouter
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -1337,7 +1338,9 @@ class DPAsyncMPClient(AsyncMPClient):
                         continue
 
                     # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
+                    decoded_stats = msgspec.msgpack.decode(buf)
+                    counts, wave, running = decoded_stats[:3]
+                    telemetry = decoded_stats[3] if len(decoded_stats) > 3 else None
                     self.current_wave = wave
                     self.engines_running = running
                     if counts is not None:
@@ -1351,6 +1354,11 @@ class DPAsyncMPClient(AsyncMPClient):
                         logger.debug(
                             "Received counts: %s (%s)", sliced_counts, count_slice
                         )
+                    prefix_router = getattr(self, "prefix_router", None)
+                    if prefix_router is not None and telemetry is not None:
+                        ranks = self.engine_ranks_managed
+                        count_slice = slice(ranks[0], ranks[-1] + 1)
+                        prefix_router.update_engine_telemetry(telemetry[count_slice])
 
         resources.stats_update_task = asyncio.create_task(
             run_engine_stats_update_task()
@@ -1410,6 +1418,152 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines) * self.client_index
         ) // client_count
 
+        self.prefix_router: PrefixAwareDPRouter | None = None
+        self._last_prefix_router_log_count = 0
+        self._prefix_arrival_wave_s = 0.0
+        self._prefix_wave_pending: list[
+            tuple[EngineCoreRequest, asyncio.Future[None]]
+        ] = []
+        self._prefix_wave_inflight: list[
+            tuple[EngineCoreRequest, asyncio.Future[None]]
+        ] = []
+        self._prefix_wave_task: asyncio.Task[None] | None = None
+        if envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING:
+            backend = vllm_config.attention_config.backend
+            if backend is None or backend.name != "FORK_ATTN":
+                logger.warning(
+                    "Ignoring VLLM_FORK_ATTN_DP_PREFIX_ROUTING because the "
+                    "attention backend is not FORK_ATTN."
+                )
+            elif client_count != 1:
+                logger.warning(
+                    "Ignoring VLLM_FORK_ATTN_DP_PREFIX_ROUTING with multiple "
+                    "API frontend processes; global prefix state is not yet shared."
+                )
+            elif vllm_config.parallel_config.enable_elastic_ep:
+                logger.warning(
+                    "Ignoring VLLM_FORK_ATTN_DP_PREFIX_ROUTING with elastic EP."
+                )
+            else:
+                graph_buckets = tuple(
+                    int(value)
+                    for value in envs.VLLM_FORK_ATTN_FOREST_CTA_BUCKETS.split(",")
+                    if value.strip()
+                )
+                block_size = vllm_config.cache_config.block_size
+                self.prefix_router = PrefixAwareDPRouter(
+                    num_ranks=len(self.core_engines),
+                    block_size=block_size,
+                    load_slack=envs.VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK,
+                    warm_ttl_s=envs.VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL,
+                    min_prefix_blocks=envs.VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS,
+                    max_warm_requests=(envs.VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_REQUESTS),
+                    graph_buckets=graph_buckets,
+                    graph_slack_buckets=(envs.VLLM_FORK_ATTN_DP_GRAPH_SLACK_BUCKETS),
+                    prefix_chunk_blocks=max(
+                        1,
+                        (envs.VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE + block_size - 1)
+                        // block_size,
+                    ),
+                    work_slack_tokens=(envs.VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS),
+                    decode_token_weight=(envs.VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT),
+                )
+                if envs.VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS < 0:
+                    raise ValueError(
+                        "VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS must be non-negative"
+                    )
+                self._prefix_arrival_wave_s = (
+                    envs.VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS / 1000
+                )
+                logger.info(
+                    "Enabled ForkAttention DP prefix routing: block_size=%d, "
+                    "load_slack=%d, warm_ttl=%.1fs, min_prefix_blocks=%d",
+                    vllm_config.cache_config.block_size,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS,
+                )
+
+    async def add_request_async(self, request: EngineCoreRequest) -> None:
+        if self.prefix_router is None or self._prefix_arrival_wave_s <= 0:
+            await super().add_request_async(request)
+            return
+
+        self._ensure_stats_update_task()
+        request.current_wave = self.current_wave
+        request.client_index = self.client_index
+        future = asyncio.get_running_loop().create_future()
+        self._prefix_wave_pending.append((request, future))
+        if self._prefix_wave_task is None:
+            self._prefix_wave_task = asyncio.create_task(self._flush_prefix_wave())
+        await future
+
+    async def _flush_prefix_wave(self) -> None:
+        await asyncio.sleep(self._prefix_arrival_wave_s)
+        pending = self._prefix_wave_pending
+        self._prefix_wave_pending = []
+        self._prefix_wave_inflight = pending
+        if not pending:
+            self._finish_prefix_wave()
+            return
+
+        requests = [request for request, _ in pending]
+        order = self.prefix_router.order_arrival_wave(requests)
+        try:
+            sends = []
+            for index in order:
+                request = requests[index]
+                chosen_engine = self.get_core_engine_for_request(request)
+                sends.append(
+                    self._send_input(
+                        EngineCoreRequestType.ADD,
+                        request,
+                        chosen_engine,
+                    )
+                )
+                if not self.engines_running:
+                    req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
+                    await self.first_req_send_socket.send(req_msg)
+            await asyncio.gather(*sends)
+            self._ensure_output_queue_task()
+        except Exception as error:
+            self.prefix_router.discard_pending(
+                [request.request_id for request in requests]
+            )
+            for request in requests:
+                self.prefix_router.finish_request(
+                    request.request_id,
+                    keep_warm=False,
+                )
+                self.reqs_in_flight.pop(request.request_id, None)
+            for _, future in pending:
+                if not future.done():
+                    future.set_exception(error)
+            self._finish_prefix_wave()
+            return
+
+        for _, future in pending:
+            if not future.done():
+                future.set_result(None)
+        self._finish_prefix_wave()
+
+    def _finish_prefix_wave(self) -> None:
+        self._prefix_wave_inflight = []
+        self._prefix_wave_task = None
+        if self._prefix_wave_pending:
+            self._prefix_wave_task = asyncio.create_task(self._flush_prefix_wave())
+
+    def shutdown(self, timeout: float | None = None) -> None:
+        if self._prefix_wave_task is not None:
+            self._prefix_wave_task.cancel()
+            self._prefix_wave_task = None
+        for _, future in self._prefix_wave_pending + self._prefix_wave_inflight:
+            if not future.done():
+                future.cancel()
+        self._prefix_wave_pending.clear()
+        self._prefix_wave_inflight.clear()
+        super().shutdown(timeout)
+
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None and (
@@ -1418,27 +1572,57 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
         ) is None:
             current_counts = self.lb_engines
-            # TODO use P2C alg for larger DP sizes
-            num_engines = len(current_counts)
-            min_score = sys.maxsize
-            eng_index = 0
-            for i in range(num_engines):
-                # Start from client_index to help with balancing when engines
-                # are empty.
-                idx = (self.eng_start_index + i) % num_engines
-                waiting, running = current_counts[idx]
-                score = waiting * 4 + running
-                if score < min_score:
-                    min_score = score
-                    eng_index = idx
+            prefix_router = getattr(self, "prefix_router", None)
+            if prefix_router is not None:
+                eng_index = prefix_router.choose_rank(
+                    request, current_counts, self.eng_start_index
+                )
+                if prefix_router.route_count % 16 == 0:
+                    self._log_prefix_router_stats()
+            else:
+                # TODO use P2C alg for larger DP sizes
+                num_engines = len(current_counts)
+                min_score = sys.maxsize
+                eng_index = 0
+                for i in range(num_engines):
+                    # Start from client_index to help with balancing when engines
+                    # are empty.
+                    idx = (self.eng_start_index + i) % num_engines
+                    waiting, running = current_counts[idx]
+                    score = waiting * 4 + running
+                    if score < min_score:
+                        min_score = score
+                        eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
+        prefix_router = getattr(self, "prefix_router", None)
+        if prefix_router is not None:
+            prefix_router.add_request(request, eng_index)
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         return chosen_engine
+
+    def _log_prefix_router_stats(self) -> None:
+        prefix_router = self.prefix_router
+        if prefix_router is None:
+            return
+        logger.info(
+            "ForkAttention DP prefix routing stats: requests=%d, "
+            "affinity_routes=%d, graph_bound_routes=%d, arrival_waves=%d, "
+            "rank_routes=%s, "
+            "avg_route_us=%.1f telemetry=%s",
+            prefix_router.route_count,
+            prefix_router.affinity_route_count,
+            prefix_router.graph_bound_route_count,
+            prefix_router.arrival_wave_count,
+            prefix_router.rank_route_counts,
+            prefix_router.average_route_us,
+            prefix_router.telemetry_snapshot,
+        )
+        self._last_prefix_router_log_count = prefix_router.route_count
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1455,9 +1639,30 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        prefix_router = getattr(self, "prefix_router", None)
+        if prefix_router is not None:
+            if (scheduler_stats := outputs.scheduler_stats) is not None:
+                try:
+                    local_rank = self.engine_ranks_managed.index(outputs.engine_index)
+                except ValueError:
+                    pass
+                else:
+                    prefix_router.update_rank_telemetry(
+                        local_rank,
+                        scheduler_stats.fork_execution_stats,
+                        scheduler_stats.kv_cache_usage,
+                    )
+            prefix_router.observe_outputs(outputs.outputs, outputs.finished_requests)
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
+            prefix_router = getattr(self, "prefix_router", None)
+            if (
+                prefix_router is not None
+                and not self.reqs_in_flight
+                and self._last_prefix_router_log_count != prefix_router.route_count
+            ):
+                self._log_prefix_router_stats()
 
     @staticmethod
     async def eep_process_engine_core_notification(

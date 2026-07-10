@@ -1768,6 +1768,10 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter = 0
         self.current_wave = 0
         self.last_counts = (0, 0)
+        self.last_fork_telemetry: tuple[
+            tuple[str, int, int, int, int] | None, float
+        ] = (None, 0.0)
+        self.publish_fork_dp_telemetry = envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING
 
         # Two-phase pause protocol state. When pending_pause is True, the
         # engine keeps stepping (dummy batches) while waiting for all DP
@@ -1904,12 +1908,25 @@ class DPEngineCoreProc(EngineCoreProc):
         if not self.publish_dp_lb_stats:
             return
 
-        # Publish our request counts (if they've changed).
+        # Publish request counts and low-rate physical execution telemetry.
         counts = self.scheduler.get_request_counts()
-        if counts != self.last_counts:
+        if self.publish_fork_dp_telemetry:
+            fork_execution_stats = self.scheduler.fork_execution_stats
+            kv_cache_usage = round(self.scheduler.kv_cache_manager.usage, 3)
+            telemetry = (fork_execution_stats, kv_cache_usage)
+        else:
+            fork_execution_stats = None
+            kv_cache_usage = 0.0
+            telemetry = self.last_fork_telemetry
+        if counts != self.last_counts or telemetry != self.last_fork_telemetry:
             self.last_counts = counts
+            self.last_fork_telemetry = telemetry
             stats = SchedulerStats(
-                *counts, step_counter=self.step_counter, current_wave=self.current_wave
+                *counts,
+                step_counter=self.step_counter,
+                current_wave=self.current_wave,
+                kv_cache_usage=kv_cache_usage,
+                fork_execution_stats=fork_execution_stats,
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 

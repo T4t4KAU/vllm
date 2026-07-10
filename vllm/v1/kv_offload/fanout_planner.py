@@ -247,11 +247,6 @@ class FanoutChunkPlanner:
         chunk: FanoutChunk,
         pressure_level: FanoutPressureLevel,
     ) -> bool:
-        # A CPU backup does not release or demote the GPU block. Keep backup
-        # admission independent from GPU residency unless protection is
-        # explicitly requested for transfer-bandwidth reasons.
-        if self.allow_hot_shared_prefix_backup:
-            return True
         if chunk.lifecycle_state is FanoutLifecycleState.COLD:
             return True
         if chunk.lifecycle_state is FanoutLifecycleState.COOLING:

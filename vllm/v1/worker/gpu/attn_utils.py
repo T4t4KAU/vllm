@@ -568,6 +568,21 @@ def set_fork_cudagraph_prefix_bucket(
                 builder_with_bucket._fork_cudagraph_plan = fork_plan
 
 
+def get_fork_execution_stats(
+    attn_groups: list[list[AttentionGroup]],
+) -> tuple[str, int, int, int, int] | None:
+    """Return the latest physical ForkAttention plan summary."""
+    for groups in attn_groups:
+        for attn_group in groups:
+            if attn_group.backend.get_name() != "FORK_ATTN":
+                continue
+            for builder in attn_group.metadata_builders:
+                stats = getattr(builder, "_fork_last_execution_stats", None)
+                if stats is not None:
+                    return cast(tuple[str, int, int, int, int], stats)
+    return None
+
+
 def set_fork_cpu_metadata(
     attn_groups: list[list[AttentionGroup]],
     block_tables_cpu: Sequence[np.ndarray],

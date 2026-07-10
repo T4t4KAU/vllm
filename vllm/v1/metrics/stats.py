@@ -195,6 +195,8 @@ class SchedulerStats:
 
     cudagraph_stats: CUDAGraphStat | None = None
 
+    fork_execution_stats: tuple[str, int, int, int, int] | None = None
+
     perf_stats: PerfStats | None = None
 
 
