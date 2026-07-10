@@ -244,6 +244,13 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Current GPU KV cache usage, used by connector-side pressure policies.
+    kv_cache_usage: float = 0.0
+
+    # Temporary scheduler-side demand summary consumed while KV connector
+    # metadata is built. Cleared before SchedulerOutput reaches the worker.
+    fanout_waiting_demand: dict[bytes, int] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

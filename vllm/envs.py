@@ -121,7 +121,7 @@ if TYPE_CHECKING:
     VLLM_FORK_ATTN_FOREST_CTA_BUCKETS: str = "64,128,256,384,512"
     VLLM_FORK_ATTN_FOREST_MAX_SPLITS: int = 0
     VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW: int = 16
-    VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES: int = 8
+    VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES: int = 32
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1145,7 +1145,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_FORK_ATTN_FANOUT_ADMISSION_WINDOW", "16")
     ),
     "VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES": lambda: int(
-        os.getenv("VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES", "8")
+        os.getenv("VLLM_FORK_ATTN_FANOUT_ADMISSION_MAX_BYPASSES", "32")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

@@ -241,6 +241,41 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def reserve_cached_prefix(
+        self,
+        request: Request,
+        max_blocks: int,
+    ) -> list[KVCacheBlock]:
+        """Temporarily pin an idle reusable prefix during admission."""
+        if (
+            not self.enable_caching
+            or request.skip_reading_prefix_cache
+            or max_blocks <= 0
+        ):
+            return []
+
+        max_cache_hit_length = min(
+            request.num_tokens - 1,
+            max_blocks * self.block_pool.hash_block_size,
+        )
+        computed_blocks, _ = self.coordinator.find_longest_cache_hit(
+            request.block_hashes,
+            max_cache_hit_length,
+        )
+        blocks = [
+            block
+            for group_blocks in computed_blocks
+            for block in group_blocks
+            if block.ref_cnt == 0 and not block.is_null
+        ]
+        unique_blocks = list({block.block_id: block for block in blocks}.values())
+        self.block_pool.touch(unique_blocks)
+        return unique_blocks
+
+    def release_reserved_prefix(self, blocks: list[KVCacheBlock]) -> None:
+        """Release references acquired by :meth:`reserve_cached_prefix`."""
+        self.block_pool.free_blocks(reversed(blocks))
+
     def allocate_slots(
         self,
         request: Request,

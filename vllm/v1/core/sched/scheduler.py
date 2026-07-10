@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from typing import Any
@@ -189,7 +189,20 @@ class Scheduler(SchedulerInterface):
             self.fork_fanout_admission_window,
             self.fork_fanout_admission_max_bypasses,
         ) = self._init_fork_fanout_admission_config()
+        (
+            self.fork_fanout_preemption_window,
+            self.fork_fanout_preemption_min_fanout,
+        ) = self._init_fork_fanout_preemption_config()
+        self.fork_fanout_profile = self._init_fork_fanout_profile_config()
+        (
+            self.fork_fanout_gpu_hotset_enabled,
+            self.fork_fanout_gpu_hotset_min_fanout,
+            self.fork_fanout_gpu_hotset_min_reuse_blocks,
+            self.fork_fanout_gpu_hotset_min_usage,
+            self.fork_fanout_gpu_hotset_budget_blocks,
+        ) = self._init_fork_fanout_gpu_hotset_config()
         self.fork_fanout_admission_bypass_counts: dict[str, int] = {}
+        self.fork_fanout_reserved_blocks: list[KVCacheBlock] = []
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -406,6 +419,7 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        assert not self.fork_fanout_reserved_blocks
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -543,33 +557,38 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
+                    # Preempt a low-value request and retry.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
                         self.running.remove(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            preempted_req_id = preempted_req.request_id
-                            scheduled_running_reqs.remove(preempted_req)
-                            token_budget += num_scheduled_tokens.pop(preempted_req_id)
-                            req_to_new_blocks.pop(preempted_req_id)
-                            scheduled_spec_decode_tokens.pop(preempted_req_id, None)
-                            preempted_encoder_inputs = scheduled_encoder_inputs.pop(
-                                preempted_req_id, None
-                            )
-                            if preempted_encoder_inputs:
-                                # Restore encoder compute budget if the preempted
-                                # request had encoder inputs scheduled in this step.
-                                num_embeds_to_restore = sum(
-                                    preempted_req.get_num_encoder_embeds(i)
-                                    for i in preempted_encoder_inputs
-                                )
-                                encoder_compute_budget += num_embeds_to_restore
-                            req_index -= 1
                     else:
-                        preempted_req = self.running.pop()
+                        preempted_req = self._select_fanout_preemption_victim(request)
+                        if preempted_req is None:
+                            preempted_req = self.running.pop()
+                        else:
+                            self.running.remove(preempted_req)
+
+                    if preempted_req in scheduled_running_reqs:
+                        preempted_req_id = preempted_req.request_id
+                        scheduled_running_reqs.remove(preempted_req)
+                        token_budget += num_scheduled_tokens.pop(preempted_req_id)
+                        req_to_new_blocks.pop(preempted_req_id)
+                        scheduled_spec_decode_tokens.pop(preempted_req_id, None)
+                        preempted_encoder_inputs = scheduled_encoder_inputs.pop(
+                            preempted_req_id, None
+                        )
+                        if preempted_encoder_inputs:
+                            # Restore encoder compute budget if the preempted
+                            # request had encoder inputs scheduled in this step.
+                            num_embeds_to_restore = sum(
+                                preempted_req.get_num_encoder_embeds(i)
+                                for i in preempted_encoder_inputs
+                            )
+                            encoder_compute_budget += num_embeds_to_restore
+                        req_index -= 1
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
                     preempted_reqs.append(preempted_req)
@@ -1082,6 +1101,12 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        if self.fork_fanout_reserved_blocks:
+            self.kv_cache_manager.release_reserved_prefix(
+                self.fork_fanout_reserved_blocks
+            )
+            self.fork_fanout_reserved_blocks = []
+
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
@@ -1106,6 +1131,8 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            kv_cache_usage=self.kv_cache_manager.usage,
+            fanout_waiting_demand=self._build_fanout_waiting_demand(),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1113,8 +1140,11 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
-            meta = self._build_kv_connector_meta(self.connector, scheduler_output)
-            scheduler_output.kv_connector_metadata = meta
+            try:
+                meta = self._build_kv_connector_meta(self.connector, scheduler_output)
+                scheduler_output.kv_connector_metadata = meta
+            finally:
+                scheduler_output.fanout_waiting_demand = None
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -1864,18 +1894,24 @@ class Scheduler(SchedulerInterface):
 
         return self.waiting or self.skipped_waiting or None
 
-    def _init_fork_fanout_admission_config(self) -> tuple[int, int]:
+    def _is_fork_attention_backend(self) -> bool:
         backend = self.vllm_config.attention_config.backend
-        if getattr(backend, "name", None) != FORK_ATTN_BACKEND_NAME:
-            return 0, 0
+        return getattr(backend, "name", None) == FORK_ATTN_BACKEND_NAME
 
+    def _get_fork_fanout_extra_config(self) -> dict[str, Any]:
         extra_config: dict[str, Any] = {}
         kv_transfer_config = self.vllm_config.kv_transfer_config
         if kv_transfer_config is not None:
             raw_extra_config = kv_transfer_config.kv_connector_extra_config
             if isinstance(raw_extra_config, dict):
                 extra_config = raw_extra_config
+        return extra_config
 
+    def _init_fork_fanout_admission_config(self) -> tuple[int, int]:
+        if not self._is_fork_attention_backend():
+            return 0, 0
+
+        extra_config = self._get_fork_fanout_extra_config()
         window = int(
             extra_config.get(
                 "fanout_admission_window",
@@ -1894,15 +1930,64 @@ class Scheduler(SchedulerInterface):
             raise ValueError("fanout_admission_max_bypasses must be >= 0")
         return window, max_bypasses
 
+    def _init_fork_fanout_preemption_config(self) -> tuple[int, int]:
+        if not self._is_fork_attention_backend():
+            return 0, 0
+
+        extra_config = self._get_fork_fanout_extra_config()
+        if not bool(extra_config.get("fanout_preemption_enabled", True)):
+            return 0, 0
+
+        window = int(
+            extra_config.get(
+                "fanout_preemption_window",
+                self.fork_fanout_admission_window,
+            )
+        )
+        min_fanout = int(extra_config.get("fanout_preemption_min_fanout", 2))
+        if window < 0:
+            raise ValueError("fanout_preemption_window must be >= 0")
+        if min_fanout < 2:
+            raise ValueError("fanout_preemption_min_fanout must be >= 2")
+        return window, min_fanout
+
+    def _init_fork_fanout_profile_config(self) -> bool:
+        if not self._is_fork_attention_backend():
+            return False
+        return bool(self._get_fork_fanout_extra_config().get("fanout_profile", False))
+
+    def _init_fork_fanout_gpu_hotset_config(
+        self,
+    ) -> tuple[bool, int, int, float, int]:
+        if not self._is_fork_attention_backend():
+            return False, 0, 0, 1.0, 0
+        extra_config = self._get_fork_fanout_extra_config()
+        enabled = bool(extra_config.get("fanout_gpu_hotset_enabled", True))
+        min_fanout = int(extra_config.get("fanout_gpu_hotset_min_fanout", 4))
+        min_reuse_blocks = int(
+            extra_config.get("fanout_gpu_hotset_min_reuse_blocks", 128)
+        )
+        min_usage = float(extra_config.get("fanout_gpu_hotset_min_usage", 0.65))
+        budget_blocks = int(extra_config.get("fanout_gpu_hotset_budget_blocks", 512))
+        if min_fanout < 2:
+            raise ValueError("fanout_gpu_hotset_min_fanout must be >= 2")
+        if min_reuse_blocks < 0:
+            raise ValueError("fanout_gpu_hotset_min_reuse_blocks must be >= 0")
+        if min_usage < 0 or min_usage > 1:
+            raise ValueError("fanout_gpu_hotset_min_usage must be in [0, 1]")
+        if budget_blocks < 0:
+            raise ValueError("fanout_gpu_hotset_budget_blocks must be >= 0")
+        return (
+            enabled,
+            min_fanout,
+            min_reuse_blocks,
+            min_usage,
+            budget_blocks,
+        )
+
     def _promote_fanout_waiting_request(self) -> None:
         window = self.fork_fanout_admission_window
-        if window <= 1 or not self.running or not self.waiting:
-            return
-
-        running_block_hashes = [
-            request.block_hashes for request in self.running if request.block_hashes
-        ]
-        if not running_block_hashes:
+        if window <= 1 or not self.waiting:
             return
 
         head_request = self.waiting.peek_request()
@@ -1919,13 +2004,18 @@ class Scheduler(SchedulerInterface):
         best_request: Request | None = None
         best_priority: tuple[int, int, int, int, float, int] | None = None
         best_reuse_score = 0
+        best_prefix_blocks = 0
+        best_fanout = 0
         best_queue_index = 0
 
-        waiting_window = itertools.islice(self.waiting, window)
+        waiting_window = list(itertools.islice(self.waiting, window))
+        hash_counts: Counter[Any] = Counter()
+        for request in itertools.chain(self.running, waiting_window):
+            hash_counts.update(request.block_hashes)
         for queue_index, request in enumerate(waiting_window):
-            reuse_score, prefix_blocks, fanout = self._fanout_admission_score(
+            reuse_score, prefix_blocks, fanout = self._fanout_score_from_hash_counts(
                 request.block_hashes,
-                running_block_hashes,
+                hash_counts,
             )
             suffix_blocks = max(0, len(request.block_hashes) - prefix_blocks)
             priority = (
@@ -1940,17 +2030,217 @@ class Scheduler(SchedulerInterface):
                 best_request = request
                 best_priority = priority
                 best_reuse_score = reuse_score
+                best_prefix_blocks = prefix_blocks
+                best_fanout = fanout
                 best_queue_index = queue_index
 
-        if best_request is None or best_queue_index == 0 or best_reuse_score <= 0:
+        if best_request is None or best_reuse_score <= 0 or best_prefix_blocks <= 0:
             return
 
-        self.fork_fanout_admission_bypass_counts[head_request_id] = (
-            self.fork_fanout_admission_bypass_counts.get(head_request_id, 0) + 1
+        best_prefix = best_request.block_hashes[:best_prefix_blocks]
+        cohort = [
+            request
+            for request in waiting_window
+            if self._has_block_prefix(request.block_hashes, best_prefix)
+        ]
+        if not cohort:
+            return
+
+        if (
+            self.fork_fanout_gpu_hotset_enabled
+            and best_fanout >= self.fork_fanout_gpu_hotset_min_fanout
+            and best_reuse_score >= self.fork_fanout_gpu_hotset_min_reuse_blocks
+            and self.kv_cache_manager.usage >= self.fork_fanout_gpu_hotset_min_usage
+            and self.fork_fanout_gpu_hotset_budget_blocks > 0
+        ):
+            reserved_blocks = self.kv_cache_manager.reserve_cached_prefix(
+                best_request,
+                min(
+                    best_prefix_blocks,
+                    self.fork_fanout_gpu_hotset_budget_blocks,
+                ),
+            )
+            self.fork_fanout_reserved_blocks.extend(reserved_blocks)
+            if self.fork_fanout_profile and reserved_blocks:
+                logger.info(
+                    "Fanout GPU hotset reserved: gpu_hotset_reserved_blocks=%d "
+                    "prefix_blocks=%d cohort_size=%d reuse_score=%d",
+                    len(reserved_blocks),
+                    best_prefix_blocks,
+                    len(cohort),
+                    best_reuse_score,
+                )
+
+        head_bypassed = head_request not in cohort
+        if head_bypassed and max_bypasses > 0:
+            used_bypasses = self.fork_fanout_admission_bypass_counts.get(
+                head_request_id, 0
+            )
+            remaining_bypasses = max_bypasses - used_bypasses
+            if remaining_bypasses <= 0:
+                self.fork_fanout_admission_bypass_counts.pop(head_request_id, None)
+                return
+            cohort = cohort[:remaining_bypasses]
+
+        if self._waiting_front_matches(cohort):
+            return
+
+        if head_bypassed:
+            self.fork_fanout_admission_bypass_counts[head_request_id] = (
+                self.fork_fanout_admission_bypass_counts.get(head_request_id, 0)
+                + len(cohort)
+            )
+        for request in cohort:
+            self.fork_fanout_admission_bypass_counts.pop(request.request_id, None)
+        for request in reversed(cohort):
+            self.waiting.remove_request(request)
+            self.waiting.prepend_request(request)
+
+        if self.fork_fanout_profile:
+            logger.info(
+                "Fanout admission promoted cohort: size=%d reuse_score=%d "
+                "prefix_blocks=%d fanout=%d head_bypassed=%s "
+                "best_queue_index=%d waiting_window=%d",
+                len(cohort),
+                best_reuse_score,
+                best_prefix_blocks,
+                best_fanout,
+                head_bypassed,
+                best_queue_index,
+                len(waiting_window),
+            )
+
+    def _waiting_front_matches(self, requests: Sequence[Request]) -> bool:
+        if not requests:
+            return True
+        front = itertools.islice(self.waiting, len(requests))
+        return all(
+            front_request is request for front_request, request in zip(front, requests)
         )
-        self.fork_fanout_admission_bypass_counts.pop(best_request.request_id, None)
-        self.waiting.remove_request(best_request)
-        self.waiting.prepend_request(best_request)
+
+    @staticmethod
+    def _has_block_prefix(
+        block_hashes: Sequence[Any],
+        prefix: Sequence[Any],
+    ) -> bool:
+        return tuple(block_hashes[: len(prefix)]) == tuple(prefix)
+
+    def _select_fanout_preemption_victim(
+        self,
+        current_request: Request,
+    ) -> Request | None:
+        window = self.fork_fanout_preemption_window
+        if window <= 1 or len(self.running) <= 1:
+            return None
+
+        running_block_hashes = {
+            request: self._resident_fanout_block_hashes(request)
+            for request in self.running
+        }
+        if not any(running_block_hashes.values()):
+            return None
+
+        waiting_block_hashes = [
+            request.block_hashes
+            for request in itertools.islice(self.waiting, window)
+            if request.block_hashes
+        ]
+        hash_counts: Counter[Any] = Counter()
+        for block_hashes in running_block_hashes.values():
+            hash_counts.update(block_hashes)
+        for block_hashes in waiting_block_hashes:
+            hash_counts.update(block_hashes)
+        best_request: Request | None = None
+        best_priority: tuple[int, int, int, int, int] | None = None
+        best_score: tuple[int, int, int] = (0, 0, 0)
+        has_positive_reuse = False
+        positive_reuse_requests = 0
+
+        for running_index, request in enumerate(self.running):
+            reuse_score, prefix_blocks, fanout = self._fanout_score_from_hash_counts(
+                running_block_hashes.get(request, ()),
+                hash_counts,
+            )
+            if fanout < self.fork_fanout_preemption_min_fanout:
+                reuse_score = 0
+                prefix_blocks = 0
+                fanout = 0
+            has_positive_reuse = has_positive_reuse or reuse_score > 0
+            positive_reuse_requests += int(reuse_score > 0)
+            priority = (
+                reuse_score,
+                fanout,
+                prefix_blocks,
+                int(request is not current_request),
+                -running_index,
+            )
+            if best_priority is None or priority < best_priority:
+                best_request = request
+                best_priority = priority
+                best_score = (reuse_score, prefix_blocks, fanout)
+
+        if not has_positive_reuse:
+            return None
+        assert best_request is not None
+        if self.fork_fanout_profile:
+            logger.info(
+                "Fanout preemption selected victim: victim=%s current=%s "
+                "victim_reuse_score=%d victim_prefix_blocks=%d victim_fanout=%d "
+                "protected_running_reqs=%d running_reqs=%d waiting_window=%d",
+                best_request.request_id,
+                current_request.request_id,
+                best_score[0],
+                best_score[1],
+                best_score[2],
+                positive_reuse_requests,
+                len(self.running),
+                window,
+            )
+        return best_request
+
+    def _resident_fanout_block_hashes(self, request: Request) -> Sequence[Any]:
+        num_resident_blocks = min(
+            len(request.block_hashes),
+            request.num_computed_tokens // self.block_size,
+        )
+        if num_resident_blocks <= 0:
+            return ()
+        return request.block_hashes[:num_resident_blocks]
+
+    @classmethod
+    def _fanout_score_from_hash_counts(
+        cls,
+        request_block_hashes: Sequence[Any],
+        hash_counts: Counter[Any],
+    ) -> tuple[int, int, int]:
+        best_reuse_score = 0
+        best_prefix_blocks = 0
+        best_fanout = 0
+        for prefix_blocks, block_hash in enumerate(request_block_hashes, start=1):
+            fanout = hash_counts[block_hash]
+            reuse_score = prefix_blocks * max(0, fanout - 1)
+            if reuse_score > best_reuse_score:
+                best_reuse_score = reuse_score
+                best_prefix_blocks = prefix_blocks
+                best_fanout = fanout
+        return best_reuse_score, best_prefix_blocks, best_fanout
+
+    def _build_fanout_waiting_demand(self) -> dict[bytes, int] | None:
+        if (
+            not self._is_fork_attention_backend()
+            or self.connector is None
+            or self.fork_fanout_admission_window <= 0
+            or not self.waiting
+        ):
+            return None
+        demand: Counter[bytes] = Counter()
+        waiting_requests = itertools.islice(
+            itertools.chain(self.skipped_waiting, self.waiting),
+            self.fork_fanout_admission_window,
+        )
+        for request in waiting_requests:
+            demand.update(request.block_hashes)
+        return dict(demand) or None
 
     @classmethod
     def _fanout_admission_score(
@@ -1972,7 +2262,7 @@ class Scheduler(SchedulerInterface):
             if prefix_blocks <= 0:
                 break
             fanout = index + 2
-            reuse_score = prefix_blocks * fanout
+            reuse_score = prefix_blocks * (fanout - 1)
             if reuse_score > best_reuse_score:
                 best_reuse_score = reuse_score
                 best_prefix_blocks = prefix_blocks

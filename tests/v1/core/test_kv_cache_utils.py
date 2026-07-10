@@ -20,6 +20,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -480,6 +481,30 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     # Append a block back and check again
     queue.append(block_to_remove)
     assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+
+
+def test_block_pool_temporarily_reserves_idle_cached_blocks() -> None:
+    pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    for block_id in (1, 2):
+        pool.blocks[block_id].set_block_hash(
+            make_block_hash_with_group_id(BlockHash(bytes([block_id])), 0)
+        )
+
+    pool.touch([pool.blocks[1], pool.blocks[2]])
+
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == [3, 4]
+
+    pool.free_blocks([pool.blocks[2], pool.blocks[1]])
+
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == [3, 4, 2, 1]
 
 
 def test_generate_block_hash_extra_keys():
