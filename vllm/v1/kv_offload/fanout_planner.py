@@ -16,6 +16,18 @@ class FanoutChunkState(Enum):
     STAGED = auto()
 
 
+class FanoutLifecycleState(Enum):
+    COLD = auto()
+    COOLING = auto()
+    HOT = auto()
+
+
+class FanoutPressureLevel(Enum):
+    NORMAL = auto()
+    HIGH = auto()
+    CRITICAL = auto()
+
+
 @dataclass(frozen=True, slots=True)
 class FanoutBlock:
     request_id: str
@@ -29,6 +41,10 @@ class FanoutBlock:
     state: FanoutChunkState = FanoutChunkState.GPU_ONLY
     is_sealed: bool = True
     is_active_tail: bool = False
+    lifecycle_state: FanoutLifecycleState = FanoutLifecycleState.COLD
+    historical_max_fanout: int = 1
+    recent_access_count: int = 1
+    residency_value: int = 0
     in_flight: bool = False
 
     @property
@@ -41,6 +57,10 @@ class FanoutBlock:
             and not self.is_active_tail
             and not self.in_flight
         )
+
+    @property
+    def is_hot_shared_prefix(self) -> bool:
+        return self.lifecycle_state is not FanoutLifecycleState.COLD
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,22 +107,34 @@ class FanoutChunk:
 
     @property
     def reuse_score(self) -> int:
-        return self.fanout * self.num_blocks
+        return max(0, self.fanout - 1) * self.num_blocks
 
     @property
-    def priority(self) -> tuple[int, float, int, float]:
-        """Priority for shared-prefix GPU reuse. Lower is better.
+    def residency_value(self) -> int:
+        return sum(block.residency_value for block in self.blocks)
 
-        This is intentionally not an eviction-victim priority. The planner
-        admits high-reuse prefix chunks first so their contributing queries can
-        be grouped for one GPU ForkAttention pass, minimizing repeated prefix
-        loads and QK/PV work.
-        """
+    @property
+    def lifecycle_state(self) -> FanoutLifecycleState:
+        return max(
+            (block.lifecycle_state for block in self.blocks),
+            key=lambda state: state.value,
+        )
+
+    @property
+    def is_hot_shared_prefix(self) -> bool:
+        return any(block.is_hot_shared_prefix for block in self.blocks)
+
+    @property
+    def priority(self) -> tuple[int, int, int, float, int, int, float]:
+        """CPU backup priority. High expected reuse sorts first."""
         return (
+            -self.lifecycle_state.value,
             -self.reuse_score,
-            self.prefix_position,
+            -self.residency_value,
+            -self.last_access_time,
             -self.fanout,
-            self.last_access_time,
+            -self.num_blocks,
+            self.prefix_position,
         )
 
 
@@ -110,6 +142,16 @@ class FanoutChunk:
 class FanoutOffloadPlan:
     chunks: tuple[FanoutChunk, ...]
     num_blocks: int
+    protected_hot_shared_chunks: tuple[FanoutChunk, ...] = ()
+    num_protected_hot_shared_blocks: int = 0
+
+    @property
+    def protected_hot_shared_keys(self) -> tuple[OffloadKey, ...]:
+        return tuple(
+            key
+            for chunk in self.protected_hot_shared_chunks
+            for key in chunk.offload_keys
+        )
 
 
 class FanoutChunkPlanner:
@@ -117,6 +159,7 @@ class FanoutChunkPlanner:
         self,
         max_blocks_per_chunk: int | None = None,
         min_fanout: int = 1,
+        allow_hot_shared_prefix_backup: bool = False,
     ) -> None:
         if max_blocks_per_chunk is not None and max_blocks_per_chunk <= 0:
             raise ValueError("max_blocks_per_chunk must be positive")
@@ -124,6 +167,7 @@ class FanoutChunkPlanner:
             raise ValueError("min_fanout must be positive")
         self.max_blocks_per_chunk = max_blocks_per_chunk
         self.min_fanout = min_fanout
+        self.allow_hot_shared_prefix_backup = allow_hot_shared_prefix_backup
 
     def build_chunks(self, blocks: Iterable[FanoutBlock]) -> list[FanoutChunk]:
         ordered = sorted(
@@ -155,16 +199,33 @@ class FanoutChunkPlanner:
         self,
         blocks: Iterable[FanoutBlock],
         budget_blocks: int,
+        pressure_level: FanoutPressureLevel = FanoutPressureLevel.NORMAL,
     ) -> FanoutOffloadPlan:
         if budget_blocks < 0:
             raise ValueError("budget_blocks must be non-negative")
-        if budget_blocks == 0:
-            return FanoutOffloadPlan((), 0)
-
-        chunks = sorted(
-            self._deduplicate(self.build_chunks(blocks)),
-            key=lambda chunk: chunk.priority,
+        chunks = self._deduplicate(self.build_chunks(blocks))
+        eligible_chunks = [
+            chunk
+            for chunk in chunks
+            if self._eligible_for_pressure(chunk, pressure_level)
+        ]
+        protected_hot_shared_chunks = tuple(
+            chunk
+            for chunk in chunks
+            if chunk.is_hot_shared_prefix and chunk not in eligible_chunks
         )
+        num_protected_hot_shared_blocks = sum(
+            chunk.num_blocks for chunk in protected_hot_shared_chunks
+        )
+        if budget_blocks == 0:
+            return FanoutOffloadPlan(
+                (),
+                0,
+                protected_hot_shared_chunks,
+                num_protected_hot_shared_blocks,
+            )
+
+        chunks = sorted(eligible_chunks, key=lambda chunk: chunk.priority)
         selected: list[FanoutChunk] = []
         selected_blocks = 0
         for chunk in chunks:
@@ -174,7 +235,31 @@ class FanoutChunkPlanner:
                 continue
             selected.append(chunk)
             selected_blocks += chunk.num_blocks
-        return FanoutOffloadPlan(tuple(selected), selected_blocks)
+        return FanoutOffloadPlan(
+            tuple(selected),
+            selected_blocks,
+            protected_hot_shared_chunks,
+            num_protected_hot_shared_blocks,
+        )
+
+    def _eligible_for_pressure(
+        self,
+        chunk: FanoutChunk,
+        pressure_level: FanoutPressureLevel,
+    ) -> bool:
+        # A CPU backup does not release or demote the GPU block. Keep backup
+        # admission independent from GPU residency unless protection is
+        # explicitly requested for transfer-bandwidth reasons.
+        if self.allow_hot_shared_prefix_backup:
+            return True
+        if chunk.lifecycle_state is FanoutLifecycleState.COLD:
+            return True
+        if chunk.lifecycle_state is FanoutLifecycleState.COOLING:
+            return pressure_level is not FanoutPressureLevel.NORMAL
+        return (
+            pressure_level is FanoutPressureLevel.CRITICAL
+            and self.allow_hot_shared_prefix_backup
+        )
 
     def _can_merge(
         self,
@@ -188,6 +273,7 @@ class FanoutChunkPlanner:
             and previous.logical_block_idx + 1 == block.logical_block_idx
             and previous.fanout == block.fanout
             and previous.state is block.state
+            and previous.lifecycle_state is block.lifecycle_state
             and (
                 self.max_blocks_per_chunk is None
                 or len(current) < self.max_blocks_per_chunk

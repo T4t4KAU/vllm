@@ -46,11 +46,14 @@ from vllm.v1.kv_offload.base import (
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
+    get_offload_block_hash,
     make_offload_key,
 )
 from vllm.v1.kv_offload.fanout_planner import (
     FanoutBlock,
     FanoutChunkPlanner,
+    FanoutLifecycleState,
+    FanoutPressureLevel,
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
@@ -84,6 +87,145 @@ def _resolve_fanout_chunk_blocks(
     if fanout_budget_blocks > 0:
         chunk_blocks = min(chunk_blocks, fanout_budget_blocks)
     return chunk_blocks
+
+
+def _resolve_fanout_hot_prefix_config(
+    extra_config: dict[str, Any],
+    *,
+    fanout_min_fanout: int,
+) -> tuple[int, float, int, int, int, bool]:
+    hot_prefix_min_fanout = int(
+        extra_config.get(
+            "fanout_hot_prefix_min_fanout",
+            max(4, fanout_min_fanout + 1),
+        )
+    )
+    hot_prefix_max_position = float(
+        extra_config.get("fanout_hot_prefix_max_position", 1.0)
+    )
+    hot_prefix_min_reuse_blocks = int(
+        extra_config.get("fanout_hot_prefix_min_reuse_blocks", 128)
+    )
+    hot_prefix_min_residency_steps = int(
+        extra_config.get("fanout_hot_prefix_min_residency_steps", 4)
+    )
+    hot_prefix_cooldown_steps = int(
+        extra_config.get("fanout_hot_prefix_cooldown_steps", 16)
+    )
+    allow_hot_prefix_backup = bool(
+        extra_config.get("fanout_allow_hot_prefix_backup", True)
+    )
+    if hot_prefix_min_fanout < 0:
+        raise ValueError("fanout_hot_prefix_min_fanout must be non-negative")
+    if hot_prefix_max_position <= 0 or hot_prefix_max_position > 1:
+        raise ValueError("fanout_hot_prefix_max_position must be in (0, 1]")
+    if hot_prefix_min_reuse_blocks < 0:
+        raise ValueError("fanout_hot_prefix_min_reuse_blocks must be non-negative")
+    if hot_prefix_min_residency_steps < 0:
+        raise ValueError("fanout_hot_prefix_min_residency_steps must be non-negative")
+    if hot_prefix_cooldown_steps < 0:
+        raise ValueError("fanout_hot_prefix_cooldown_steps must be non-negative")
+    return (
+        hot_prefix_min_fanout,
+        hot_prefix_max_position,
+        hot_prefix_min_reuse_blocks,
+        hot_prefix_min_residency_steps,
+        hot_prefix_cooldown_steps,
+        allow_hot_prefix_backup,
+    )
+
+
+def _resolve_fanout_pressure_config(
+    extra_config: dict[str, Any],
+) -> tuple[float, float, float, float]:
+    high_threshold = float(extra_config.get("fanout_high_pressure_threshold", 0.90))
+    critical_threshold = float(
+        extra_config.get("fanout_critical_pressure_threshold", 0.97)
+    )
+    high_exit_threshold = float(
+        extra_config.get(
+            "fanout_high_pressure_exit_threshold",
+            round(max(0.0, high_threshold - 0.05), 6),
+        )
+    )
+    critical_exit_threshold = float(
+        extra_config.get(
+            "fanout_critical_pressure_exit_threshold",
+            round(max(high_threshold, critical_threshold - 0.04), 6),
+        )
+    )
+    if high_threshold < 0 or high_threshold > 1:
+        raise ValueError("fanout_high_pressure_threshold must be in [0, 1]")
+    if critical_threshold < 0 or critical_threshold > 1:
+        raise ValueError("fanout_critical_pressure_threshold must be in [0, 1]")
+    if high_threshold > critical_threshold:
+        raise ValueError(
+            "fanout_high_pressure_threshold must be <= "
+            "fanout_critical_pressure_threshold"
+        )
+    if not 0 <= high_exit_threshold <= high_threshold:
+        raise ValueError(
+            "fanout_high_pressure_exit_threshold must be in [0, high threshold]"
+        )
+    if not high_threshold <= critical_exit_threshold <= critical_threshold:
+        raise ValueError(
+            "fanout_critical_pressure_exit_threshold must be between the high "
+            "and critical thresholds"
+        )
+    return (
+        high_threshold,
+        critical_threshold,
+        high_exit_threshold,
+        critical_exit_threshold,
+    )
+
+
+def _is_hot_shared_prefix(
+    *,
+    fanout: int,
+    prefix_position: float,
+    min_fanout: int,
+    max_prefix_position: float,
+    reuse_score: int = 0,
+    min_reuse_score: int = 0,
+) -> bool:
+    return (
+        min_fanout > 0
+        and fanout >= min_fanout
+        and prefix_position <= max_prefix_position
+        and reuse_score >= min_reuse_score
+    )
+
+
+@dataclass(slots=True)
+class FanoutLifecycle:
+    historical_max_fanout: int = 1
+    historical_max_reuse_score: int = 0
+    recent_access_count: int = 0
+    last_access_step: int = 0
+    hot_since_step: int | None = None
+    min_resident_until_step: int = 0
+    last_hot_step: int = 0
+    last_observed_step: int = 0
+
+
+@dataclass(slots=True)
+class FanoutCandidateObservation:
+    request_id: str
+    group_idx: int
+    logical_block_idx: int
+    physical_block_id: int
+    offload_key: OffloadKey
+    fanout: int
+    prefix_position: float
+    reuse_score: int
+    is_active_tail: bool
+
+    def merge(self, other: "FanoutCandidateObservation") -> None:
+        self.fanout = max(self.fanout, other.fanout)
+        self.prefix_position = min(self.prefix_position, other.prefix_position)
+        self.reuse_score = max(self.reuse_score, other.reuse_score)
+        self.is_active_tail = self.is_active_tail or other.is_active_tail
 
 
 @dataclass(slots=True)
@@ -170,6 +312,16 @@ class SchedulerOffloadConfig(NamedTuple):
     fanout_budget_blocks: int
     fanout_min_fanout: int
     fanout_recent_tail_blocks: int
+    fanout_hot_prefix_min_fanout: int
+    fanout_hot_prefix_max_position: float
+    fanout_hot_prefix_min_reuse_blocks: int
+    fanout_hot_prefix_min_residency_steps: int
+    fanout_hot_prefix_cooldown_steps: int
+    fanout_allow_hot_prefix_backup: bool
+    fanout_high_pressure_threshold: float
+    fanout_critical_pressure_threshold: float
+    fanout_high_pressure_exit_threshold: float
+    fanout_critical_pressure_exit_threshold: float
     fanout_layerwise_load: bool
     fanout_profile: bool
 
@@ -248,10 +400,27 @@ class SchedulerOffloadConfig(NamedTuple):
             min_offloaded_block_size=min_offloaded_block_size,
             fanout_budget_blocks=fanout_budget_blocks,
         )
-        fanout_min_fanout = int(spec.extra_config.get("fanout_min_fanout", 2))
+        fanout_min_fanout = int(spec.extra_config.get("fanout_min_fanout", 1))
         fanout_recent_tail_blocks = int(
             spec.extra_config.get("fanout_recent_tail_blocks", 1)
         )
+        (
+            fanout_hot_prefix_min_fanout,
+            fanout_hot_prefix_max_position,
+            fanout_hot_prefix_min_reuse_blocks,
+            fanout_hot_prefix_min_residency_steps,
+            fanout_hot_prefix_cooldown_steps,
+            fanout_allow_hot_prefix_backup,
+        ) = _resolve_fanout_hot_prefix_config(
+            spec.extra_config,
+            fanout_min_fanout=fanout_min_fanout,
+        )
+        (
+            fanout_high_pressure_threshold,
+            fanout_critical_pressure_threshold,
+            fanout_high_pressure_exit_threshold,
+            fanout_critical_pressure_exit_threshold,
+        ) = _resolve_fanout_pressure_config(spec.extra_config)
         fanout_profile = fanout_profiling_enabled(
             spec.extra_config,
             spec.vllm_config,
@@ -291,12 +460,29 @@ class SchedulerOffloadConfig(NamedTuple):
             logger.info(
                 "Fanout KV offload enabled: layerwise_load=%s, "
                 "chunk_blocks=%d, budget_blocks=%d, min_fanout=%d, "
+                "hot_prefix_min_fanout=%d, hot_prefix_max_position=%.3f, "
+                "hot_prefix_min_reuse_blocks=%d, "
+                "hot_prefix_min_residency_steps=%d, "
+                "hot_prefix_cooldown_steps=%d, "
+                "allow_hot_prefix_backup=%s, "
+                "pressure_thresholds=(%.3f, %.3f), "
+                "pressure_exit_thresholds=(%.3f, %.3f), "
                 "estimated_load_bytes=%d, "
                 "threshold_bytes=%d, profile=%s",
                 fanout_layerwise_load,
                 fanout_chunk_blocks,
                 fanout_budget_blocks,
                 fanout_min_fanout,
+                fanout_hot_prefix_min_fanout,
+                fanout_hot_prefix_max_position,
+                fanout_hot_prefix_min_reuse_blocks,
+                fanout_hot_prefix_min_residency_steps,
+                fanout_hot_prefix_cooldown_steps,
+                fanout_allow_hot_prefix_backup,
+                fanout_high_pressure_threshold,
+                fanout_critical_pressure_threshold,
+                fanout_high_pressure_exit_threshold,
+                fanout_critical_pressure_exit_threshold,
                 estimated_load_bytes,
                 layerwise_threshold_bytes,
                 fanout_profile,
@@ -336,6 +522,20 @@ class SchedulerOffloadConfig(NamedTuple):
             fanout_budget_blocks=fanout_budget_blocks,
             fanout_min_fanout=fanout_min_fanout,
             fanout_recent_tail_blocks=fanout_recent_tail_blocks,
+            fanout_hot_prefix_min_fanout=fanout_hot_prefix_min_fanout,
+            fanout_hot_prefix_max_position=fanout_hot_prefix_max_position,
+            fanout_hot_prefix_min_reuse_blocks=(fanout_hot_prefix_min_reuse_blocks),
+            fanout_hot_prefix_min_residency_steps=(
+                fanout_hot_prefix_min_residency_steps
+            ),
+            fanout_hot_prefix_cooldown_steps=fanout_hot_prefix_cooldown_steps,
+            fanout_allow_hot_prefix_backup=fanout_allow_hot_prefix_backup,
+            fanout_high_pressure_threshold=fanout_high_pressure_threshold,
+            fanout_critical_pressure_threshold=fanout_critical_pressure_threshold,
+            fanout_high_pressure_exit_threshold=(fanout_high_pressure_exit_threshold),
+            fanout_critical_pressure_exit_threshold=(
+                fanout_critical_pressure_exit_threshold
+            ),
             fanout_layerwise_load=fanout_layerwise_load,
             fanout_profile=fanout_profile,
         )
@@ -500,31 +700,141 @@ class OffloadingConnectorScheduler:
             FanoutChunkPlanner(
                 self.config.fanout_chunk_blocks,
                 min_fanout=self.config.fanout_min_fanout,
+                allow_hot_shared_prefix_backup=(
+                    self.config.fanout_allow_hot_prefix_backup
+                ),
             )
             if self.config.fanout_offload
             else None
         )
         self._fanout_profile_steps = 0
+        self._fanout_step = 0
+        self._fanout_pressure_state = FanoutPressureLevel.NORMAL
+        self._fanout_lifecycle: dict[OffloadKey, FanoutLifecycle] = {}
 
     def _profile_fanout(
         self,
         *,
+        kv_cache_usage: float,
+        pressure_level: FanoutPressureLevel,
         candidates: int,
+        hot_shared_candidates: int,
+        lifecycle_hot_candidates: int,
+        lifecycle_cooling_candidates: int,
+        lifecycle_cold_candidates: int,
         selected_chunks: int,
         selected_blocks: int,
+        protected_hot_shared_chunks: int,
+        protected_hot_shared_blocks: int,
+        selected_hot_shared_chunks: int,
+        selected_hot_shared_blocks: int,
     ) -> None:
         if not self.config.fanout_profile:
             return
         self._fanout_profile_steps += 1
         logger.info(
             "Fanout offload profile: step=%d candidates=%d "
-            "selected_chunks=%d selected_blocks=%d layerwise_load=%s",
+            "kv_cache_usage=%.4f pressure=%s "
+            "hot_shared_candidates=%d selected_chunks=%d "
+            "lifecycle_hot_candidates=%d lifecycle_cooling_candidates=%d "
+            "lifecycle_cold_candidates=%d "
+            "selected_blocks=%d protected_hot_shared_chunks=%d "
+            "protected_hot_shared_blocks=%d selected_hot_shared_chunks=%d "
+            "selected_hot_shared_blocks=%d layerwise_load=%s",
             self._fanout_profile_steps,
             candidates,
+            kv_cache_usage,
+            pressure_level.name.lower(),
+            hot_shared_candidates,
             selected_chunks,
+            lifecycle_hot_candidates,
+            lifecycle_cooling_candidates,
+            lifecycle_cold_candidates,
             selected_blocks,
+            protected_hot_shared_chunks,
+            protected_hot_shared_blocks,
+            selected_hot_shared_chunks,
+            selected_hot_shared_blocks,
             self.config.fanout_layerwise_load,
         )
+
+    def _fanout_pressure_level(self, kv_cache_usage: float) -> FanoutPressureLevel:
+        state = getattr(
+            self,
+            "_fanout_pressure_state",
+            FanoutPressureLevel.NORMAL,
+        )
+        if state is FanoutPressureLevel.NORMAL:
+            if kv_cache_usage >= self.config.fanout_critical_pressure_threshold:
+                state = FanoutPressureLevel.CRITICAL
+            elif kv_cache_usage >= self.config.fanout_high_pressure_threshold:
+                state = FanoutPressureLevel.HIGH
+        elif state is FanoutPressureLevel.HIGH:
+            if kv_cache_usage >= self.config.fanout_critical_pressure_threshold:
+                state = FanoutPressureLevel.CRITICAL
+            elif kv_cache_usage < self.config.fanout_high_pressure_exit_threshold:
+                state = FanoutPressureLevel.NORMAL
+        elif kv_cache_usage < self.config.fanout_high_pressure_exit_threshold:
+            state = FanoutPressureLevel.NORMAL
+        elif kv_cache_usage < self.config.fanout_critical_pressure_exit_threshold:
+            state = FanoutPressureLevel.HIGH
+
+        self._fanout_pressure_state = state
+        return state
+
+    def _update_fanout_lifecycle(
+        self,
+        key: OffloadKey,
+        *,
+        fanout: int,
+        reuse_score: int,
+        base_hot: bool,
+    ) -> tuple[FanoutLifecycleState, FanoutLifecycle]:
+        step = self._fanout_step
+        lifecycle = self._fanout_lifecycle.setdefault(key, FanoutLifecycle())
+        lifecycle.historical_max_fanout = max(lifecycle.historical_max_fanout, fanout)
+        lifecycle.historical_max_reuse_score = max(
+            lifecycle.historical_max_reuse_score, reuse_score
+        )
+        if lifecycle.last_observed_step != step:
+            if lifecycle.last_observed_step == step - 1:
+                lifecycle.recent_access_count += 1
+            else:
+                lifecycle.recent_access_count = 1
+            lifecycle.last_access_step = step
+            lifecycle.last_observed_step = step
+
+        if base_hot:
+            if lifecycle.hot_since_step is None:
+                lifecycle.hot_since_step = step
+                lifecycle.min_resident_until_step = (
+                    step + self.config.fanout_hot_prefix_min_residency_steps
+                )
+            lifecycle.last_hot_step = step
+            return FanoutLifecycleState.HOT, lifecycle
+
+        lifecycle.hot_since_step = None
+        cooling_until = max(
+            lifecycle.min_resident_until_step,
+            lifecycle.last_hot_step + self.config.fanout_hot_prefix_cooldown_steps,
+        )
+        if lifecycle.last_hot_step > 0 and step <= cooling_until:
+            return FanoutLifecycleState.COOLING, lifecycle
+        return FanoutLifecycleState.COLD, lifecycle
+
+    def _prune_fanout_lifecycle(self) -> None:
+        if self._fanout_step % 64:
+            return
+        retention_steps = max(
+            256,
+            self.config.fanout_hot_prefix_cooldown_steps * 8,
+        )
+        stale_before = self._fanout_step - retention_steps
+        self._fanout_lifecycle = {
+            key: lifecycle
+            for key, lifecycle in self._fanout_lifecycle.items()
+            if lifecycle.last_observed_step >= stale_before
+        }
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -1023,6 +1333,10 @@ class OffloadingConnectorScheduler:
         if planner is None:
             return None
 
+        self._fanout_step += 1
+        kv_cache_usage = float(getattr(scheduler_output, "kv_cache_usage", 0.0))
+        pressure_level = self._fanout_pressure_level(kv_cache_usage)
+
         fanout: Counter[tuple[int, int]] = Counter()
         for tracked_req_status in self._req_status.values():
             for group_config, group_state in zip(
@@ -1033,7 +1347,8 @@ class OffloadingConnectorScheduler:
                     if block_id != 0:
                         fanout[(group_config.group_idx, block_id)] += 1
 
-        candidates: list[FanoutBlock] = []
+        waiting_demand = scheduler_output.fanout_waiting_demand or {}
+        observations: dict[OffloadKey, FanoutCandidateObservation] = {}
         for (
             req_id,
             num_scheduled_tokens,
@@ -1056,6 +1371,7 @@ class OffloadingConnectorScheduler:
                     0,
                     num_blocks - self.config.fanout_recent_tail_blocks,
                 )
+                block_data: list[tuple[int, int, OffloadKey, int]] = []
                 for logical_idx in range(num_blocks):
                     if logical_idx in group_state.fanout_admitted_block_indices:
                         continue
@@ -1065,31 +1381,132 @@ class OffloadingConnectorScheduler:
                     block_id = group_state.block_ids[physical_idx]
                     if logical_idx >= len(group_state.offload_keys):
                         break
-                    candidates.append(
-                        FanoutBlock(
-                            request_id=req_id,
-                            group_idx=group_config.group_idx,
-                            logical_block_idx=logical_idx,
-                            physical_block_id=block_id,
-                            offload_key=group_state.offload_keys[logical_idx],
-                            fanout=fanout[(group_config.group_idx, block_id)],
-                            prefix_position=(logical_idx + 1) / max(num_blocks, 1),
-                            last_access_time=float(
-                                candidate_req_status.req.num_computed_tokens
-                            ),
-                            is_active_tail=logical_idx >= tail_start,
-                        )
+                    offload_key = group_state.offload_keys[logical_idx]
+                    block_fanout = fanout[(group_config.group_idx, block_id)]
+                    block_fanout += waiting_demand.get(
+                        get_offload_block_hash(offload_key),
+                        0,
+                    )
+                    block_data.append(
+                        (logical_idx, block_id, offload_key, block_fanout)
                     )
 
-        plan = planner.select(candidates, self.config.fanout_budget_blocks)
+                reuse_scores: dict[int, int] = {}
+                run_start = 0
+                while run_start < len(block_data):
+                    run_fanout = block_data[run_start][3]
+                    run_end = run_start + 1
+                    while (
+                        run_end < len(block_data)
+                        and block_data[run_end][0] == block_data[run_end - 1][0] + 1
+                        and block_data[run_end][3] == run_fanout
+                    ):
+                        run_end += 1
+                    run_reuse_score = max(0, run_fanout - 1) * (run_end - run_start)
+                    for run_idx in range(run_start, run_end):
+                        reuse_scores[block_data[run_idx][0]] = run_reuse_score
+                    run_start = run_end
+
+                for logical_idx, block_id, offload_key, block_fanout in block_data:
+                    if block_id == 0:
+                        continue
+                    prefix_position = (logical_idx + 1) / max(num_blocks, 1)
+                    reuse_score = reuse_scores[logical_idx]
+                    observation = FanoutCandidateObservation(
+                        request_id=req_id,
+                        group_idx=group_config.group_idx,
+                        logical_block_idx=logical_idx,
+                        physical_block_id=block_id,
+                        offload_key=offload_key,
+                        fanout=block_fanout,
+                        prefix_position=prefix_position,
+                        reuse_score=reuse_score,
+                        is_active_tail=logical_idx >= tail_start,
+                    )
+                    previous = observations.get(offload_key)
+                    if previous is None:
+                        observations[offload_key] = observation
+                    else:
+                        previous.merge(observation)
+
+        candidates: list[FanoutBlock] = []
+        for observation in observations.values():
+            base_hot = _is_hot_shared_prefix(
+                fanout=observation.fanout,
+                prefix_position=observation.prefix_position,
+                min_fanout=self.config.fanout_hot_prefix_min_fanout,
+                max_prefix_position=self.config.fanout_hot_prefix_max_position,
+                reuse_score=observation.reuse_score,
+                min_reuse_score=self.config.fanout_hot_prefix_min_reuse_blocks,
+            )
+            lifecycle_state, lifecycle = self._update_fanout_lifecycle(
+                observation.offload_key,
+                fanout=observation.fanout,
+                reuse_score=observation.reuse_score,
+                base_hot=base_hot,
+            )
+            residency_value = (
+                observation.reuse_score * 16
+                + lifecycle.historical_max_reuse_score * 4
+                + min(lifecycle.recent_access_count, 8)
+                * max(1, lifecycle.historical_max_fanout)
+            )
+            candidates.append(
+                FanoutBlock(
+                    request_id=observation.request_id,
+                    group_idx=observation.group_idx,
+                    logical_block_idx=observation.logical_block_idx,
+                    physical_block_id=observation.physical_block_id,
+                    offload_key=observation.offload_key,
+                    fanout=observation.fanout,
+                    prefix_position=observation.prefix_position,
+                    last_access_time=float(lifecycle.last_access_step),
+                    is_active_tail=observation.is_active_tail,
+                    lifecycle_state=lifecycle_state,
+                    historical_max_fanout=lifecycle.historical_max_fanout,
+                    recent_access_count=lifecycle.recent_access_count,
+                    residency_value=residency_value,
+                )
+            )
+
+        self._prune_fanout_lifecycle()
+        plan = planner.select(
+            candidates,
+            self.config.fanout_budget_blocks,
+            pressure_level,
+        )
         selected: dict[str, set[OffloadKey]] = {}
         for chunk in plan.chunks:
             selected.setdefault(chunk.request_id, set()).update(chunk.offload_keys)
-        self._profile_fanout(
-            candidates=len(candidates),
-            selected_chunks=len(plan.chunks),
-            selected_blocks=plan.num_blocks,
-        )
+        if self.config.fanout_profile:
+            lifecycle_counts = Counter(
+                candidate.lifecycle_state for candidate in candidates
+            )
+            selected_hot_chunks = [
+                chunk for chunk in plan.chunks if chunk.is_hot_shared_prefix
+            ]
+            self._profile_fanout(
+                kv_cache_usage=kv_cache_usage,
+                pressure_level=pressure_level,
+                candidates=len(candidates),
+                hot_shared_candidates=(
+                    lifecycle_counts[FanoutLifecycleState.HOT]
+                    + lifecycle_counts[FanoutLifecycleState.COOLING]
+                ),
+                lifecycle_hot_candidates=lifecycle_counts[FanoutLifecycleState.HOT],
+                lifecycle_cooling_candidates=lifecycle_counts[
+                    FanoutLifecycleState.COOLING
+                ],
+                lifecycle_cold_candidates=lifecycle_counts[FanoutLifecycleState.COLD],
+                selected_chunks=len(plan.chunks),
+                selected_blocks=plan.num_blocks,
+                protected_hot_shared_chunks=len(plan.protected_hot_shared_chunks),
+                protected_hot_shared_blocks=plan.num_protected_hot_shared_blocks,
+                selected_hot_shared_chunks=len(selected_hot_chunks),
+                selected_hot_shared_blocks=sum(
+                    chunk.num_blocks for chunk in selected_hot_chunks
+                ),
+            )
         return selected
 
     def _build_store_jobs(
@@ -1520,6 +1937,8 @@ class OffloadingConnectorScheduler:
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
                 group_state.fanout_admitted_block_indices.clear()
+        self._fanout_lifecycle.clear()
+        self._fanout_step = 0
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
