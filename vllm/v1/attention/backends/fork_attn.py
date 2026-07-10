@@ -8,6 +8,7 @@ kernel.
 """
 
 import os
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, fields
 from typing import Any, ClassVar, cast
@@ -449,10 +450,17 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                     "ForkAttention prefix graph was selected without an "
                     "eligible common prefix"
                 )
+            profile_metadata = _fork_profile_enabled(getattr(self, "vllm_config", None))
+            started_at = time.perf_counter() if profile_metadata else None
             kwargs = self._update_cudagraph_workspace(
                 metadata,
                 workspace,
                 num_active_reqs,
+            )
+            metadata_ms = (
+                (time.perf_counter() - started_at) * 1000
+                if started_at is not None
+                else None
             )
             if not kwargs:
                 raise RuntimeError(
@@ -463,6 +471,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 metadata,
                 enabled=bool(kwargs.get("fork_enabled", False)),
                 reason="cudagraph",
+                metadata_ms=metadata_ms,
             )
             return kwargs
 
@@ -475,10 +484,17 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                     "ForkAttention forest graph was selected without an "
                     "eligible decode batch"
                 )
+            profile_metadata = _fork_profile_enabled(getattr(self, "vllm_config", None))
+            started_at = time.perf_counter() if profile_metadata else None
             kwargs = self._update_cudagraph_forest_workspace(
                 metadata,
                 workspace,
                 num_active_reqs,
+            )
+            metadata_ms = (
+                (time.perf_counter() - started_at) * 1000
+                if started_at is not None
+                else None
             )
             if not kwargs:
                 raise RuntimeError(
@@ -489,6 +505,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 metadata,
                 enabled=bool(kwargs.get("fork_enabled", False)),
                 reason="cudagraph_forest",
+                metadata_ms=metadata_ms,
             )
             return kwargs
 
@@ -500,12 +517,20 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             )
             return {}
 
+        profile_metadata = _fork_profile_enabled(getattr(self, "vllm_config", None))
+        started_at = time.perf_counter() if profile_metadata else None
         forest_kwargs = self._build_fork_forest_kwargs(metadata, num_active_reqs)
+        metadata_ms = (
+            (time.perf_counter() - started_at) * 1000
+            if started_at is not None
+            else None
+        )
         if forest_kwargs:
             self._profile_fork_metadata(
                 metadata,
                 enabled=True,
                 reason="eager_forest",
+                metadata_ms=metadata_ms,
             )
             return forest_kwargs
 
@@ -594,10 +619,14 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
         hratio = self.num_heads_q // self.num_heads_kv
         max_q_per_cta = max(1, 32 // hratio)
-        seq_lens_cpu = [
-            int(seq_len)
-            for seq_len in metadata.seq_lens[:num_reqs].detach().cpu().tolist()
-        ]
+        seq_lens_source = getattr(self, "_fork_seq_lens_cpu", None)
+        if seq_lens_source is None:
+            seq_lens_cpu = [
+                int(seq_len)
+                for seq_len in metadata.seq_lens[:num_reqs].detach().cpu().tolist()
+            ]
+        else:
+            seq_lens_cpu = [int(seq_len) for seq_len in seq_lens_source[:num_reqs]]
         if any(seq_len <= 0 for seq_len in seq_lens_cpu):
             return None
 
@@ -609,34 +638,39 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         if metadata.block_table.shape[1] < max_blocks:
             return None
 
-        block_rows = (
-            metadata.block_table[:num_reqs, :max_blocks].detach().cpu().tolist()
-        )
-        root = _PrefixTrieNode()
         partial_segments: list[tuple[int, int, int]] = []
         max_complete_blocks = 0
+        block_table_source = getattr(self, "_fork_block_table_cpu", None)
+        if block_table_source is None:
+            block_rows = (
+                metadata.block_table[:num_reqs, :max_blocks].detach().cpu().tolist()
+            )
+        else:
+            block_rows = block_table_source[:num_reqs, :max_blocks].tolist()
+
         for req_id, seq_len in enumerate(seq_lens_cpu):
             complete_blocks = seq_len // self.block_size
             partial_tokens = seq_len % self.block_size
             max_complete_blocks = max(max_complete_blocks, complete_blocks)
-            if complete_blocks > 0:
-                _add_trie_path(root, req_id, block_rows[req_id][:complete_blocks])
             if partial_tokens > 0:
-                partial_block_index = complete_blocks
-                if partial_block_index >= len(block_rows[req_id]):
-                    return None
-                partial_segments.append(
-                    (
-                        req_id,
-                        int(block_rows[req_id][partial_block_index]),
-                        partial_tokens,
-                    )
-                )
+                if block_table_source is not None:
+                    partial_block = int(block_table_source[req_id, complete_blocks])
+                else:
+                    assert block_rows is not None
+                    if complete_blocks >= len(block_rows[req_id]):
+                        return None
+                    partial_block = int(block_rows[req_id][complete_blocks])
+                partial_segments.append((req_id, partial_block, partial_tokens))
 
         if max_complete_blocks <= 0 and not partial_segments:
             return None
 
-        boxes: list[_ForkSegmentBox] = []
+        root = _PrefixTrieNode()
+        for req_id, seq_len in enumerate(seq_lens_cpu):
+            complete_blocks = seq_len // self.block_size
+            if complete_blocks > 0:
+                _add_trie_path(root, req_id, block_rows[req_id][:complete_blocks])
+        boxes = []
         rank_by_req = [0] * num_reqs
         chunk_blocks = _get_prefix_chunk_blocks(
             self.block_size,
@@ -707,6 +741,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         reason: str,
         prefix_chunks: int | None = None,
         suffix_blocks: int | None = None,
+        metadata_ms: float | None = None,
     ) -> None:
         if not _fork_profile_enabled(getattr(self, "vllm_config", None)):
             return
@@ -717,12 +752,18 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         key = f"{reason}:{'enabled' if enabled else 'fallback'}"
         first_for_path = counters[key] == 0
         counters[key] += 1
+        timings = getattr(self, "_fork_profile_metadata_ms", None)
+        if timings is None:
+            timings = Counter()
+            self._fork_profile_metadata_ms = timings
+        if metadata_ms is not None:
+            timings[key] += metadata_ms
         total = sum(counters.values())
         if first_for_path or total <= 16 or total % 128 == 0:
             logger.info(
                 "ForkAttention profile: total=%d path=%s num_reqs=%d "
                 "common_prefix_len=%d use_cascade=%s prefix_chunks=%s "
-                "suffix_blocks=%s counters=%s",
+                "suffix_blocks=%s metadata_ms=%.3f avg_metadata_ms=%.3f counters=%s",
                 total,
                 key,
                 metadata.num_actual_tokens,
@@ -730,14 +771,18 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 metadata.use_cascade,
                 prefix_chunks,
                 suffix_blocks,
+                metadata_ms or 0.0,
+                timings[key] / counters[key],
                 dict(counters),
             )
 
     def _get_cudagraph_prefix_chunk_bucket(self) -> int | None:
-        return getattr(self, "_fork_cudagraph_prefix_chunk_bucket", None)
+        plan = getattr(self, "_fork_cudagraph_plan", None)
+        return plan.capacity if getattr(plan, "kind", None) == "common" else None
 
     def _get_cudagraph_forest_cta_bucket(self) -> int | None:
-        return getattr(self, "_fork_cudagraph_forest_cta_bucket", None)
+        plan = getattr(self, "_fork_cudagraph_plan", None)
+        return plan.capacity if getattr(plan, "kind", None) == "forest" else None
 
     def _get_cudagraph_workspace(
         self,

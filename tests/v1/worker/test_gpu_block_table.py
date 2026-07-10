@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -71,6 +72,16 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
     assert block_tables.num_blocks.np[0, 1] == 1
     assert block_tables.num_blocks.np[1, 1] == 2
     assert block_tables.num_blocks.np[2, 1] == 2
+    gathered_cpu = block_tables.gather_block_tables_cpu(
+        np.asarray([1, 0], dtype=np.int32),
+        num_reqs_padded=3,
+    )
+    assert gathered_cpu[0][:, :3].tolist() == [[3, 0, 0], [1, 2, 0], [0, 0, 0]]
+    assert gathered_cpu[1][:, :4].tolist() == [
+        [24, 25, 0, 0],
+        [20, 21, 22, 23],
+        [0, 0, 0, 0],
+    ]
     assert torch.equal(
         block_tables.num_blocks.gpu[:, :2],
         torch.tensor([[2, 1], [4, 2], [0, 2]], dtype=torch.int32, device=device),
@@ -105,6 +116,15 @@ def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
     assert block_tables.num_blocks.np[0, 0] == 3
     assert block_tables.num_blocks.np[1, 0] == 6
     assert block_tables.num_blocks.np[2, 0] == 1
+    assert block_tables.block_tables_cpu[0][0, :3].tolist() == [1, 2, 7]
+    assert block_tables.block_tables_cpu[1][0, :6].tolist() == [
+        20,
+        21,
+        22,
+        23,
+        26,
+        27,
+    ]
 
 
 def test_block_tables_apply_staged_writes_single_group():

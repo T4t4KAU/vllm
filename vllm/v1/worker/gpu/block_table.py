@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -46,12 +47,20 @@ class BlockTables:
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
+        self.block_tables_cpu: list[np.ndarray] = []
+        self.input_block_tables_cpu: list[np.ndarray] = []
         for i in range(self.num_kv_cache_groups):
             max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )
             self.block_tables.append(block_table)
+            self.block_tables_cpu.append(
+                np.zeros((self.max_num_reqs, max_num_blocks), dtype=np.int32)
+            )
+            self.input_block_tables_cpu.append(
+                np.zeros((self.max_num_reqs, max_num_blocks), dtype=np.int32)
+            )
 
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
@@ -117,6 +126,10 @@ class BlockTables:
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
             self.block_tables[i].stage_write(req_index, start, block_ids)
+            end = start + len(block_ids)
+            if overwrite:
+                self.block_tables_cpu[i][req_index].fill(0)
+            self.block_tables_cpu[i][req_index, start:end] = block_ids
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 
     def apply_staged_writes(self) -> None:
@@ -149,6 +162,17 @@ class BlockTables:
             BLOCK_SIZE=1024,  # type: ignore
         )
         return tuple(bt[:num_reqs_padded] for bt in self.input_block_tables)
+
+    def gather_block_tables_cpu(
+        self,
+        idx_mapping: np.ndarray,
+        num_reqs_padded: int,
+    ) -> tuple[np.ndarray, ...]:
+        num_reqs = len(idx_mapping)
+        for group_id, output in enumerate(self.input_block_tables_cpu):
+            output[:num_reqs] = self.block_tables_cpu[group_id][idx_mapping]
+            output[num_reqs:num_reqs_padded].fill(0)
+        return tuple(table[:num_reqs_padded] for table in self.input_block_tables_cpu)
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.

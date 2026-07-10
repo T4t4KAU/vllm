@@ -544,8 +544,7 @@ def should_use_fork_dynamic_forest(
     vllm_config: VllmConfig,
     num_reqs: int,
     uniform_token_count: int | None,
-    fork_prefix_chunk_bucket: int | None,
-    fork_forest_cta_bucket: int | None = None,
+    fork_plan: Any | None,
 ) -> bool:
     if not envs.VLLM_FORK_ATTN_ENABLE_FOREST:
         return False
@@ -553,13 +552,12 @@ def should_use_fork_dynamic_forest(
         return False
     if uniform_token_count != 1 or num_reqs <= 1:
         return False
-    return fork_prefix_chunk_bucket is None and fork_forest_cta_bucket is None
+    return fork_plan is None
 
 
 def set_fork_cudagraph_prefix_bucket(
     attn_groups: list[list[AttentionGroup]],
-    fork_prefix_chunk_bucket: int | None,
-    fork_forest_cta_bucket: int | None = None,
+    fork_plan: Any | None,
 ) -> None:
     for groups in attn_groups:
         for attn_group in groups:
@@ -567,12 +565,25 @@ def set_fork_cudagraph_prefix_bucket(
                 continue
             for builder in attn_group.metadata_builders:
                 builder_with_bucket = cast(Any, builder)
-                builder_with_bucket._fork_cudagraph_prefix_chunk_bucket = (
-                    fork_prefix_chunk_bucket
-                )
-                builder_with_bucket._fork_cudagraph_forest_cta_bucket = (
-                    fork_forest_cta_bucket
-                )
+                builder_with_bucket._fork_cudagraph_plan = fork_plan
+
+
+def set_fork_cpu_metadata(
+    attn_groups: list[list[AttentionGroup]],
+    block_tables_cpu: Sequence[np.ndarray],
+    seq_lens_cpu: Sequence[int] | np.ndarray | torch.Tensor,
+) -> None:
+    """Expose scheduler-owned CPU metadata to ForkAttention planners."""
+    for group_id, groups in enumerate(attn_groups):
+        if group_id >= len(block_tables_cpu):
+            break
+        for attn_group in groups:
+            if attn_group.backend.get_name() != "FORK_ATTN":
+                continue
+            for builder in attn_group.metadata_builders:
+                builder_with_metadata = cast(Any, builder)
+                builder_with_metadata._fork_block_table_cpu = block_tables_cpu[group_id]
+                builder_with_metadata._fork_seq_lens_cpu = seq_lens_cpu
 
 
 def _compute_fork_common_prefix_len(

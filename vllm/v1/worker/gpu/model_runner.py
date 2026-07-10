@@ -60,6 +60,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    set_fork_cpu_metadata,
     set_fork_cudagraph_prefix_bucket,
     should_use_fork_dynamic_forest,
 )
@@ -71,6 +72,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
+    ForkGraphPlan,
     ModelCudaGraphManager,
     get_uniform_token_count,
 )
@@ -1046,6 +1048,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        fork_block_size = get_fork_attention_block_size(
+            self.vllm_config, self.attn_groups
+        )
+        if fork_block_size is not None:
+            block_tables_cpu = self.block_tables.gather_block_tables_cpu(
+                input_batch.idx_mapping_np,
+                num_reqs_padded=input_batch.num_reqs_after_padding,
+            )
+            set_fork_cpu_metadata(
+                self.attn_groups,
+                block_tables_cpu,
+                input_batch.seq_lens_cpu_upper_bound,
+            )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -1163,8 +1178,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
-        fork_prefix_chunk_bucket = None
-        fork_forest_cta_bucket = None
+        fork_plan = None
         if self.cudagraph_manager is not None and not dummy_run:
             fork_prefix_info = get_fork_cudagraph_prefix_info(
                 self.vllm_config,
@@ -1175,12 +1189,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if fork_prefix_info is not None:
                 prefix_blocks, block_size = fork_prefix_info
-                fork_prefix_chunk_bucket = (
-                    self.cudagraph_manager.get_fork_prefix_chunk_bucket(
-                        prefix_blocks,
-                        block_size,
-                    )
+                capacity = self.cudagraph_manager.get_fork_prefix_chunk_bucket(
+                    prefix_blocks,
+                    block_size,
                 )
+                if capacity is not None:
+                    fork_plan = ForkGraphPlan("common", capacity)
             elif uniform_tok_count == 1:
                 fork_block_size = get_fork_attention_block_size(
                     self.vllm_config,
@@ -1199,20 +1213,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             + num_scheduled
                         )
                         fork_req_seq_lens.append(int(seq_len))
-                    fork_forest_cta_bucket = (
-                        self.cudagraph_manager.get_fork_forest_cta_bucket(
-                            num_reqs,
-                            fork_block_size,
-                            fork_req_seq_lens or None,
-                        )
+                    capacity = self.cudagraph_manager.get_fork_forest_cta_bucket(
+                        num_reqs,
+                        fork_block_size,
+                        fork_req_seq_lens or None,
                     )
+                    if capacity is not None:
+                        fork_plan = ForkGraphPlan("forest", capacity)
 
         fork_dynamic_forest = not dummy_run and should_use_fork_dynamic_forest(
             self.vllm_config,
             num_reqs,
             uniform_tok_count,
-            fork_prefix_chunk_bucket,
-            fork_forest_cta_bucket,
+            fork_plan,
         )
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -1230,16 +1243,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled or fork_dynamic_forest,
             num_active_loras=num_active_loras,
-            fork_prefix_chunk_bucket=fork_prefix_chunk_bucket,
-            fork_forest_cta_bucket=fork_forest_cta_bucket,
+            fork_plan=fork_plan,
         )
         if hasattr(self, "attn_groups"):
             set_fork_cudagraph_prefix_bucket(
                 self.attn_groups,
-                batch_desc.fork_prefix_chunk_bucket
-                if batch_desc.cg_mode == CUDAGraphMode.FULL
-                else None,
-                batch_desc.fork_forest_cta_bucket
+                batch_desc.fork_plan
                 if batch_desc.cg_mode == CUDAGraphMode.FULL
                 else None,
             )

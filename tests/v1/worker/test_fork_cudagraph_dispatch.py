@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,8 @@ from vllm.v1.worker.gpu.attn_utils import (
     _compute_fork_common_prefix_len,
     should_use_fork_dynamic_forest,
 )
-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager, ForkGraphPlan
+from vllm.v1.worker.gpu.dp_utils import _resolve_synced_fork_plan
 
 
 def _make_manager() -> CudaGraphManager:
@@ -33,9 +35,19 @@ def _make_manager() -> CudaGraphManager:
     manager._uses_fork_attention = True
     manager._fork_prefix_chunk_buckets = (2, 4)
     manager._fork_forest_cta_buckets = (64, 128, 256, 384, 512)
+    manager._fork_capture_plans = (
+        ForkGraphPlan("common", 2),
+        ForkGraphPlan("common", 4),
+        ForkGraphPlan("forest", 64),
+        ForkGraphPlan("forest", 128),
+        ForkGraphPlan("forest", 256),
+        ForkGraphPlan("forest", 384),
+        ForkGraphPlan("forest", 512),
+    )
     manager._candidates = {}
     manager._capture_descs = {}
     manager._graphs_captured = True
+    manager._fork_dispatch_stats = defaultdict(int)
     return manager
 
 
@@ -52,32 +64,30 @@ def test_fork_cudagraph_dispatch_has_flash_and_fork_decode_graphs(
         num_tokens=16,
         uniform_token_count=1,
         num_active_loras=0,
-        fork_prefix_chunk_bucket=None,
+        fork_plan=None,
     )
     assert flash_desc.cg_mode == CUDAGraphMode.FULL
-    assert flash_desc.fork_prefix_chunk_bucket is None
+    assert flash_desc.fork_plan is None
 
     fork_desc = manager.dispatch(
         num_reqs=16,
         num_tokens=16,
         uniform_token_count=1,
         num_active_loras=0,
-        fork_prefix_chunk_bucket=2,
+        fork_plan=ForkGraphPlan("common", 2),
     )
     assert fork_desc.cg_mode == CUDAGraphMode.FULL
-    assert fork_desc.fork_prefix_chunk_bucket == 2
-    assert fork_desc.fork_forest_cta_bucket is None
+    assert fork_desc.fork_plan == ForkGraphPlan("common", 2)
 
     forest_desc = manager.dispatch(
         num_reqs=16,
         num_tokens=16,
         uniform_token_count=1,
         num_active_loras=0,
-        fork_forest_cta_bucket=512,
+        fork_plan=ForkGraphPlan("forest", 512),
     )
     assert forest_desc.cg_mode == CUDAGraphMode.FULL
-    assert forest_desc.fork_prefix_chunk_bucket is None
-    assert forest_desc.fork_forest_cta_bucket == 512
+    assert forest_desc.fork_plan == ForkGraphPlan("forest", 512)
 
 
 def test_fork_forest_graph_uses_smallest_cta_bucket(
@@ -116,13 +126,75 @@ def test_fork_cudagraph_dispatch_pads_active_requests() -> None:
         num_tokens=13,
         uniform_token_count=1,
         num_active_loras=0,
-        fork_prefix_chunk_bucket=2,
+        fork_plan=ForkGraphPlan("common", 2),
     )
 
     assert fork_desc.cg_mode == CUDAGraphMode.FULL
     assert fork_desc.num_reqs == 16
     assert fork_desc.num_tokens == 16
-    assert fork_desc.fork_prefix_chunk_bucket == 2
+    assert fork_desc.fork_plan == ForkGraphPlan("common", 2)
+
+
+def test_fork_cudagraph_dispatch_records_hits_and_misses() -> None:
+    manager = _make_manager()
+    manager._init_candidates()
+
+    manager.dispatch(16, 16, 1, 0, ForkGraphPlan("common", 2))
+    manager.dispatch(16, 16, 1, 0, ForkGraphPlan("common", 8))
+
+    assert manager.get_fork_dispatch_stats() == {
+        "hit:common": 1,
+        "miss:common": 1,
+        "miss_reason:plan_capacity": 1,
+    }
+
+
+def test_fork_cudagraph_dispatch_uses_larger_compatible_plan() -> None:
+    manager = _make_manager()
+    manager._fork_capture_plans = (ForkGraphPlan("common", 4),)
+    manager._init_candidates()
+
+    desc = manager.dispatch(16, 16, 1, 0, ForkGraphPlan("common", 3))
+
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.fork_plan == ForkGraphPlan("common", 4)
+
+
+def test_fork_cudagraph_capture_plan_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _make_manager()
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH", True)
+    monkeypatch.setattr(
+        envs,
+        "VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS",
+        "common:4,8;forest:256,512",
+    )
+
+    assert manager._init_fork_capture_plans() == (
+        ForkGraphPlan("common", 4),
+        ForkGraphPlan("common", 8),
+        ForkGraphPlan("forest", 256),
+        ForkGraphPlan("forest", 512),
+    )
+
+
+def test_fork_dp_plan_uses_max_capacity_for_matching_kind() -> None:
+    matches, plan = _resolve_synced_fork_plan(
+        torch.tensor([2, 2], dtype=torch.int32),
+        torch.tensor([256, 512], dtype=torch.int32),
+    )
+    assert matches
+    assert plan == ForkGraphPlan("forest", 512)
+
+
+def test_fork_dp_plan_rejects_different_kinds() -> None:
+    matches, plan = _resolve_synced_fork_plan(
+        torch.tensor([1, 2], dtype=torch.int32),
+        torch.tensor([4, 256], dtype=torch.int32),
+    )
+    assert not matches
+    assert plan is None
 
 
 def test_fork_common_prefix_ignores_cudagraph_padding(
@@ -214,24 +286,23 @@ def test_fork_dynamic_forest_uses_dynamic_metadata(
         manager.vllm_config,
         num_reqs=8,
         uniform_token_count=1,
-        fork_prefix_chunk_bucket=None,
+        fork_plan=None,
     )
     assert not should_use_fork_dynamic_forest(
         manager.vllm_config,
         num_reqs=8,
         uniform_token_count=1,
-        fork_prefix_chunk_bucket=2,
+        fork_plan=ForkGraphPlan("common", 2),
     )
     assert not should_use_fork_dynamic_forest(
         manager.vllm_config,
         num_reqs=8,
         uniform_token_count=1,
-        fork_prefix_chunk_bucket=None,
-        fork_forest_cta_bucket=512,
+        fork_plan=ForkGraphPlan("forest", 512),
     )
     assert not should_use_fork_dynamic_forest(
         manager.vllm_config,
         num_reqs=1,
         uniform_token_count=1,
-        fork_prefix_chunk_bucket=None,
+        fork_plan=None,
     )

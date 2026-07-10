@@ -136,7 +136,7 @@ def test_fork_cudagraph_workspace_uses_prefix_bucket(
     )
     builder.compilation_config = SimpleNamespace(max_cudagraph_capture_size=32)
     builder.model_config = SimpleNamespace(max_model_len=32768)
-    builder._fork_cudagraph_prefix_chunk_bucket = 2
+    builder._fork_cudagraph_plan = SimpleNamespace(kind="common", capacity=2)
 
     workspace = builder._get_cudagraph_workspace(
         builder._get_cudagraph_prefix_chunk_bucket()
@@ -320,6 +320,8 @@ def test_fork_forest_metadata_without_global_common_prefix(
         suffix_kv_lens=None,
         causal=True,
     )
+    builder._fork_block_table_cpu = block_table.cpu().numpy()
+    builder._fork_seq_lens_cpu = torch.full((4,), 64, dtype=torch.int32)
 
     kwargs = builder._build_fork_kwargs(metadata)
     torch.cuda.synchronize()

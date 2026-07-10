@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import product
-from typing import Any, NamedTuple, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 import torch
 import torch.nn as nn
@@ -106,6 +107,14 @@ class AttentionStatePair(NamedTuple):
 
 
 @dataclass(frozen=True)
+class ForkGraphPlan:
+    """Static ForkAttention topology selected for CUDA graph replay."""
+
+    kind: Literal["common", "forest"]
+    capacity: int
+
+
+@dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
     matches between the capture and runtime."""
@@ -115,8 +124,7 @@ class BatchExecutionDescriptor:
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
     num_active_loras: int = 0
-    fork_prefix_chunk_bucket: int | None = None
-    fork_forest_cta_bucket: int | None = None
+    fork_plan: ForkGraphPlan | None = None
 
 
 class CreateForwardFn(Protocol):
@@ -137,8 +145,7 @@ def _is_compatible(
     num_tokens: int,
     uniform_token_count: int | None,
     num_active_loras: int,
-    fork_prefix_chunk_bucket: int | None,
-    fork_forest_cta_bucket: int | None,
+    fork_plan: ForkGraphPlan | None,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
@@ -150,9 +157,17 @@ def _is_compatible(
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
-        and desc.fork_prefix_chunk_bucket == fork_prefix_chunk_bucket
-        and desc.fork_forest_cta_bucket == fork_forest_cta_bucket
+        and _is_fork_plan_compatible(desc.fork_plan, fork_plan)
     )
+
+
+def _is_fork_plan_compatible(
+    captured: ForkGraphPlan | None,
+    required: ForkGraphPlan | None,
+) -> bool:
+    if captured is None or required is None:
+        return captured is required
+    return captured.kind == required.kind and captured.capacity >= required.capacity
 
 
 def get_uniform_token_count(
@@ -196,6 +211,7 @@ class CudaGraphManager:
         self._uses_fork_attention = self._is_fork_attention_backend()
         self._fork_prefix_chunk_buckets = self._init_fork_prefix_chunk_buckets()
         self._fork_forest_cta_buckets = self._init_fork_forest_cta_buckets()
+        self._fork_capture_plans = self._init_fork_capture_plans()
         # Precompute actual num_active_loras -> captured case mapping so that
         # dispatch() is a plain dict lookup instead of a per-call bisect.
         self._lora_dispatch_map, self._max_lora_case = self._build_lora_dispatch_map()
@@ -204,6 +220,7 @@ class CudaGraphManager:
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
         self._graphs_captured = False
+        self._fork_dispatch_stats: defaultdict[str, int] = defaultdict(int)
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
@@ -310,6 +327,47 @@ class CudaGraphManager:
             raise ValueError("VLLM_FORK_ATTN_FOREST_CTA_BUCKETS must not be empty")
         return tuple(sorted(buckets))
 
+    def _init_fork_capture_plans(self) -> tuple[ForkGraphPlan, ...]:
+        if not self._uses_fork_attention:
+            return ()
+        raw_config = envs.VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS.strip()
+        if not raw_config:
+            plans = [
+                ForkGraphPlan("common", capacity)
+                for capacity in self._fork_prefix_chunk_buckets
+            ]
+            if envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:
+                plans.extend(
+                    ForkGraphPlan("forest", capacity)
+                    for capacity in self._fork_forest_cta_buckets
+                )
+            return tuple(plans)
+
+        plans: set[ForkGraphPlan] = set()
+        for group in raw_config.split(";"):
+            kind, separator, capacities = group.partition(":")
+            if not separator or kind not in ("common", "forest"):
+                raise ValueError(
+                    "VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS entries must use "
+                    "'common:...' or 'forest:...'"
+                )
+            if kind == "forest" and not envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:
+                raise ValueError(
+                    "forest capture buckets require "
+                    "VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH=1"
+                )
+            for raw_capacity in capacities.split(","):
+                capacity = int(raw_capacity.strip())
+                if capacity <= 0:
+                    raise ValueError(
+                        "ForkAttention capture capacities must be positive"
+                    )
+                plan_kind: Literal["common", "forest"] = (
+                    "common" if kind == "common" else "forest"
+                )
+                plans.add(ForkGraphPlan(plan_kind, capacity))
+        return tuple(sorted(plans, key=lambda plan: (plan.kind, plan.capacity)))
+
     def get_fork_forest_cta_bucket(
         self,
         num_reqs: int,
@@ -365,31 +423,17 @@ class CudaGraphManager:
                 and decode_mode
                 and self.decode_query_len <= num_tokens <= max_decode_tokens
             ):
-                fork_graph_buckets: tuple[tuple[int | None, int | None], ...] = (
-                    (None, None),
-                )
+                fork_graph_plans: tuple[ForkGraphPlan | None, ...] = (None,)
                 if self._uses_fork_attention:
-                    fork_graph_buckets += tuple(
-                        (prefix_bucket, None)
-                        for prefix_bucket in self._fork_prefix_chunk_buckets
-                    )
-                    if envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:
-                        fork_graph_buckets += tuple(
-                            (None, forest_bucket)
-                            for forest_bucket in self._fork_forest_cta_buckets
-                        )
-                for (
-                    fork_prefix_chunk_bucket,
-                    fork_forest_cta_bucket,
-                ) in fork_graph_buckets:
+                    fork_graph_plans += self._fork_capture_plans
+                for fork_plan in fork_graph_plans:
                     desc = BatchExecutionDescriptor(
                         cg_mode=decode_mode,
                         num_tokens=num_tokens,
                         num_reqs=num_tokens // self.decode_query_len,
                         uniform_token_count=self.decode_query_len,
                         num_active_loras=num_active_loras,
-                        fork_prefix_chunk_bucket=fork_prefix_chunk_bucket,
-                        fork_forest_cta_bucket=fork_forest_cta_bucket,
+                        fork_plan=fork_plan,
                     )
                     descs_by_mode[decode_mode].append(desc)
                     descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
@@ -512,8 +556,7 @@ class CudaGraphManager:
         num_tokens: int,
         uniform_token_count: int | None,
         num_active_loras: int,
-        fork_prefix_chunk_bucket: int | None = None,
-        fork_forest_cta_bucket: int | None = None,
+        fork_plan: ForkGraphPlan | None = None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
@@ -527,18 +570,51 @@ class CudaGraphManager:
                     num_tokens,
                     uniform_token_count,
                     effective_loras,
-                    fork_prefix_chunk_bucket,
-                    fork_forest_cta_bucket,
+                    fork_plan,
                 ):
+                    if self._uses_fork_attention:
+                        plan_kind = "base" if fork_plan is None else fork_plan.kind
+                        self._fork_dispatch_stats[f"hit:{plan_kind}"] += 1
+                        self._profile_fork_dispatch()
                     return desc
+        if self._uses_fork_attention:
+            plan_kind = "base" if fork_plan is None else fork_plan.kind
+            self._fork_dispatch_stats[f"miss:{plan_kind}"] += 1
+            if num_tokens <= 0:
+                reason = "empty"
+            elif key not in self._candidates:
+                reason = "batch_size"
+            elif fork_plan is not None:
+                reason = "plan_capacity"
+            else:
+                reason = "shape"
+            self._fork_dispatch_stats[f"miss_reason:{reason}"] += 1
+            self._profile_fork_dispatch()
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
-            fork_prefix_chunk_bucket=fork_prefix_chunk_bucket,
-            fork_forest_cta_bucket=fork_forest_cta_bucket,
+            fork_plan=fork_plan,
         )
+
+    def get_fork_dispatch_stats(self) -> dict[str, int]:
+        return dict(self._fork_dispatch_stats)
+
+    def _profile_fork_dispatch(self) -> None:
+        if os.environ.get("PROFILE_FORK") != "1":
+            return
+        total = sum(
+            count
+            for key, count in self._fork_dispatch_stats.items()
+            if key.startswith(("hit:", "miss:"))
+        )
+        if total <= 16 or total % 128 == 0:
+            logger.info(
+                "ForkAttention CUDA graph dispatch: total=%d counters=%s",
+                total,
+                dict(self._fork_dispatch_stats),
+            )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
@@ -626,8 +702,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 lora_capture_hook(desc.num_active_loras, num_reqs, num_tokens)
             set_fork_cudagraph_prefix_bucket(
                 attn_groups,
-                desc.fork_prefix_chunk_bucket,
-                desc.fork_forest_cta_bucket,
+                desc.fork_plan,
             )
 
             num_tokens_across_dp = (
