@@ -207,8 +207,8 @@ def _run_flash_ref(
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize(
     ("num_heads", "num_kv_heads"),
-    [(16, 4), (14, 2)],
-    ids=["gqa4", "gqa7"],
+    [(16, 4), (14, 2), (16, 2)],
+    ids=["gqa4", "gqa7", "gqa8"],
 )
 def test_fork_attention_shared_prefix(
     dtype: torch.dtype,
@@ -247,8 +247,8 @@ def test_fork_attention_shared_prefix(
 )
 @pytest.mark.parametrize(
     ("num_heads", "num_kv_heads"),
-    [(16, 4), (14, 2)],
-    ids=["gqa4", "gqa7"],
+    [(16, 4), (14, 2), (16, 2)],
+    ids=["gqa4", "gqa7", "gqa8"],
 )
 def test_fork_attention_split_prefix_suffix(
     num_heads: int,

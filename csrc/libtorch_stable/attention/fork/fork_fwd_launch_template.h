@@ -98,11 +98,8 @@ void fork_run_mha_fwd_splitkv_dispatch(std::vector<fork_fwd_params>& params,
                                        cudaStream_t stream) {
   const int q_head_ratio = params[0].q_head_ratio;
   int q_head_offset = 0;
-  while (q_head_ratio - q_head_offset >= 8) {
-    launch_head_group<elem_type, Headdim, 8>(params, stream, q_head_offset);
-    q_head_offset += 8;
-  }
-  if (q_head_ratio - q_head_offset >= 4) {
+  // Larger groups break vectorized Q/O layouts for some head and warp shapes.
+  while (q_head_ratio - q_head_offset >= 4) {
     launch_head_group<elem_type, Headdim, 4>(params, stream, q_head_offset);
     q_head_offset += 4;
   }
