@@ -35,7 +35,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
   // constexpr int kNWarps = Kernel_traits::kNWarps;
   constexpr int HRatio = Kernel_traits::HRatio;
 
-  const Block<HRatio> binfo(params, bidb);
+  const Block<HRatio> binfo(params, bidb, bidh);
   if (binfo.sum_s_q <= 0 || binfo.kv_in_CTA <= 0) {
     return;
   }
@@ -49,7 +49,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
 
   Tensor gQ = make_tensor(
       make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) +
-                    binfo.q_offset(bidh, params.q_head_stride)),
+                    binfo.q_offset(params.q_head_stride)),
       Shape<Shape<Int<HRatio>, Int<kBlockM / HRatio>>, Int<kHeadDim>>{},
       make_stride(make_stride(params.q_head_stride, params.q_batch_stride),
                   Int<1>{}));
@@ -289,7 +289,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
   __syncthreads();
   cute::copy(smem_tiled_copyO, taccOrO, taccOsO);
 
-  auto [o_offset, lse_offset] = binfo.o_lse_offset(params, bidb, bidh * HRatio);
+  auto [o_offset, lse_offset] = binfo.o_lse_offset(params, bidb);
 
   Tensor gOaccum = make_tensor(
       make_gmem_ptr(reinterpret_cast<ElementO*>(params.oaccum_ptr) + o_offset),

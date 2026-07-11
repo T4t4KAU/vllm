@@ -22,6 +22,8 @@ struct base_params {
   int kv_head_stride;
 
   int h, h_k;
+  int q_head_ratio;
+  int q_head_offset;
 
   int b;
   int page_block_size;

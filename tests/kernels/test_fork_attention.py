@@ -205,13 +205,21 @@ def _run_flash_ref(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_fork_attention_shared_prefix(dtype: torch.dtype, head_dim: int) -> None:
+@pytest.mark.parametrize(
+    ("num_heads", "num_kv_heads"),
+    [(16, 4), (14, 2)],
+    ids=["gqa4", "gqa7"],
+)
+def test_fork_attention_shared_prefix(
+    dtype: torch.dtype,
+    head_dim: int,
+    num_heads: int,
+    num_kv_heads: int,
+) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
     batch = 8
     block_size = 32
-    num_heads = 16
-    num_kv_heads = 4
     seq_len = 128
     num_blocks = seq_len // block_size
 
@@ -237,14 +245,20 @@ def test_fork_attention_shared_prefix(dtype: torch.dtype, head_dim: int) -> None
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
     reason="FORK requires SM80+",
 )
-def test_fork_attention_split_prefix_suffix() -> None:
+@pytest.mark.parametrize(
+    ("num_heads", "num_kv_heads"),
+    [(16, 4), (14, 2)],
+    ids=["gqa4", "gqa7"],
+)
+def test_fork_attention_split_prefix_suffix(
+    num_heads: int,
+    num_kv_heads: int,
+) -> None:
     torch.manual_seed(1)
     device = torch.device("cuda")
     dtype = torch.float16
     batch = 6
     block_size = 32
-    num_heads = 16
-    num_kv_heads = 4
     head_dim = 128
     prefix_blocks = 4
     suffix_blocks = 2

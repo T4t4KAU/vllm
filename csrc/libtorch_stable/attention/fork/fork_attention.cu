@@ -77,6 +77,8 @@ void set_params_base(FORK_NAMESPACE::base_params& params, const Tensor& q,
   params.b = q.size(0);
   params.h = q.size(2);
   params.h_k = k.size(2);
+  params.q_head_ratio = params.h / params.h_k;
+  params.q_head_offset = 0;
   params.page_block_size = k.size(1);
 
   params.scale_softmax = static_cast<float>(softmax_scale);
@@ -186,10 +188,6 @@ void fork_attention(Tensor& out, Tensor& softmax_lse, Tensor& split_out,
                   "softmax_lse shape mismatch");
   STD_TORCH_CHECK(q.size(2) % k_cache.size(2) == 0,
                   "query heads must be divisible by kv heads");
-  const int64_t h_ratio = q.size(2) / k_cache.size(2);
-  STD_TORCH_CHECK(h_ratio == 1 || h_ratio == 2 || h_ratio == 4 || h_ratio == 8,
-                  "ForkAttention supports GQA ratios 1, 2, 4, and 8");
-
   check_last_dim_contiguous(q, "q");
   check_last_dim_contiguous(k_cache, "k_cache");
   check_last_dim_contiguous(v_cache, "v_cache");

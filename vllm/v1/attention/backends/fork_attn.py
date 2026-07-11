@@ -739,10 +739,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             return False
         if not _is_supported_fork_kv_cache_dtype(self.kv_cache_dtype):
             return False
-        if self.num_heads_q % self.num_heads_kv != 0:
-            return False
-        hratio = self.num_heads_q // self.num_heads_kv
-        return hratio in (1, 2, 4, 8)
+        return self.num_heads_q % self.num_heads_kv == 0
 
     def _can_use_fork(self, metadata: FlashAttentionMetadata) -> bool:
         return (

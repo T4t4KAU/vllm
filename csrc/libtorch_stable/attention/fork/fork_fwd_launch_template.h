@@ -66,38 +66,65 @@ void launch(fork_fwd_params& params, cudaStream_t& stream) {
   FORK_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+template <typename elem_type, int Headdim, int HRatio>
+void launch_head_group(std::vector<fork_fwd_params>& params,
+                       cudaStream_t stream, int q_head_offset) {
+  for (fork_fwd_params& param : params) {
+    param.q_head_offset = q_head_offset;
+  }
+
+  if (params[0].max_split_per_seq == 1) {
+    MNW_SWITCH(params[0].tile_q, params[0].tile_kv, params[0].Warps, kBlockM,
+               kBlockN, Warps, [&]() {
+                 launch<fwd_kernel_traits<elem_type, elem_type, kBlockM,
+                                          kBlockN, Headdim, Warps, HRatio>>(
+                     params[0], stream);
+               });
+    return;
+  }
+
+  for (fork_fwd_params& param : params) {
+    MNW_SWITCH(param.tile_q, param.tile_kv, param.Warps, kBlockM, kBlockN,
+               Warps, [&]() {
+                 launch<fwd_kernel_traits<elem_type, float, kBlockM, kBlockN,
+                                          Headdim, Warps, HRatio>>(param,
+                                                                   stream);
+               });
+  }
+}
+
 template <typename elem_type, int Headdim>
 void fork_run_mha_fwd_splitkv_dispatch(std::vector<fork_fwd_params>& params,
                                        cudaStream_t stream) {
-  HRatio_SWITCH(params[0].h / params[0].h_k, HRatio, [&]() {
-    if (params[0].max_split_per_seq == 1) {
-      // In this case, we will not run gather_kernel
-      MNW_SWITCH(params[0].tile_q, params[0].tile_kv, params[0].Warps, kBlockM,
-                 kBlockN, Warps, [&]() {
-                   launch<fwd_kernel_traits<elem_type, elem_type, kBlockM,
-                                            kBlockN, Headdim, Warps, HRatio>>(
-                       params[0], stream);
-                 });
-    } else {
-      const int num_kernels = params.size();
-      for (int i = 0; i < num_kernels; i++) {
-        MNW_SWITCH(params[i].tile_q, params[i].tile_kv, params[i].Warps,
-                   kBlockM, kBlockN, Warps, [&]() {
-                     launch<fwd_kernel_traits<elem_type, float, kBlockM,
-                                              kBlockN, Headdim, Warps, HRatio>>(
-                         params[i], stream);
-                   });
-      }
+  const int q_head_ratio = params[0].q_head_ratio;
+  int q_head_offset = 0;
+  while (q_head_ratio - q_head_offset >= 8) {
+    launch_head_group<elem_type, Headdim, 8>(params, stream, q_head_offset);
+    q_head_offset += 8;
+  }
+  if (q_head_ratio - q_head_offset >= 4) {
+    launch_head_group<elem_type, Headdim, 4>(params, stream, q_head_offset);
+    q_head_offset += 4;
+  }
+  if (q_head_ratio - q_head_offset >= 2) {
+    launch_head_group<elem_type, Headdim, 2>(params, stream, q_head_offset);
+    q_head_offset += 2;
+  }
+  if (q_head_ratio - q_head_offset == 1) {
+    launch_head_group<elem_type, Headdim, 1>(params, stream, q_head_offset);
+  }
 
-      dim3 grid_gather(params[0].b, params[0].h);
-      constexpr int WARPS = Headdim == 64 ? 2 : 4;
-      GBLOCKM_SWITCH(params[0].max_split_per_seq, [&]() {
-        gather_kernel<elem_type, Headdim, BLOCKM, WARPS>
-            <<<grid_gather, WARPS * 32, 0, stream>>>(params[0]);
-      });
-      FORK_CUDA_KERNEL_LAUNCH_CHECK();
-    }
+  if (params[0].max_split_per_seq == 1) {
+    return;
+  }
+
+  dim3 grid_gather(params[0].b, params[0].h);
+  constexpr int WARPS = Headdim == 64 ? 2 : 4;
+  GBLOCKM_SWITCH(params[0].max_split_per_seq, [&]() {
+    gather_kernel<elem_type, Headdim, BLOCKM, WARPS>
+        <<<grid_gather, WARPS * 32, 0, stream>>>(params[0]);
   });
+  FORK_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace FORK_NAMESPACE

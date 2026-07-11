@@ -75,6 +75,36 @@ def _make_builder(
     return builder
 
 
+@pytest.mark.parametrize(
+    ("num_heads", "num_kv_heads", "expected"),
+    [(14, 2, True), (14, 4, False)],
+    ids=["qwen2_5_gqa7", "non_divisible"],
+)
+def test_fork_decode_supports_non_power_of_two_gqa(
+    monkeypatch: pytest.MonkeyPatch,
+    num_heads: int,
+    num_kv_heads: int,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    builder = _make_builder(
+        block_size=16,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=64,
+    )
+    metadata = SimpleNamespace(
+        max_query_len=1,
+        num_actual_tokens=2,
+        seq_lens=torch.empty(2),
+        causal=True,
+        mm_prefix_range_tensor=None,
+        rswa_prefix_lens=None,
+    )
+
+    assert builder._can_use_fork_decode(metadata) is expected
+
+
 def _run_flash_ref(
     q: torch.Tensor,
     k_cache: torch.Tensor,

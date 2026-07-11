@@ -65,23 +65,6 @@
     }                                                             \
   }()
 
-#define HRatio_SWITCH(h_ratio, CONST_NAME, ...) \
-  [&] {                                         \
-    if (h_ratio == 1) {                         \
-      constexpr static int CONST_NAME = 1;      \
-      return __VA_ARGS__();                     \
-    } else if (h_ratio == 2) {                  \
-      constexpr static int CONST_NAME = 2;      \
-      return __VA_ARGS__();                     \
-    } else if (h_ratio == 4) {                  \
-      constexpr static int CONST_NAME = 4;      \
-      return __VA_ARGS__();                     \
-    } else if (h_ratio == 8) {                  \
-      constexpr static int CONST_NAME = 8;      \
-      return __VA_ARGS__();                     \
-    }                                           \
-  }()
-
 #define GBLOCKM_SWITCH(MAX_SPLITS, ...) \
   [&] {                                 \
     if (MAX_SPLITS <= 4) {              \
