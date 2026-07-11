@@ -77,10 +77,10 @@ def _make_builder(
 
 @pytest.mark.parametrize(
     ("num_heads", "num_kv_heads", "expected"),
-    [(14, 2, True), (14, 4, False)],
-    ids=["qwen2_5_gqa7", "non_divisible"],
+    [(14, 2, True), (32, 8, True), (14, 4, False)],
+    ids=["qwen2_5_gqa7", "llama3_2_gqa4", "non_divisible"],
 )
-def test_fork_decode_supports_non_power_of_two_gqa(
+def test_fork_decode_supports_model_gqa_geometry(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
     num_kv_heads: int,
