@@ -1,7 +1,7 @@
 #pragma once
 
 #include "namespace_config.h"
-#include "sm120_arch.h"
+#include "cuda_arch.h"
 #include "cute/tensor.hpp"
 
 #include "cutlass/cutlass.h"
@@ -47,7 +47,7 @@ struct fwd_kernel_traits {
   using GmemLayoutAtom = Layout<
       Shape<Int<kNWarps * 32 / KVGmemThreadsPerRow>, Int<KVGmemThreadsPerRow>>,
       Stride<Int<KVGmemThreadsPerRow>, _1>>; /*(16,8):(8,1)*/
-  using Gmem_copy_struct = fork_sm120::CpAsync<cute::uint128_t>;
+  using Gmem_copy_struct = fork_cuda::CpAsync<cute::uint128_t>;
   // static constexpr int QRowsPerThread = kBlockM / (kNWarps * 32 /
   // QKVGmemThreadsPerRow); // (kBlockM / (128/8))
   static constexpr int QRowsPerThread = HRatio;
@@ -68,14 +68,14 @@ struct fwd_kernel_traits {
       Copy_Atom<Gmem_copy_struct, Element>{}, GmemLayoutAtom{},
       Layout<Shape<Int<KVRowsPerThread>, Int<KVGmemThreadsPerRow>>,
              Stride<Int<KVGmemThreadsPerRow>, _1>>{}));
-  using MMA_Atom_Arch = fork_sm120::Mma<Element>;
+  using MMA_Atom_Arch = fork_cuda::Mma<Element>;
   using TiledMma =
       TiledMMA<MMA_Atom_Arch,
                Layout<Shape<Int<Warps>, _1, _1>>,  // 4x1x1 or 8x1x1 thread
                                                    // group
                Tile<Int<kBlockM>, _16, _16>>;
-  using SmemCopyAtom = fork_sm120::LdMatrix<Element>;
-  using SmemCopyAtomTransposed = fork_sm120::LdMatrixTransposed<Element>;
+  using SmemCopyAtom = fork_cuda::LdMatrix<Element>;
+  using SmemCopyAtomTransposed = fork_cuda::LdMatrixTransposed<Element>;
   using SmemLayoutAtomO = decltype(composition(
       Swizzle<kSwizzle, 3, 3>{},
       Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));

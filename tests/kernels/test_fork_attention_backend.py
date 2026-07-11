@@ -9,10 +9,12 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.fork_attn import (
+    ForkAttentionBackend,
     ForkAttentionImpl,
     ForkAttentionMetadata,
     ForkAttentionMetadataBuilder,
@@ -24,6 +26,37 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 def test_fork_attention_backend_registered() -> None:
     backend_cls = AttentionBackendEnum.FORK_ATTN.get_class()
     assert backend_cls.get_name() == "FORK_ATTN"
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_error"),
+    [
+        (DeviceCapability(8, 0), None),
+        (DeviceCapability(8, 9), None),
+        (DeviceCapability(7, 5), "compute capability >= 8.0"),
+    ],
+)
+def test_fork_attention_backend_device_capability(
+    capability: DeviceCapability,
+    expected_error: str | None,
+) -> None:
+    error = ForkAttentionBackend.supports_combination(
+        head_size=128,
+        dtype=torch.float16,
+        kv_cache_dtype=None,
+        block_size=16,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=capability,
+    )
+
+    if expected_error is None:
+        assert error is None
+    else:
+        assert error is not None
+        assert expected_error in error
 
 
 def _make_builder(
@@ -406,8 +439,8 @@ def test_fork_forest_metadata_emits_hierarchical_segments(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 def test_fork_attention_backend_forward_uses_fork(
     monkeypatch: pytest.MonkeyPatch,
@@ -512,8 +545,8 @@ def test_fork_attention_backend_forward_uses_fork(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 def test_fork_attention_backend_forward_uses_prefix_forest(
     monkeypatch: pytest.MonkeyPatch,
@@ -600,8 +633,8 @@ def test_fork_attention_backend_forward_uses_prefix_forest(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 def test_fork_forest_cudagraph_replay_handles_noncontiguous_pages(
     monkeypatch: pytest.MonkeyPatch,

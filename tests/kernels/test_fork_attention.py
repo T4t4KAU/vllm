@@ -200,8 +200,8 @@ def _run_flash_ref(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128])
@@ -234,8 +234,8 @@ def test_fork_attention_shared_prefix(dtype: torch.dtype, head_dim: int) -> None
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 def test_fork_attention_split_prefix_suffix() -> None:
     torch.manual_seed(1)
@@ -278,8 +278,8 @@ def test_fork_attention_split_prefix_suffix() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 def test_fork_attention_masks_partial_suffix_block() -> None:
     torch.manual_seed(2)
@@ -323,8 +323,8 @@ def test_fork_attention_masks_partial_suffix_block() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 12,
-    reason="FORK requires SM120+",
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
+    reason="FORK requires SM80+",
 )
 def test_fork_attention_interleaved_kv_cache_suffix_page_stride() -> None:
     torch.manual_seed(3)

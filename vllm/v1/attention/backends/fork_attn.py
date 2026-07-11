@@ -1390,8 +1390,8 @@ class ForkAttentionBackend(FlashAttentionBackend):
             return "FORK attention does not support mm_prefix"
         if has_sink:
             return "FORK attention does not support sinks"
-        if device_capability < DeviceCapability(12, 0):
-            return "FORK attention requires compute capability >= 12.0"
+        if device_capability < DeviceCapability(8, 0):
+            return "FORK attention requires compute capability >= 8.0"
         if dtype not in cls.supported_dtypes:
             return "dtype not supported"
         if not cls.supports_head_size(head_size):

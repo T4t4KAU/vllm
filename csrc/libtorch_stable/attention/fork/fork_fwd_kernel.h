@@ -160,7 +160,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
         partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
 
     clear(acc_s);
-    fork_sm120::cp_async_wait<0>();
+    fork_cuda::cp_async_wait<0>();
     __syncthreads();
 
     flash::copy<false, true>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV,
@@ -200,7 +200,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
       }
     }
 
-    fork_sm120::cp_async_wait<0>();
+    fork_cuda::cp_async_wait<0>();
     __syncthreads();
 
     if (n_block > 0) {
@@ -231,7 +231,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
     Tensor acc_s =
         partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
-    fork_sm120::cp_async_wait<0>();
+    fork_cuda::cp_async_wait<0>();
     __syncthreads();
 
     // advance V
@@ -247,7 +247,7 @@ inline __device__ void fork_kernel(const Params& params, const int bidb,
     flash::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q,
                 smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
 
-    fork_sm120::cp_async_wait<0>();
+    fork_cuda::cp_async_wait<0>();
     __syncthreads();
 
     if (n_block > 0) {
@@ -407,7 +407,7 @@ inline __global__ void gather_kernel(Params params) {
       Layout<Shape<Int<kNThreads / GmemThreadsPerRow>, Int<GmemThreadsPerRow>>,
              Stride<Int<GmemThreadsPerRow>, _1>>;  // (4,32):(32,1)
   using GmemTiledCopyOaccum = decltype(make_tiled_copy(
-      Copy_Atom<fork_sm120::CpAsync<cute::uint128_t>, Element>{},
+      Copy_Atom<fork_cuda::CpAsync<cute::uint128_t>, Element>{},
       GmemLayoutAtom{}, Layout<Shape<_1, Int<GmemElemsPerLoad>>>{}));
   using SmemLayoutAtomOaccum = decltype(composition(
       Swizzle<2, 2, 3>{}, Layout<Shape<_4, Int<32>>, Stride<Int<32>, _1>>{}));
@@ -479,7 +479,7 @@ inline __global__ void gather_kernel(Params params) {
   }
   // scale
   sLse[tid] = exp2f((rLse - lse_global) * M_LOG2E);
-  fork_sm120::cp_async_wait<0>();
+  fork_cuda::cp_async_wait<0>();
   __syncthreads();
 
   // copy Oaccum from smem to register

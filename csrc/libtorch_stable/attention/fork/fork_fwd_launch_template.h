@@ -10,17 +10,21 @@
 
 namespace FORK_NAMESPACE {
 
-// Determine if the architecture supports FORK and define a macro to handle
-// parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+// Ampere and newer provide the async copies and tensor-core instructions used
+// by the kernel. Keep grid-constant parameters limited to architectures where
+// they were already enabled.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
   #define ARCH_SUPPORTS_FORK
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
   #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
   #define KERNEL_PARAM_MODIFIER
 #endif
 
 #define FORK_UNSUPPORTED_ARCH \
-  printf("FATAL: ForkAttention requires building for sm120 or newer!");
+  printf("FATAL: ForkAttention requires building for sm80 or newer!");
 
 inline void fork_cuda_check(cudaError_t error, const char* file, int line) {
   STD_TORCH_CHECK(error == cudaSuccess,

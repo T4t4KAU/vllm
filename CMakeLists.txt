@@ -1061,14 +1061,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   # Experimental ForkAttention decode kernel.
-  cuda_archs_loose_intersection(FORK_ARCHS "12.0+PTX" "${CUDA_ARCHS}")
+  cuda_archs_loose_intersection(
+    FORK_ARCHS
+    "8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;11.0;12.0;12.1"
+    "${CUDA_ARCHS}")
   if(FORK_ARCHS)
     set(FORK_ATTN_SRCS
       "csrc/libtorch_stable/attention/fork/fork_attention.cu"
-      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_fp16_sm120.cu"
-      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_bf16_sm120.cu"
-      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_fp16_sm120.cu"
-      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_bf16_sm120.cu")
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_fp16.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_bf16.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_fp16.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_bf16.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FORK_ATTN_SRCS}"
       CUDA_ARCHS "${FORK_ARCHS}")
