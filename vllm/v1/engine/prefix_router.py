@@ -23,6 +23,7 @@ class _RequestPrefix:
     tail: list[int]
     work_units: int
     active: bool = False
+    detached: bool = False
 
 
 @dataclass
@@ -56,6 +57,9 @@ class PrefixAwareDPRouter:
         prefix_chunk_blocks: int = 128,
         work_slack_tokens: int = 8192,
         decode_token_weight: int = 16,
+        reload_min_fanout_gain: int = 1,
+        reload_min_prefix_gain_blocks: int = 4,
+        reload_max_kv_usage: float = 0.90,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if num_ranks <= 1:
@@ -78,6 +82,12 @@ class PrefixAwareDPRouter:
             raise ValueError("work_slack_tokens must be non-negative")
         if decode_token_weight <= 0:
             raise ValueError("decode_token_weight must be positive")
+        if reload_min_fanout_gain < 0:
+            raise ValueError("reload_min_fanout_gain must be non-negative")
+        if reload_min_prefix_gain_blocks <= 0:
+            raise ValueError("reload_min_prefix_gain_blocks must be positive")
+        if not 0 < reload_max_kv_usage <= 1:
+            raise ValueError("reload_max_kv_usage must be in (0, 1]")
 
         self.num_ranks = num_ranks
         self.block_size = block_size
@@ -90,6 +100,9 @@ class PrefixAwareDPRouter:
         self.prefix_chunk_blocks = prefix_chunk_blocks
         self.work_slack_tokens = work_slack_tokens
         self.decode_token_weight = decode_token_weight
+        self.reload_min_fanout_gain = reload_min_fanout_gain
+        self.reload_min_prefix_gain_blocks = reload_min_prefix_gain_blocks
+        self.reload_max_kv_usage = reload_max_kv_usage
         self._clock = clock
         self._engine_telemetry = [_EngineTelemetry() for _ in range(num_ranks)]
 
@@ -111,6 +124,19 @@ class PrefixAwareDPRouter:
         self.last_affinity_blocks = 0
         self.graph_bound_route_count = 0
         self.arrival_wave_count = 0
+        self.reload_intent_count = 0
+        self.reload_local_count = 0
+        self.reload_rebalanced_count = 0
+        self.reload_committed_count = 0
+        self.reload_failed_count = 0
+        self.reload_predicted_saved_blocks = 0
+        self.reload_source_external_tokens = 0
+        self.reload_target_external_tokens = 0
+        self.reload_saved_external_tokens = 0
+        self.reload_source_tokens = 0
+        self.reload_target_local_tokens = 0
+        self.reload_saved_tokens = 0
+        self.reload_reject_counts: Counter[str] = Counter()
 
     def order_arrival_wave(
         self,
@@ -159,6 +185,8 @@ class PrefixAwareDPRouter:
             if len(item) < 2:
                 continue
             execution_stats, kv_cache_usage = item
+            if not isinstance(kv_cache_usage, int | float):
+                continue
             self.update_rank_telemetry(rank, execution_stats, float(kv_cache_usage))
 
     def update_rank_telemetry(
@@ -427,6 +455,185 @@ class PrefixAwareDPRouter:
         self._rank_work[rank] += work_units
         self._increment(self._live[rank], keys)
 
+    def set_resident(self, request_id: str, rank: int, resident: bool) -> None:
+        """Apply an event-driven physical residency transition."""
+        record = self._requests.get(request_id)
+        if record is None or record.detached or record.rank != rank:
+            return
+        if record.active == resident:
+            return
+        record.active = resident
+        if resident:
+            self._increment(self._active[rank], record.keys)
+        else:
+            self._decrement(self._active[rank], record.keys)
+
+    def detach_for_reload(self, request_id: str) -> int | None:
+        record = self._requests.get(request_id)
+        if record is None:
+            return None
+        if record.detached:
+            return None
+        rank = record.rank
+        self._rank_work[rank] = max(0, self._rank_work[rank] - record.work_units)
+        self._decrement(self._live[rank], record.keys)
+        if record.active:
+            self._decrement(self._active[rank], record.keys)
+        record.rank = -1
+        record.active = False
+        record.detached = True
+        return rank
+
+    def attach_after_reload(self, request_id: str, rank: int) -> bool:
+        record = self._requests.get(request_id)
+        if record is None or not record.detached:
+            return False
+        record.rank = rank
+        record.detached = False
+        self._rank_work[rank] += record.work_units
+        self._increment(self._live[rank], record.keys)
+        return True
+
+    def choose_reload_rank(
+        self,
+        request_id: str,
+        source_rank: int,
+        engine_counts: Sequence[Sequence[int]],
+        start_index: int = 0,
+    ) -> int:
+        """Choose a reload destination for target-side local-KV validation."""
+        self._expire_warm()
+        self.reload_intent_count += 1
+        record = self._requests.get(request_id)
+        if record is None or not record.detached:
+            self.reload_local_count += 1
+            self.reload_reject_counts["missing_record"] += 1
+            return source_rank
+        keys = record.keys
+        if len(keys) < self.min_prefix_blocks:
+            self.reload_local_count += 1
+            self.reload_reject_counts["short_prefix"] += 1
+            return source_rank
+
+        anchor_depth = 0
+        anchor: PrefixKey | None = None
+        for depth in range(len(keys), 0, -1):
+            key = keys[depth - 1]
+            if any(
+                self._active[rank].get(key, 0)
+                or self._warm[rank].get(key, 0)
+                or self._live[rank].get(key, 0)
+                for rank in range(self.num_ranks)
+            ):
+                anchor_depth = depth
+                anchor = key
+                break
+        if anchor is None or anchor_depth < self.min_prefix_blocks:
+            self.reload_local_count += 1
+            self.reload_reject_counts["no_anchor"] += 1
+            return source_rank
+
+        load_scores = []
+        for rank, (waiting, running) in enumerate(engine_counts):
+            if rank == source_rank:
+                waiting = max(0, waiting - 1)
+            load_scores.append(waiting * 4 + running)
+        min_load = min(load_scores)
+        eligible = {
+            rank
+            for rank, load in enumerate(load_scores)
+            if load <= min_load + self.load_slack
+        }
+
+        graph_indices = self._predicted_graph_bucket_indices(keys)
+        if graph_indices is not None:
+            min_graph_index = min(graph_indices)
+            max_usage = max(state.kv_cache_usage for state in self._engine_telemetry)
+            slack = 0 if max_usage >= 0.90 else self.graph_slack_buckets
+            graph_eligible = {
+                rank
+                for rank, index in enumerate(graph_indices)
+                if index <= min_graph_index + slack
+            }
+            eligible = (eligible & graph_eligible) or graph_eligible
+
+        eligible = {
+            rank
+            for rank in eligible
+            if rank == source_rank
+            or self._engine_telemetry[rank].kv_cache_usage <= self.reload_max_kv_usage
+        }
+        eligible.add(source_rank)
+
+        candidate_work = [
+            self._rank_work[rank] + record.work_units for rank in range(self.num_ranks)
+        ]
+
+        def rank_score(rank: int) -> tuple[int, ...]:
+            active_depth, active_fanout = self._deepest_match(keys, self._active[rank])
+            live_depth, live_fanout = self._deepest_match(keys, self._live[rank])
+            warm_depth, warm_fanout = self._deepest_match(keys, self._warm[rank])
+            anchor_active = self._active[rank].get(anchor, 0)
+            anchor_live = self._live[rank].get(anchor, 0)
+            anchor_warm = self._warm[rank].get(anchor, 0)
+            graph_index = graph_indices[rank] if graph_indices is not None else 0
+            return (
+                int(anchor_active > 0),
+                anchor_active,
+                active_depth,
+                active_fanout,
+                int(anchor_warm > 0),
+                anchor_warm,
+                warm_depth,
+                warm_fanout,
+                anchor_live,
+                live_depth,
+                live_fanout,
+                -graph_index,
+                -candidate_work[rank],
+                -load_scores[rank],
+                -((rank - start_index) % self.num_ranks),
+            )
+
+        target_rank = max(eligible, key=rank_score)
+        if target_rank == source_rank:
+            self.reload_local_count += 1
+            reason = "only_source" if len(eligible) == 1 else "source_best"
+            self.reload_reject_counts[reason] += 1
+            return source_rank
+
+        source_active_depth, _ = self._deepest_match(keys, self._active[source_rank])
+        source_warm_depth, _ = self._deepest_match(keys, self._warm[source_rank])
+        source_live_depth, _ = self._deepest_match(keys, self._live[source_rank])
+        target_active_depth, _ = self._deepest_match(keys, self._active[target_rank])
+        target_warm_depth, _ = self._deepest_match(keys, self._warm[target_rank])
+        target_live_depth, _ = self._deepest_match(keys, self._live[target_rank])
+        source_depth = max(source_active_depth, source_warm_depth, source_live_depth)
+        target_depth = max(target_active_depth, target_warm_depth, target_live_depth)
+        source_fanout = max(
+            self._active[source_rank].get(anchor, 0),
+            self._warm[source_rank].get(anchor, 0),
+            self._live[source_rank].get(anchor, 0),
+        )
+        target_fanout = max(
+            self._active[target_rank].get(anchor, 0),
+            self._warm[target_rank].get(anchor, 0),
+            self._live[target_rank].get(anchor, 0),
+        )
+        fanout_gain = target_fanout - source_fanout
+        depth_gain = target_depth - source_depth
+        if (
+            fanout_gain < self.reload_min_fanout_gain
+            and depth_gain < self.reload_min_prefix_gain_blocks
+        ):
+            self.reload_local_count += 1
+            self.reload_reject_counts["insufficient_gain"] += 1
+            return source_rank
+
+        self.reload_rebalanced_count += 1
+        self.reload_predicted_saved_blocks += max(0, depth_gain)
+        return target_rank
+
     def discard_pending(self, request_ids: Sequence[str]) -> None:
         for request_id in request_ids:
             self._pending_prefixes.pop(request_id, None)
@@ -453,7 +660,7 @@ class PrefixAwareDPRouter:
     ) -> None:
         for output in outputs:
             record = self._requests.get(output.request_id)
-            if record is None:
+            if record is None or record.detached:
                 continue
             if not record.active:
                 record.active = True
@@ -466,6 +673,8 @@ class PrefixAwareDPRouter:
     def finish_request(self, request_id: str, *, keep_warm: bool = True) -> None:
         record = self._requests.pop(request_id, None)
         if record is None:
+            return
+        if record.detached:
             return
         self._rank_work[record.rank] = max(
             0, self._rank_work[record.rank] - record.work_units

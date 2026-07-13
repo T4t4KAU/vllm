@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.sampling_params import SamplingType
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -52,7 +53,14 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    DPPrefixResidencyUpdate,
+    DPReloadEvent,
+    DPReloadEventType,
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -87,6 +95,7 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
+        self.dp_engine_index = self.parallel_config.data_parallel_index
         self.log_stats = log_stats
         self.fork_execution_stats: tuple[str, int, int, int, int] | None = None
         self.observability_config = vllm_config.observability_config
@@ -218,7 +227,20 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
-
+        self.dp_reload_reassigned_req_ids: set[str] = set()
+        self.dp_reload_reassigned_order: deque[str] = deque()
+        self.dp_reload_rebalance_enabled = self._init_dp_reload_rebalance()
+        if self.connector is not None:
+            self.connector.set_dp_reload_rebalance_enabled(
+                self.dp_reload_rebalance_enabled
+            )
+        self.publish_dp_prefix_residency = self.dp_reload_rebalance_enabled
+        self.pending_dp_prefix_residency: dict[int, list[DPPrefixResidencyUpdate]] = (
+            defaultdict(list)
+        )
+        self.pending_dp_reload_events: dict[int, list[DPReloadEvent]] = defaultdict(
+            list
+        )
         # Encoder-related.
         # Calculate encoder cache size if applicable
         supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -559,6 +581,7 @@ class Scheduler(SchedulerInterface):
 
                     # The request cannot be scheduled.
                     # Preempt a low-value request and retry.
+                    preempted_req: Request | None
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
@@ -571,6 +594,7 @@ class Scheduler(SchedulerInterface):
                             preempted_req = self.running.pop()
                         else:
                             self.running.remove(preempted_req)
+                    assert preempted_req is not None
 
                     if preempted_req in scheduled_running_reqs:
                         preempted_req_id = preempted_req.request_id
@@ -767,6 +791,46 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
+
+                        if (
+                            request.ownership_epoch > 0
+                            and request.reload_rebalance_count > 0
+                            and not request.reload_lookup_reported
+                        ):
+                            request.reload_lookup_reported = True
+                            self.pending_dp_reload_events[request.client_index].append(
+                                DPReloadEvent(
+                                    type=DPReloadEventType.TARGET_LOOKUP,
+                                    request_id=request.request_id,
+                                    rank=self.dp_engine_index,
+                                    ownership_epoch=request.ownership_epoch,
+                                    num_preemptions=request.num_preemptions,
+                                    local_tokens=num_new_local_computed_tokens,
+                                    external_tokens=num_external_computed_tokens,
+                                )
+                            )
+
+                        if self._should_request_dp_reload_placement(
+                            request,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        ):
+                            request.status = RequestStatus.WAITING_FOR_RELOAD_PLACEMENT
+                            request.reload_rebalance_count += 1
+                            self.pending_dp_reload_events[request.client_index].append(
+                                DPReloadEvent(
+                                    type=DPReloadEventType.INTENT,
+                                    request_id=request.request_id,
+                                    rank=self.dp_engine_index,
+                                    ownership_epoch=request.ownership_epoch,
+                                    num_preemptions=request.num_preemptions,
+                                    local_tokens=num_new_local_computed_tokens,
+                                    external_tokens=num_external_computed_tokens,
+                                )
+                            )
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1007,6 +1071,7 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self._record_dp_prefix_residency(request, resident=True)
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -1180,6 +1245,7 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
+        self._record_dp_prefix_residency(request, resident=False)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -1854,6 +1920,18 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        pending_residency = getattr(self, "pending_dp_prefix_residency", {})
+        for client_index, updates in pending_residency.items():
+            eco = engine_core_outputs.setdefault(client_index, EngineCoreOutputs())
+            eco.dp_prefix_residency_updates = updates
+        pending_residency.clear()
+
+        pending_reload_events = getattr(self, "pending_dp_reload_events", {})
+        for client_index, events in pending_reload_events.items():
+            eco = engine_core_outputs.setdefault(client_index, EngineCoreOutputs())
+            eco.dp_reload_events = events
+        pending_reload_events.clear()
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats,
@@ -1877,6 +1955,7 @@ class Scheduler(SchedulerInterface):
         return status in (
             RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,
             RequestStatus.WAITING_FOR_REMOTE_KVS,
+            RequestStatus.WAITING_FOR_RELOAD_PLACEMENT,
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
@@ -1913,6 +1992,138 @@ class Scheduler(SchedulerInterface):
             if isinstance(raw_extra_config, dict):
                 extra_config = raw_extra_config
         return extra_config
+
+    def _init_dp_reload_rebalance(self) -> bool:
+        if not envs.VLLM_FORK_ATTN_DP_RELOAD_REBALANCE:
+            return False
+        if not envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING:
+            logger.warning(
+                "Ignoring DP reload rebalance because prefix routing is disabled."
+            )
+            return False
+        if not self._is_fork_attention_backend():
+            logger.warning(
+                "Ignoring DP reload rebalance because the backend is not FORK_ATTN."
+            )
+            return False
+        if (
+            self.parallel_config.data_parallel_size <= 1
+            and self.parallel_config.data_parallel_rank_local is None
+        ):
+            logger.warning(
+                "Ignoring DP reload rebalance because data parallel size is one."
+            )
+            return False
+        if self.parallel_config.pipeline_parallel_size != 1:
+            logger.warning("Ignoring DP reload rebalance with pipeline parallelism.")
+            return False
+        if self.scheduler_config.async_scheduling:
+            logger.warning("Ignoring DP reload rebalance with asynchronous scheduling.")
+            return False
+        if not self.vllm_config.use_v2_model_runner:
+            logger.warning(
+                "Ignoring DP reload rebalance because the v2 model runner is "
+                "required for output-token state restoration."
+            )
+            return False
+        if self.connector is None or not self.connector.supports_dp_reload_rebalance:
+            logger.warning(
+                "Ignoring DP reload rebalance because the KV connector does not "
+                "provide a DP-shared reload domain."
+            )
+            return False
+        if envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS <= 0:
+            raise ValueError(
+                "VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS must be positive"
+            )
+        if envs.VLLM_FORK_ATTN_DP_RELOAD_TIMEOUT_MS <= 0:
+            raise ValueError("VLLM_FORK_ATTN_DP_RELOAD_TIMEOUT_MS must be positive")
+        logger.info(
+            "Enabled experimental ForkAttention DP reload rebalance: "
+            "min_external_tokens=%d",
+            envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS,
+        )
+        return True
+
+    def _should_request_dp_reload_placement(
+        self,
+        request: Request,
+        num_local_tokens: int,
+        num_external_tokens: int,
+    ) -> bool:
+        del num_local_tokens
+        return (
+            self._is_dp_reload_migratable(request)
+            and request.status == RequestStatus.PREEMPTED
+            and request.num_computed_tokens == 0
+            and request.reload_rebalance_count == 0
+            and num_external_tokens >= envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS
+        )
+
+    def _is_dp_reload_migratable(self, request: Request) -> bool:
+        sampling_params = request.sampling_params
+        return (
+            self.dp_reload_rebalance_enabled
+            and request.pooling_params is None
+            and request.prompt_embeds is None
+            and request.prompt_is_token_ids is None
+            and not request.mm_features
+            and request.lora_request is None
+            and not request.use_structured_output
+            and not request.resumable
+            and sampling_params is not None
+            and sampling_params.sampling_type == SamplingType.GREEDY
+            and sampling_params.prompt_logprobs is None
+        )
+
+    def _record_dp_prefix_residency(self, request: Request, *, resident: bool) -> None:
+        if not self.publish_dp_prefix_residency:
+            return
+        self.pending_dp_prefix_residency[request.client_index].append(
+            DPPrefixResidencyUpdate(
+                request_id=request.request_id,
+                rank=self.dp_engine_index,
+                resident=resident,
+            )
+        )
+
+    def resume_dp_reload(self, request_id: str, ownership_epoch: int) -> bool:
+        request = self.requests.get(request_id)
+        if (
+            request is None
+            or request.status != RequestStatus.WAITING_FOR_RELOAD_PLACEMENT
+            or request.ownership_epoch != ownership_epoch
+        ):
+            return False
+        self.skipped_waiting.remove_requests({request})
+        self.waiting.remove_requests({request})
+        request.status = RequestStatus.PREEMPTED
+        self.waiting.prepend_request(request)
+        return True
+
+    def drop_dp_reload_source(self, request_id: str, ownership_epoch: int) -> bool:
+        request = self.requests.get(request_id)
+        if (
+            request is None
+            or request.status != RequestStatus.WAITING_FOR_RELOAD_PLACEMENT
+            or request.ownership_epoch != ownership_epoch
+        ):
+            return False
+        self.skipped_waiting.remove_requests({request})
+        self.waiting.remove_requests({request})
+        self._inflight_prefills.discard(request)
+        self.encoder_cache_manager.free(request)
+        self.fork_fanout_admission_bypass_counts.pop(request_id, None)
+        if self.connector is not None:
+            self.connector.request_reassigned(request)
+        self.dp_reload_reassigned_req_ids.add(request_id)
+        self.dp_reload_reassigned_order.append(request_id)
+        while len(self.dp_reload_reassigned_order) > 4096:
+            expired_id = self.dp_reload_reassigned_order.popleft()
+            self.dp_reload_reassigned_req_ids.discard(expired_id)
+        self.finished_req_ids.add(request_id)
+        del self.requests[request_id]
+        return True
 
     def _init_fork_fanout_admission_config(self) -> tuple[int, int]:
         if not self._is_fork_attention_backend():
@@ -2853,6 +3064,9 @@ class Scheduler(SchedulerInterface):
         """
         Try to promote a blocked waiting request back to schedulable states.
         """
+        if request.status == RequestStatus.WAITING_FOR_RELOAD_PLACEMENT:
+            return False
+
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals
@@ -2899,6 +3113,11 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
+            if (
+                req_id not in self.requests
+                and req_id in self.dp_reload_reassigned_req_ids
+            ):
+                continue
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -2908,6 +3127,11 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
+            if (
+                req_id not in self.requests
+                and req_id in self.dp_reload_reassigned_req_ids
+            ):
+                continue
             assert req_id in self.requests
             self._free_blocks(self.requests[req_id])
 

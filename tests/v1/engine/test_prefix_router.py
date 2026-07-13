@@ -1,9 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 from types import SimpleNamespace
 
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import (
+    DPReloadEvent,
+    DPReloadEventType,
+    DPReloadRequest,
+    EngineCoreOutputs,
+    EngineCoreRequest,
+    EngineCoreRequestType,
+)
 from vllm.v1.engine.core import DPEngineCoreProc
-from vllm.v1.engine.core_client import DPLBAsyncMPClient
+from vllm.v1.engine.core_client import DPLBAsyncMPClient, _DPReloadPlacement
 from vllm.v1.engine.prefix_router import PrefixAwareDPRouter
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 def _request(
@@ -258,7 +270,7 @@ def test_dplb_client_coalesces_concurrent_prefix_wave() -> None:
 
 
 def test_dp_core_publishes_physical_telemetry_when_counts_are_unchanged() -> None:
-    published = []
+    published: list[tuple[int, EngineCoreOutputs]] = []
     execution_stats = ("forest", 64, 24, 8, 16)
     core = SimpleNamespace(
         publish_dp_lb_stats=True,
@@ -284,3 +296,256 @@ def test_dp_core_publishes_physical_telemetry_when_counts_are_unchanged() -> Non
     assert outputs.scheduler_stats.kv_cache_usage == 0.625
     assert core.last_counts == (2, 3)
     assert core.last_fork_telemetry == (execution_stats, 0.625)
+
+
+def test_residency_updates_are_idempotent_across_preemption() -> None:
+    router = PrefixAwareDPRouter(2, 4, 32, 30, 1)
+    request = _request("request", list(range(16)))
+    router.add_request(request, rank=0)
+
+    router.set_resident("request", 0, True)
+    router.set_resident("request", 0, True)
+    assert all(count == 1 for count in router._active[0].values())
+
+    router.set_resident("request", 0, False)
+    router.set_resident("request", 0, False)
+    assert not router._active[0]
+
+
+def test_dp_reload_request_msgpack_round_trip() -> None:
+    request = EngineCoreRequest(
+        request_id="reload",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=8, temperature=0),
+        pooling_params=None,
+        arrival_time=1.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    payload = DPReloadRequest(
+        request=request,
+        source_rank=0,
+        ownership_epoch=2,
+        num_preemptions=3,
+        source_local_tokens=128,
+        source_external_tokens=256,
+        output_token_ids=[4, 5],
+    )
+
+    frames = MsgpackEncoder().encode(payload)
+    decoded = MsgpackDecoder(DPReloadRequest).decode(frames)
+
+    assert decoded.request.request_id == "reload"
+    assert decoded.request.prompt_token_ids == [1, 2, 3]
+    assert decoded.ownership_epoch == 2
+    assert decoded.output_token_ids == [4, 5]
+
+
+def test_reload_rebalance_chooses_dominant_active_anchor() -> None:
+    router = PrefixAwareDPRouter(
+        2,
+        4,
+        32,
+        30,
+        1,
+        reload_min_fanout_gain=1,
+        reload_min_prefix_gain_blocks=1,
+    )
+    tokens = list(range(16))
+    source = _request("source", tokens)
+    router.add_request(source, rank=0)
+    router.set_resident("source", 0, True)
+    for request_id in ("target-a", "target-b"):
+        request = _request(request_id, tokens)
+        router.add_request(request, rank=1)
+        router.set_resident(request_id, 1, True)
+
+    assert router.detach_for_reload("source") == 0
+    assert router.choose_reload_rank("source", 0, [[1, 0], [0, 2]]) == 1
+    assert router.attach_after_reload("source", 1)
+    router.set_resident("source", 1, True)
+
+    record = router._requests["source"]
+    assert record.rank == 1
+    assert record.active
+    assert router.reload_rebalanced_count == 1
+    assert router.reload_predicted_saved_blocks == 4
+
+
+def test_reload_rebalance_stays_local_without_active_anchor() -> None:
+    router = PrefixAwareDPRouter(2, 4, 32, 30, 1)
+    request = _request("source", list(range(16)))
+    router.add_request(request, rank=0)
+
+    assert router.detach_for_reload("source") == 0
+    assert router.choose_reload_rank("source", 0, [[1, 0], [0, 0]]) == 0
+    assert router.attach_after_reload("source", 0)
+    assert router.reload_local_count == 1
+
+
+def test_reload_rebalance_considers_recent_warm_anchor() -> None:
+    router = PrefixAwareDPRouter(
+        2,
+        4,
+        32,
+        30,
+        1,
+        reload_min_fanout_gain=1,
+        reload_min_prefix_gain_blocks=1,
+    )
+    tokens = list(range(16))
+    source = _request("source", tokens)
+    target = _request("target", tokens)
+    router.add_request(source, rank=0)
+    router.add_request(target, rank=1)
+    router.set_resident(target.request_id, 1, True)
+    router.finish_request(target.request_id)
+
+    assert router.detach_for_reload(source.request_id) == 0
+    assert router.choose_reload_rank(source.request_id, 0, [[1, 0], [0, 0]]) == 1
+
+
+def test_dplb_client_commits_reload_only_after_target_prepares(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS", "4")
+
+    async def run() -> None:
+        client = object.__new__(DPLBAsyncMPClient)
+        client.prefix_router = PrefixAwareDPRouter(
+            2,
+            4,
+            32,
+            30,
+            1,
+            reload_min_prefix_gain_blocks=1,
+        )
+        client.dp_reload_rebalance_enabled = True
+        client.engine_ranks_managed = [0, 1]
+        client.core_engines = [b"rank-0", b"rank-1"]
+        client.lb_engines = [[1, 0], [0, 2]]
+        client.eng_start_index = 0
+        client.reqs_in_flight = {"source": b"rank-0"}
+        initial_request = _request("source", list(range(16)))
+        client._dp_reload_placements = {
+            "source": _DPReloadPlacement(
+                initial_request,
+                b"rank-0",
+                output_token_ids=[17, 18],
+            )
+        }
+        sent = []
+
+        async def send(request_type, payload, engine):
+            sent.append((request_type, payload, engine))
+
+        client._send_input = send
+        client.prefix_router.add_request(initial_request, rank=0)
+        client.prefix_router.set_resident("source", 0, True)
+        for request_id in ("target-a", "target-b"):
+            request = _request(request_id, list(range(16)))
+            client.prefix_router.add_request(request, rank=1)
+            client.prefix_router.set_resident(request_id, 1, True)
+
+        await client._handle_dp_reload_event(
+            DPReloadEvent(
+                DPReloadEventType.INTENT,
+                "source",
+                0,
+                0,
+                num_preemptions=1,
+                local_tokens=0,
+            )
+        )
+        assert [item[0] for item in sent] == [EngineCoreRequestType.PREPARE_DP_RELOAD]
+        assert sent[0][1].output_token_ids == [17, 18]
+        assert client.reqs_in_flight["source"] == b"rank-0"
+
+        await client._handle_dp_reload_event(
+            DPReloadEvent(
+                DPReloadEventType.PREPARED,
+                "source",
+                1,
+                1,
+                local_tokens=12,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert [item[0] for item in sent] == [
+            EngineCoreRequestType.PREPARE_DP_RELOAD,
+            EngineCoreRequestType.COMMIT_DP_RELOAD,
+            EngineCoreRequestType.DROP_DP_RELOAD_SOURCE,
+        ]
+        assert client.reqs_in_flight["source"] == b"rank-1"
+        assert client.prefix_router._requests["source"].rank == 1
+
+        lookup_event = DPReloadEvent(
+            DPReloadEventType.TARGET_LOOKUP,
+            "source",
+            1,
+            1,
+            local_tokens=12,
+            external_tokens=4,
+        )
+        await client._handle_dp_reload_event(lookup_event)
+        await client._handle_dp_reload_event(lookup_event)
+        assert client.prefix_router.reload_committed_count == 1
+        assert client.prefix_router.reload_source_tokens == 18
+        assert client.prefix_router.reload_target_local_tokens == 12
+        assert client.prefix_router.reload_saved_tokens == 12
+        assert client.prefix_router.reload_source_external_tokens == 0
+        assert client.prefix_router.reload_target_external_tokens == 4
+        assert client.prefix_router.reload_saved_external_tokens == 0
+
+    asyncio.run(run())
+
+
+def test_dplb_client_rejects_reload_without_physical_prefix_gain(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS", "4")
+
+    async def run() -> None:
+        client = object.__new__(DPLBAsyncMPClient)
+        client.prefix_router = PrefixAwareDPRouter(2, 4, 32, 30, 1)
+        client.engine_ranks_managed = [0, 1]
+        client.reqs_in_flight = {"source": b"rank-0"}
+        request = _request("source", list(range(16)))
+        client.prefix_router.add_request(request, rank=0)
+        assert client.prefix_router.detach_for_reload("source") == 0
+        placement = _DPReloadPlacement(request, b"rank-0")
+        placement.state = "PREPARING"
+        placement.source_engine = b"rank-0"
+        placement.source_rank = 0
+        placement.source_epoch = 0
+        placement.source_local_tokens = 12
+        placement.target_engine = b"rank-1"
+        placement.target_rank = 1
+        placement.target_epoch = 1
+        client._dp_reload_placements = {"source": placement}
+        sent = []
+
+        async def send(request_type, payload, engine):
+            sent.append((request_type, payload, engine))
+
+        client._send_input = send
+        await client._handle_dp_reload_prepared(
+            DPReloadEvent(
+                DPReloadEventType.PREPARED,
+                "source",
+                1,
+                1,
+                local_tokens=12,
+            )
+        )
+
+        assert [item[0] for item in sent] == [
+            EngineCoreRequestType.CANCEL_DP_RELOAD,
+            EngineCoreRequestType.RESUME_DP_RELOAD,
+        ]
+        assert client.reqs_in_flight["source"] == b"rank-0"
+        assert client.prefix_router._requests["source"].rank == 0
+        assert client.prefix_router.reload_failed_count == 1
+
+    asyncio.run(run())

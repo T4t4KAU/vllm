@@ -76,6 +76,48 @@ def test_get_num_unfinished_requests():
         assert scheduler.get_num_unfinished_requests() == len(requests) - i - 1
 
 
+def test_dp_reload_eligibility_supports_greedy_decode_state() -> None:
+    scheduler = create_scheduler()
+    scheduler.dp_reload_rebalance_enabled = True
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    request.status = RequestStatus.PREEMPTED
+    request.num_preemptions = 1
+    assert request.sampling_params is not None
+    request.sampling_params.temperature = 0
+
+    assert scheduler._should_request_dp_reload_placement(request, 0, 2048)
+
+    request.append_output_token_ids(123)
+    assert scheduler._should_request_dp_reload_placement(request, 0, 2048)
+
+    request.sampling_params = SamplingParams(max_tokens=16, temperature=1)
+    assert not scheduler._should_request_dp_reload_placement(request, 0, 2048)
+
+
+def test_drop_dp_reload_source_does_not_finish_frontend_request() -> None:
+    scheduler = create_scheduler()
+    connector = Mock()
+    scheduler.connector = connector
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    scheduler.waiting.remove_requests({request})
+    request.status = RequestStatus.WAITING_FOR_RELOAD_PLACEMENT
+    scheduler.skipped_waiting.add_request(request)
+
+    assert scheduler.drop_dp_reload_source(request.request_id, 0)
+    assert request.request_id not in scheduler.requests
+    assert request.request_id in scheduler.finished_req_ids
+    assert not scheduler.finished_req_ids_dict
+    connector.request_reassigned.assert_called_once_with(request)
+
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(
+            finished_recving={request.request_id},
+            finished_sending={request.request_id},
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "enable_prefix_caching, prompt_logprobs",
     [

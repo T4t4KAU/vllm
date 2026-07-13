@@ -181,6 +181,11 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def supports_dp_reload_rebalance(self) -> bool:
+        """Whether detached requests can reload from a DP-shared KV domain."""
+        return False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -527,6 +532,14 @@ class KVConnectorBase_V1(ABC):
         Connectors can override this to inspect the request and perform
         bookkeeping. The default implementation is a no-op.
         """
+        return
+
+    def request_reassigned(self, request: "Request") -> None:
+        """Drop rank-local request state without deleting shared KV objects."""
+        return
+
+    def set_dp_reload_rebalance_enabled(self, enabled: bool) -> None:
+        """Apply the scheduler-validated DP reload runtime state."""
         return
 
     def update_connector_output(self, connector_output: KVConnectorOutput):

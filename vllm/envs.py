@@ -132,6 +132,12 @@ if TYPE_CHECKING:
     VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS: int = 8192
     VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT: int = 16
     VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS: float = 1.0
+    VLLM_FORK_ATTN_DP_RELOAD_REBALANCE: bool = False
+    VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS: int = 2048
+    VLLM_FORK_ATTN_DP_RELOAD_MIN_FANOUT_GAIN: int = 1
+    VLLM_FORK_ATTN_DP_RELOAD_MIN_PREFIX_GAIN_BLOCKS: int = 4
+    VLLM_FORK_ATTN_DP_RELOAD_MAX_KV_USAGE: float = 0.90
+    VLLM_FORK_ATTN_DP_RELOAD_TIMEOUT_MS: int = 1000
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1186,6 +1192,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS": lambda: float(
         os.getenv("VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS", "1")
+    ),
+    "VLLM_FORK_ATTN_DP_RELOAD_REBALANCE": lambda: bool(
+        int(os.getenv("VLLM_FORK_ATTN_DP_RELOAD_REBALANCE", "0"))
+    ),
+    "VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS", "2048")
+    ),
+    "VLLM_FORK_ATTN_DP_RELOAD_MIN_FANOUT_GAIN": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_RELOAD_MIN_FANOUT_GAIN", "1")
+    ),
+    "VLLM_FORK_ATTN_DP_RELOAD_MIN_PREFIX_GAIN_BLOCKS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_RELOAD_MIN_PREFIX_GAIN_BLOCKS", "4")
+    ),
+    "VLLM_FORK_ATTN_DP_RELOAD_MAX_KV_USAGE": lambda: float(
+        os.getenv("VLLM_FORK_ATTN_DP_RELOAD_MAX_KV_USAGE", "0.90")
+    ),
+    "VLLM_FORK_ATTN_DP_RELOAD_TIMEOUT_MS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_RELOAD_TIMEOUT_MS", "1000")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

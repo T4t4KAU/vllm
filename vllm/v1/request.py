@@ -174,6 +174,13 @@ class Request:
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
+        # Fences experimental cross-rank reload ownership handoffs.
+        self.ownership_epoch = 0
+        self.reload_rebalance_count = 0
+        self.reload_source_local_tokens = 0
+        self.reload_source_external_tokens = 0
+        self.reload_lookup_reported = False
+
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
         self.block_hashes: list[BlockHash] = []
@@ -326,6 +333,7 @@ class RequestStatus(enum.IntEnum):
     WAITING = enum.auto()
     WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR = enum.auto()
     WAITING_FOR_REMOTE_KVS = enum.auto()
+    WAITING_FOR_RELOAD_PLACEMENT = enum.auto()
     WAITING_FOR_STREAMING_REQ = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()

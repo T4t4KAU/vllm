@@ -139,6 +139,14 @@ class SchedulerInterface(ABC):
         """
         raise NotImplementedError
 
+    def resume_dp_reload(self, request_id: str, ownership_epoch: int) -> bool:
+        """Resume a frozen experimental DP reload on its original rank."""
+        return False
+
+    def drop_dp_reload_source(self, request_id: str, ownership_epoch: int) -> bool:
+        """Remove a frozen source after another DP rank accepts ownership."""
+        return False
+
     @abstractmethod
     def finish_requests(
         self,

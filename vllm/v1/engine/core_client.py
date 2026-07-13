@@ -10,11 +10,11 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
 from threading import Thread
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, Literal, TypeAlias, TypeVar
 
 import msgspec.msgpack
 import zmq
@@ -35,6 +35,9 @@ from vllm.utils.network_utils import (
 )
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
+    DPReloadEvent,
+    DPReloadEventType,
+    DPReloadRequest,
     EEPNotificationType,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
@@ -67,6 +70,27 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+
+@dataclass
+class _DPReloadPlacement:
+    initial_request: EngineCoreRequest
+    owner: EngineIdentity
+    epoch: int = 0
+    state: Literal["RUNNING", "PREPARING"] = "RUNNING"
+    source_engine: EngineIdentity | None = None
+    source_rank: int = -1
+    source_epoch: int = -1
+    target_engine: EngineIdentity | None = None
+    target_rank: int = -1
+    target_epoch: int = -1
+    source_local_tokens: int = 0
+    source_external_tokens: int = 0
+    source_reload_tokens: int = 0
+    target_local_tokens: int = 0
+    lookup_reported: bool = False
+    output_token_ids: list[int] = field(default_factory=list)
+    timeout_task: asyncio.Task[None] | None = None
 
 
 class EngineCoreClient(ABC):
@@ -1402,6 +1426,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         # To route aborts to the correct engine.
         self.reqs_in_flight: dict[str, EngineIdentity] = {}
+        self.dp_reload_rebalance_enabled = False
+        self._dp_reload_placements: dict[str, _DPReloadPlacement] = {}
 
         super().__init__(
             vllm_config,
@@ -1467,6 +1493,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     ),
                     work_slack_tokens=(envs.VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS),
                     decode_token_weight=(envs.VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT),
+                    reload_min_fanout_gain=(
+                        envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_FANOUT_GAIN
+                    ),
+                    reload_min_prefix_gain_blocks=(
+                        envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_PREFIX_GAIN_BLOCKS
+                    ),
+                    reload_max_kv_usage=(envs.VLLM_FORK_ATTN_DP_RELOAD_MAX_KV_USAGE),
+                )
+                self.dp_reload_rebalance_enabled = (
+                    envs.VLLM_FORK_ATTN_DP_RELOAD_REBALANCE
+                    and not vllm_config.scheduler_config.async_scheduling
+                    and vllm_config.use_v2_model_runner
+                    and vllm_config.parallel_config.pipeline_parallel_size == 1
+                    and vllm_config.kv_transfer_config is not None
+                    and vllm_config.kv_transfer_config.kv_connector
+                    == "LMCacheMPConnector"
                 )
                 if envs.VLLM_FORK_ATTN_DP_ARRIVAL_WAVE_MS < 0:
                     raise ValueError(
@@ -1507,8 +1549,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self._finish_prefix_wave()
             return
 
+        prefix_router = self.prefix_router
+        assert prefix_router is not None
         requests = [request for request, _ in pending]
-        order = self.prefix_router.order_arrival_wave(requests)
+        order = prefix_router.order_arrival_wave(requests)
         try:
             sends = []
             for index in order:
@@ -1527,11 +1571,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             await asyncio.gather(*sends)
             self._ensure_output_queue_task()
         except Exception as error:
-            self.prefix_router.discard_pending(
-                [request.request_id for request in requests]
-            )
+            prefix_router.discard_pending([request.request_id for request in requests])
             for request in requests:
-                self.prefix_router.finish_request(
+                prefix_router.finish_request(
                     request.request_id,
                     keep_warm=False,
                 )
@@ -1562,6 +1604,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 future.cancel()
         self._prefix_wave_pending.clear()
         self._prefix_wave_inflight.clear()
+        for placement in getattr(self, "_dp_reload_placements", {}).values():
+            if placement.timeout_task is not None:
+                placement.timeout_task.cancel()
         super().shutdown(timeout)
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
@@ -1603,6 +1648,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             prefix_router.add_request(request, eng_index)
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
+        if getattr(self, "dp_reload_rebalance_enabled", False):
+            self._dp_reload_placements[request.request_id] = _DPReloadPlacement(
+                initial_request=request,
+                owner=chosen_engine,
+            )
         return chosen_engine
 
     def _log_prefix_router_stats(self) -> None:
@@ -1622,7 +1672,281 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             prefix_router.average_route_us,
             prefix_router.telemetry_snapshot,
         )
+        if self.dp_reload_rebalance_enabled:
+            logger.info(
+                "ForkAttention DP reload stats: intents=%d local=%d "
+                "planned=%d committed=%d failed=%d "
+                "predicted_saved_blocks=%d source_reload_tokens=%d "
+                "target_local_tokens=%d saved_reload_tokens=%d "
+                "source_external_tokens=%d target_external_tokens=%d "
+                "saved_external_tokens=%d rejections=%s",
+                prefix_router.reload_intent_count,
+                prefix_router.reload_local_count,
+                prefix_router.reload_rebalanced_count,
+                prefix_router.reload_committed_count,
+                prefix_router.reload_failed_count,
+                prefix_router.reload_predicted_saved_blocks,
+                prefix_router.reload_source_tokens,
+                prefix_router.reload_target_local_tokens,
+                prefix_router.reload_saved_tokens,
+                prefix_router.reload_source_external_tokens,
+                prefix_router.reload_target_external_tokens,
+                prefix_router.reload_saved_external_tokens,
+                dict(prefix_router.reload_reject_counts),
+            )
         self._last_prefix_router_log_count = prefix_router.route_count
+
+    async def _handle_dp_reload_event(self, event: DPReloadEvent) -> None:
+        if event.type == DPReloadEventType.INTENT:
+            await self._handle_dp_reload_intent(event)
+        elif event.type == DPReloadEventType.PREPARED:
+            await self._handle_dp_reload_prepared(event)
+        elif event.type == DPReloadEventType.FAILED:
+            placement = self._dp_reload_placements.get(event.request_id)
+            if placement is not None and placement.state == "PREPARING":
+                await self._fallback_dp_reload(
+                    event.request_id,
+                    placement,
+                    event.message or "target rejected reload",
+                )
+        elif event.type == DPReloadEventType.TARGET_LOOKUP:
+            self._handle_dp_reload_target_lookup(event)
+
+    def _handle_dp_reload_target_lookup(self, event: DPReloadEvent) -> None:
+        placement = self._dp_reload_placements.get(event.request_id)
+        prefix_router = self.prefix_router
+        if (
+            placement is None
+            or prefix_router is None
+            or placement.lookup_reported
+            or placement.state != "RUNNING"
+            or placement.epoch != event.ownership_epoch
+            or event.rank != self.engine_ranks_managed[placement.target_rank]
+        ):
+            return
+        placement.lookup_reported = True
+        source_tokens = placement.source_reload_tokens
+        prefix_router.reload_source_tokens += source_tokens
+        prefix_router.reload_target_local_tokens += event.local_tokens
+        prefix_router.reload_saved_tokens += min(source_tokens, event.local_tokens)
+        prefix_router.reload_source_external_tokens += placement.source_external_tokens
+        prefix_router.reload_target_external_tokens += event.external_tokens
+        prefix_router.reload_saved_external_tokens += max(
+            0, placement.source_external_tokens - event.external_tokens
+        )
+        self._log_prefix_router_stats()
+
+    async def _handle_dp_reload_intent(self, event: DPReloadEvent) -> None:
+        placement = self._dp_reload_placements.get(event.request_id)
+        prefix_router = self.prefix_router
+        if placement is None or prefix_router is None:
+            return
+        if placement.state != "RUNNING" or placement.epoch != event.ownership_epoch:
+            return
+        try:
+            source_rank = self.engine_ranks_managed.index(event.rank)
+        except ValueError:
+            return
+        source_engine = self.core_engines[source_rank]
+        if placement.owner != source_engine:
+            return
+        detached_rank = prefix_router.detach_for_reload(event.request_id)
+        if detached_rank != source_rank:
+            if detached_rank is not None:
+                prefix_router.attach_after_reload(event.request_id, source_rank)
+            prefix_router.reload_failed_count += 1
+            await self._send_input(
+                EngineCoreRequestType.RESUME_DP_RELOAD,
+                (event.request_id, placement.epoch),
+                source_engine,
+            )
+            return
+
+        target_rank = prefix_router.choose_reload_rank(
+            event.request_id,
+            source_rank,
+            self.lb_engines,
+            self.eng_start_index,
+        )
+        if target_rank == source_rank:
+            prefix_router.attach_after_reload(event.request_id, source_rank)
+            await self._send_input(
+                EngineCoreRequestType.RESUME_DP_RELOAD,
+                (event.request_id, placement.epoch),
+                source_engine,
+            )
+            return
+
+        target_engine = self.core_engines[target_rank]
+        target_epoch = placement.epoch + 1
+        placement.state = "PREPARING"
+        placement.source_engine = source_engine
+        placement.source_rank = source_rank
+        placement.source_epoch = placement.epoch
+        placement.target_engine = target_engine
+        placement.target_rank = target_rank
+        placement.target_epoch = target_epoch
+        placement.source_local_tokens = event.local_tokens
+        placement.source_external_tokens = event.external_tokens
+        placement.source_reload_tokens = max(
+            event.local_tokens,
+            len(placement.initial_request.prompt_token_ids or ())
+            + len(placement.output_token_ids),
+        )
+        placement.lookup_reported = False
+        reload_request = DPReloadRequest(
+            request=placement.initial_request,
+            source_rank=event.rank,
+            ownership_epoch=target_epoch,
+            num_preemptions=event.num_preemptions,
+            source_local_tokens=event.local_tokens,
+            source_external_tokens=event.external_tokens,
+            output_token_ids=list(placement.output_token_ids),
+        )
+        try:
+            await self._send_input(
+                EngineCoreRequestType.PREPARE_DP_RELOAD,
+                reload_request,
+                target_engine,
+            )
+        except Exception as error:
+            await self._fallback_dp_reload(
+                event.request_id, placement, f"prepare send failed: {error}"
+            )
+            return
+        placement.timeout_task = asyncio.create_task(
+            self._dp_reload_timeout(event.request_id, target_epoch)
+        )
+
+    async def _handle_dp_reload_prepared(self, event: DPReloadEvent) -> None:
+        placement = self._dp_reload_placements.get(event.request_id)
+        prefix_router = self.prefix_router
+        if placement is None or prefix_router is None:
+            return
+        if (
+            placement.state != "PREPARING"
+            or placement.target_epoch != event.ownership_epoch
+            or placement.target_engine is None
+            or placement.source_engine is None
+        ):
+            return
+        try:
+            event_rank = self.engine_ranks_managed.index(event.rank)
+        except ValueError:
+            return
+        if event_rank != placement.target_rank:
+            return
+        if event.local_tokens < envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_EXTERNAL_TOKENS:
+            await self._fallback_dp_reload(
+                event.request_id,
+                placement,
+                f"target local prefix too short: {event.local_tokens} tokens",
+            )
+            return
+        if event.local_tokens <= placement.source_local_tokens:
+            await self._fallback_dp_reload(
+                event.request_id,
+                placement,
+                "target has no physical local-prefix gain",
+            )
+            return
+        if placement.timeout_task is not None:
+            placement.timeout_task.cancel()
+            placement.timeout_task = None
+
+        if not prefix_router.attach_after_reload(
+            event.request_id, placement.target_rank
+        ):
+            await self._fallback_dp_reload(
+                event.request_id, placement, "router attach failed"
+            )
+            return
+
+        old_epoch = placement.epoch
+        placement.owner = placement.target_engine
+        placement.epoch = placement.target_epoch
+        self.reqs_in_flight[event.request_id] = placement.target_engine
+        try:
+            await self._send_input(
+                EngineCoreRequestType.COMMIT_DP_RELOAD,
+                (event.request_id, placement.target_epoch),
+                placement.target_engine,
+            )
+        except Exception as error:
+            await self._fallback_dp_reload(
+                event.request_id, placement, f"commit send failed: {error}"
+            )
+            return
+
+        placement.state = "RUNNING"
+        placement.target_local_tokens = event.local_tokens
+        prefix_router.reload_committed_count += 1
+        try:
+            await self._send_input(
+                EngineCoreRequestType.DROP_DP_RELOAD_SOURCE,
+                (event.request_id, old_epoch),
+                placement.source_engine,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to drop frozen DP reload source for request %s",
+                event.request_id,
+            )
+        placement.source_engine = None
+        placement.target_engine = None
+        placement.source_epoch = -1
+        placement.target_epoch = -1
+
+    async def _dp_reload_timeout(self, request_id: str, target_epoch: int) -> None:
+        await asyncio.sleep(envs.VLLM_FORK_ATTN_DP_RELOAD_TIMEOUT_MS / 1000)
+        placement = self._dp_reload_placements.get(request_id)
+        if (
+            placement is not None
+            and placement.state == "PREPARING"
+            and placement.target_epoch == target_epoch
+        ):
+            await self._fallback_dp_reload(request_id, placement, "prepare timeout")
+
+    async def _fallback_dp_reload(
+        self,
+        request_id: str,
+        placement: _DPReloadPlacement,
+        reason: str,
+    ) -> None:
+        prefix_router = self.prefix_router
+        if placement.timeout_task is not None:
+            current = asyncio.current_task()
+            if placement.timeout_task is not current:
+                placement.timeout_task.cancel()
+            placement.timeout_task = None
+        if placement.target_engine is not None and placement.target_epoch >= 0:
+            try:
+                await self._send_input(
+                    EngineCoreRequestType.CANCEL_DP_RELOAD,
+                    (request_id, placement.target_epoch),
+                    placement.target_engine,
+                )
+            except Exception:
+                logger.exception("Failed to cancel DP reload target %s", request_id)
+        if prefix_router is not None:
+            prefix_router.detach_for_reload(request_id)
+            prefix_router.attach_after_reload(request_id, placement.source_rank)
+            prefix_router.reload_failed_count += 1
+        placement.owner = placement.source_engine or placement.owner
+        placement.epoch = placement.source_epoch
+        placement.state = "RUNNING"
+        self.reqs_in_flight[request_id] = placement.owner
+        if placement.source_engine is not None:
+            await self._send_input(
+                EngineCoreRequestType.RESUME_DP_RELOAD,
+                (request_id, placement.source_epoch),
+                placement.source_engine,
+            )
+        logger.warning("DP reload rebalance fell back for %s: %s", request_id, reason)
+        placement.source_engine = None
+        placement.target_engine = None
+        placement.source_epoch = -1
+        placement.target_epoch = -1
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1639,8 +1963,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if getattr(self, "dp_reload_rebalance_enabled", False):
+            placements = self._dp_reload_placements
+            for output in outputs.outputs:
+                if placement := placements.get(output.request_id):
+                    placement.output_token_ids.extend(output.new_token_ids)
         prefix_router = getattr(self, "prefix_router", None)
         if prefix_router is not None:
+            for update in getattr(outputs, "dp_prefix_residency_updates", None) or ():
+                try:
+                    local_rank = self.engine_ranks_managed.index(update.rank)
+                except ValueError:
+                    continue
+                prefix_router.set_resident(
+                    update.request_id, local_rank, update.resident
+                )
             if (scheduler_stats := outputs.scheduler_stats) is not None:
                 try:
                     local_rank = self.engine_ranks_managed.index(outputs.engine_index)
@@ -1653,14 +1990,23 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                         scheduler_stats.kv_cache_usage,
                     )
             prefix_router.observe_outputs(outputs.outputs, outputs.finished_requests)
+        if getattr(self, "dp_reload_rebalance_enabled", False):
+            for event in getattr(outputs, "dp_reload_events", None) or ():
+                await self._handle_dp_reload_event(event)
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
+                placement = getattr(self, "_dp_reload_placements", {}).pop(req_id, None)
+                if placement is not None and placement.timeout_task is not None:
+                    placement.timeout_task.cancel()
             prefix_router = getattr(self, "prefix_router", None)
             if (
                 prefix_router is not None
                 and not self.reqs_in_flight
-                and self._last_prefix_router_log_count != prefix_router.route_count
+                and (
+                    self._last_prefix_router_log_count != prefix_router.route_count
+                    or self.dp_reload_rebalance_enabled
+                )
             ):
                 self._log_prefix_router_stats()
 
@@ -1728,19 +2074,31 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if not request_ids or self.resources.engine_dead:
             return
-
-        if len(request_ids) == 1:
-            # Fast-path common case.
-            if engine := self.reqs_in_flight.get(request_ids[0]):
-                await self._abort_requests(request_ids, engine)
-            return
-
         by_engine = defaultdict[EngineIdentity, list[str]](list)
+        cancel_tasks = []
         for req_id in request_ids:
+            placement = getattr(self, "_dp_reload_placements", {}).get(req_id)
+            if placement is not None and placement.state == "PREPARING":
+                if placement.timeout_task is not None:
+                    placement.timeout_task.cancel()
+                    placement.timeout_task = None
+                if placement.source_engine is not None:
+                    by_engine[placement.source_engine].append(req_id)
+                if placement.target_engine is not None:
+                    cancel_tasks.append(
+                        self._send_input(
+                            EngineCoreRequestType.CANCEL_DP_RELOAD,
+                            (req_id, placement.target_epoch),
+                            placement.target_engine,
+                        )
+                    )
+                continue
             if engine := self.reqs_in_flight.get(req_id):
                 by_engine[engine].append(req_id)
-        for engine, req_ids in by_engine.items():
-            await self._abort_requests(req_ids, engine)
+        await asyncio.gather(
+            *(self._abort_requests(ids, engine) for engine, ids in by_engine.items()),
+            *cancel_tasks,
+        )
 
     async def _abort_requests(
         self, request_ids: list[str], engine: EngineIdentity

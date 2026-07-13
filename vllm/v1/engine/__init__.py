@@ -145,6 +145,56 @@ class EngineCoreRequest(
         return self.pooling_params
 
 
+class DPReloadRequest(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    """A prefill-only request prepared on a replacement DP rank."""
+
+    request: EngineCoreRequest
+    source_rank: int
+    ownership_epoch: int
+    num_preemptions: int
+    source_local_tokens: int = 0
+    source_external_tokens: int = 0
+    output_token_ids: list[int] = msgspec.field(default_factory=list)
+
+
+class DPPrefixResidencyUpdate(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    request_id: str
+    rank: int
+    resident: bool
+
+
+class DPReloadEventType(enum.IntEnum):
+    INTENT = 1
+    PREPARED = 2
+    FAILED = 3
+    TARGET_LOOKUP = 4
+
+
+class DPReloadEvent(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    type: DPReloadEventType
+    request_id: str
+    rank: int
+    ownership_epoch: int
+    num_preemptions: int = 0
+    local_tokens: int = 0
+    external_tokens: int = 0
+    message: str = ""
+
+
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
 
@@ -243,6 +293,11 @@ class EngineCoreOutputs(
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
 
+    # Event-driven ForkAttention DP placement updates. These are intentionally
+    # absent from the steady-state protocol unless prefix routing is enabled.
+    dp_prefix_residency_updates: list[DPPrefixResidencyUpdate] | None = None
+    dp_reload_events: list[DPReloadEvent] | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()
@@ -262,6 +317,11 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    PREPARE_DP_RELOAD = b"\x06"
+    COMMIT_DP_RELOAD = b"\x07"
+    RESUME_DP_RELOAD = b"\x08"
+    DROP_DP_RELOAD_SOURCE = b"\x09"
+    CANCEL_DP_RELOAD = b"\x0a"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):

@@ -473,6 +473,10 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
       heartbeat pings.
     """
 
+    @property
+    def supports_dp_reload_rebalance(self) -> bool:
+        return True
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -480,6 +484,7 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+        self._dp_reload_rebalance_enabled = False
 
         assert vllm_config.kv_transfer_config is not None
         server_host = vllm_config.kv_transfer_config.get_from_extra_config(
@@ -763,10 +768,10 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             into account.
         """
         tracker = self._get_or_create_request_tracker(request)
-        # TODO: support loading KV for preempted requests in the future
-        if request.status == RequestStatus.PREEMPTED:
+        if request.status == RequestStatus.PREEMPTED and not (
+            self._dp_reload_rebalance_enabled
+        ):
             return 0, False
-
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
             token_ids=list(request.all_token_ids),
@@ -956,6 +961,13 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         self.scheduler_adapter.end_session(request.request_id)
 
         return True, return_params
+
+    def request_reassigned(self, request: "Request") -> None:
+        self._cleanup_request_tracker(request.request_id)
+        self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+
+    def set_dp_reload_rebalance_enabled(self, enabled: bool) -> None:
+        self._dp_reload_rebalance_enabled = enabled
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """

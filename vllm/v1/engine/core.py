@@ -15,7 +15,7 @@ from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from multiprocessing.queues import Queue
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import msgspec
 import zmq
@@ -56,6 +56,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
+    DPReloadEvent,
+    DPReloadEventType,
+    DPReloadRequest,
     EEPNotificationType,
     EngineCoreOutput,
     EngineCoreOutputs,
@@ -85,6 +88,9 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import IterationDetails, compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.scheduler import Scheduler
 
 logger = init_logger(__name__)
 
@@ -922,6 +928,7 @@ class EngineCoreProc(EngineCore):
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
+        self._prepared_dp_reloads: dict[str, tuple[Request, int, int]] = {}
 
         # Receiver for tensor IPC
         self.tensor_ipc_receiver: TensorIpcReceiver | None = None
@@ -1381,7 +1388,30 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+        elif request_type == EngineCoreRequestType.PREPARE_DP_RELOAD:
+            reload_request, req, request_wave = request
+            self._prepare_dp_reload(reload_request, req, request_wave)
+        elif request_type == EngineCoreRequestType.COMMIT_DP_RELOAD:
+            request_id, ownership_epoch = request
+            prepared = self._prepared_dp_reloads.get(request_id)
+            if prepared is not None and prepared[2] == ownership_epoch:
+                req, request_wave, _ = self._prepared_dp_reloads.pop(request_id)
+                req.status = RequestStatus.WAITING
+                self.add_request(req, request_wave)
+        elif request_type == EngineCoreRequestType.RESUME_DP_RELOAD:
+            request_id, ownership_epoch = request
+            self.scheduler.resume_dp_reload(request_id, ownership_epoch)
+        elif request_type == EngineCoreRequestType.DROP_DP_RELOAD_SOURCE:
+            request_id, ownership_epoch = request
+            self.scheduler.drop_dp_reload_source(request_id, ownership_epoch)
+        elif request_type == EngineCoreRequestType.CANCEL_DP_RELOAD:
+            request_id, ownership_epoch = request
+            prepared = self._prepared_dp_reloads.get(request_id)
+            if prepared is not None and prepared[2] == ownership_epoch:
+                self._prepared_dp_reloads.pop(request_id, None)
         elif request_type == EngineCoreRequestType.ABORT:
+            for request_id in request:
+                self._prepared_dp_reloads.pop(request_id, None)
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
@@ -1403,6 +1433,57 @@ class EngineCoreProc(EngineCore):
             logger.error(
                 "Unrecognized input request type encountered: %s", request_type
             )
+
+    def _prepare_dp_reload(
+        self,
+        reload_request: DPReloadRequest,
+        request: Request,
+        request_wave: int,
+    ) -> None:
+        request_id = request.request_id
+        error = ""
+        if not getattr(self.scheduler, "dp_reload_rebalance_enabled", False):
+            error = "target scheduler does not support DP reload rebalance"
+        elif request_id in self._prepared_dp_reloads:
+            error = "duplicate prepared reload"
+        elif request_id in getattr(self.scheduler, "requests", {}):
+            error = "request already exists on target"
+
+        if error:
+            event = DPReloadEvent(
+                type=DPReloadEventType.FAILED,
+                request_id=request_id,
+                rank=self.engine_index,
+                ownership_epoch=reload_request.ownership_epoch,
+                message=error,
+            )
+        else:
+            request.ownership_epoch = reload_request.ownership_epoch
+            request.reload_rebalance_count = 1
+            request.num_preemptions = reload_request.num_preemptions
+            request.append_output_token_ids(reload_request.output_token_ids)
+            request.reload_source_local_tokens = reload_request.source_local_tokens
+            request.reload_source_external_tokens = (
+                reload_request.source_external_tokens
+            )
+            self._prepared_dp_reloads[request_id] = (
+                request,
+                request_wave,
+                reload_request.ownership_epoch,
+            )
+            scheduler = cast("Scheduler", self.scheduler)
+            _, local_tokens = scheduler.kv_cache_manager.get_computed_blocks(request)
+            event = DPReloadEvent(
+                type=DPReloadEventType.PREPARED,
+                request_id=request_id,
+                rank=self.engine_index,
+                ownership_epoch=reload_request.ownership_epoch,
+                num_preemptions=reload_request.num_preemptions,
+                local_tokens=local_tokens,
+            )
+        self.output_queue.put_nowait(
+            (request.client_index, EngineCoreOutputs(dp_reload_events=[event]))
+        )
 
     def _reject_add_in_shutdown(self, request: Request) -> bool:
         if self.shutdown_state == EngineShutdownState.RUNNING:
@@ -1494,6 +1575,9 @@ class EngineCoreProc(EngineCore):
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
         )
+        dp_reload_decoder = MsgpackDecoder(
+            DPReloadRequest, oob_tensor_provider=self.tensor_ipc_receiver
+        )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -1572,6 +1656,32 @@ class EngineCoreProc(EngineCore):
                             request = self.preprocess_add_request(req)
                         except Exception:
                             self._handle_request_preproc_error(req)
+                            continue
+                    elif request_type == EngineCoreRequestType.PREPARE_DP_RELOAD:
+                        reload_request = dp_reload_decoder.decode(data_frames)
+                        try:
+                            prepared_req, request_wave = self.preprocess_add_request(
+                                reload_request.request
+                            )
+                            request = (reload_request, prepared_req, request_wave)
+                        except Exception as error:
+                            logger.exception(
+                                "Failed to preprocess DP reload request %s",
+                                reload_request.request.request_id,
+                            )
+                            event = DPReloadEvent(
+                                type=DPReloadEventType.FAILED,
+                                request_id=reload_request.request.request_id,
+                                rank=self.engine_index,
+                                ownership_epoch=reload_request.ownership_epoch,
+                                message=str(error),
+                            )
+                            self.output_queue.put_nowait(
+                                (
+                                    reload_request.request.client_index,
+                                    EngineCoreOutputs(dp_reload_events=[event]),
+                                )
+                            )
                             continue
                     else:
                         request = generic_decoder.decode(data_frames)
@@ -1911,8 +2021,9 @@ class DPEngineCoreProc(EngineCoreProc):
         # Publish request counts and low-rate physical execution telemetry.
         counts = self.scheduler.get_request_counts()
         if self.publish_fork_dp_telemetry:
-            fork_execution_stats = self.scheduler.fork_execution_stats
-            kv_cache_usage = round(self.scheduler.kv_cache_manager.usage, 3)
+            scheduler = cast("Scheduler", self.scheduler)
+            fork_execution_stats = scheduler.fork_execution_stats
+            kv_cache_usage = round(scheduler.kv_cache_manager.usage, 3)
             telemetry = (fork_execution_stats, kv_cache_usage)
         else:
             fork_execution_stats = None
