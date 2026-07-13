@@ -37,7 +37,13 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "values indicate transfers (stores or promotions) may be "
                     "dropped due to insufficient capacity."
                 ),
-            )
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_OCCUPANCY_PERC: OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of CPU KV-cache capacity containing stored or "
+                    "in-flight blocks (0.0 = empty, 1.0 = full)."
+                ),
+            ),
         }
         store_threshold = int(extra_config.get("store_threshold", 0))
         if store_threshold >= 2:

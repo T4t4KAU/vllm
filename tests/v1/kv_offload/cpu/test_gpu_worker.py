@@ -3,6 +3,7 @@
 import random
 import time
 import uuid
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -17,7 +18,11 @@ from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
-from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.gpu_worker import (
+    MAX_BATCH_COPY_DESCRIPTORS,
+    CPUOffloadingWorker,
+    SingleDirectionOffloadingHandler,
+)
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 NUM_GPU_BLOCKS = [64]
@@ -30,6 +35,34 @@ DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:0"]
 NUM_MAPPINGS = [3]
 NUM_MAPPINGS_PER_GROUP = [2]
+
+
+def test_submit_copy_batches_limits_driver_batch_size() -> None:
+    handler = MagicMock()
+    num_descriptors = MAX_BATCH_COPY_DESCRIPTORS * 2 + 17
+    src = torch.arange(num_descriptors, dtype=torch.int64)
+    dst = src + num_descriptors
+    sizes = src + 2 * num_descriptors
+
+    SingleDirectionOffloadingHandler._submit_copy_batches(
+        handler,
+        src,
+        dst,
+        sizes,
+        is_src_access_order_any=True,
+    )
+
+    calls = handler._swap_blocks_batch.call_args_list
+    assert [len(call.args[0]) for call in calls] == [
+        MAX_BATCH_COPY_DESCRIPTORS,
+        MAX_BATCH_COPY_DESCRIPTORS,
+        17,
+    ]
+    for tensor_index, expected in enumerate((src, dst, sizes)):
+        assert torch.equal(
+            torch.cat([call.args[tensor_index] for call in calls]), expected
+        )
+    assert all(call.kwargs["is_src_access_order_any"] for call in calls)
 
 
 @pytest.mark.parametrize("gpu_to_cpu", [True, False])
@@ -162,6 +195,8 @@ def test_transfer(
         assert worker.submit_store(1, src_spec, dst_spec)
     else:
         assert worker.submit_load(1, src_spec, dst_spec)
+    assert worker._cpu_memory_ready
+    assert worker.pin_thread is None
     assert {x.job_id for x in handler._transfers} == {1}
 
     # wait for transfer to complete

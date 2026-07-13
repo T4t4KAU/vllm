@@ -32,10 +32,15 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 
 logger = init_logger(__name__)
 
+# Large prefix reloads can contain tens of thousands of layer/block copies.
+# Bound each driver submission while preserving stream order for the full job.
+MAX_BATCH_COPY_DESCRIPTORS = 2048
+
 
 def _select_swap_blocks_fn(
     kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
     gpu_to_cpu: bool,
+    allow_triton: bool = True,
 ):
     """Resolve the swap_blocks function for a handler at init time."""
     # GPU->CPU is bandwidth-bound; the dedicated copy engine beats Triton.
@@ -45,7 +50,7 @@ def _select_swap_blocks_fn(
     # (e.g. ROCm builds without Triton) or where GPU kernels cannot directly
     # dereference CPU pointers (XPU lacks CUDA's unified virtual address space,
     # so the Triton kernel's tl.load(cpu_ptr) is invalid on XPU).
-    if not HAS_TRITON or current_platform.is_xpu():
+    if not allow_triton or not HAS_TRITON or current_platform.is_xpu():
         return ops.swap_blocks_batch
     page_sizes = [r.page_size_bytes for g in kv_cache_groups_data_refs for r in g]
     # Triton wins only on small, 8-byte-aligned payloads.
@@ -153,6 +158,7 @@ class SingleDirectionOffloadingHandler:
         mmap_region: SharedOffloadRegion | None = None,
         pin_thread: threading.Thread | None = None,
         manually_pinned_tensors: list[torch.Tensor] | None = None,
+        allow_triton: bool = True,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -190,7 +196,7 @@ class SingleDirectionOffloadingHandler:
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
         self._swap_blocks_batch = _select_swap_blocks_fn(
-            kv_cache_groups_data_refs, gpu_to_cpu
+            kv_cache_groups_data_refs, gpu_to_cpu, allow_triton
         )
 
         # GPU blocks may be smaller
@@ -216,6 +222,16 @@ class SingleDirectionOffloadingHandler:
         self._layer_names: tuple[str, ...] = ()
         self._layer_page_size_bytes = 0
         self._cross_layer_tensor = False
+
+    def configure_cpu_load_backend(self, host_memory_pinned: bool) -> None:
+        """Select the CPU->GPU backend after host registration completes."""
+        assert not self.gpu_to_cpu
+        assert not self._transfers
+        self._swap_blocks_batch = _select_swap_blocks_fn(
+            self.kv_cache_groups_data_refs,
+            gpu_to_cpu=False,
+            allow_triton=host_memory_pinned,
+        )
 
     def configure_layerwise_load(self, layer_names: tuple[str, ...]) -> bool:
         if self.gpu_to_cpu or not layer_names:
@@ -254,6 +270,23 @@ class SingleDirectionOffloadingHandler:
         for transfer in self._transfers:
             if transfer.layer_events:
                 compute_stream.wait_event(transfer.layer_events[layer_idx])
+
+    def _submit_copy_batches(
+        self,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        sizes: torch.Tensor,
+        *,
+        is_src_access_order_any: bool,
+    ) -> None:
+        for start in range(0, len(src), MAX_BATCH_COPY_DESCRIPTORS):
+            end = start + MAX_BATCH_COPY_DESCRIPTORS
+            self._swap_blocks_batch(
+                src[start:end],
+                dst[start:end],
+                sizes[start:end],
+                is_src_access_order_any=is_src_access_order_any,
+            )
 
     def transfer_async(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
@@ -440,7 +473,7 @@ class SingleDirectionOffloadingHandler:
                     for layer_idx in range(num_layers):
                         start = layer_idx * descriptors_per_layer
                         end = start + descriptors_per_layer
-                        self._swap_blocks_batch(
+                        self._submit_copy_batches(
                             src[start:end],
                             dst[start:end],
                             sizes[start:end],
@@ -454,7 +487,7 @@ class SingleDirectionOffloadingHandler:
                         layer_event.record(stream)
                         layer_events.append(layer_event)
                 else:
-                    self._swap_blocks_batch(
+                    self._submit_copy_batches(
                         src,
                         dst,
                         sizes,
@@ -560,6 +593,9 @@ class CPUOffloadingWorker(OffloadingWorker):
         pin_memory = PIN_MEMORY
         self.pin_thread: threading.Thread | None = None
         self._manually_pinned_tensors: list[torch.Tensor] = []
+        self._pin_lock = threading.Lock()
+        self._cpu_memory_ready = False
+        self._cpu_memory_pinned = False
 
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
         self._mmap_region = mmap_region
@@ -629,6 +665,9 @@ class CPUOffloadingWorker(OffloadingWorker):
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             gpu_to_cpu=False,
+            # A Triton kernel cannot dereference these host pointers until
+            # asynchronous cudaHostRegister has completed successfully.
+            allow_triton=False,
         )
 
     def _pin_cpu_tensors(self) -> None:
@@ -649,7 +688,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             if result.value != 0:
                 logger.warning(
                     "cudaHostRegister failed for host tensor (code=%d) "
-                    "- transfers will still work but may be slower (unpinned DMA)",
+                    "- CPU loads will fall back to the DMA path",
                     result.value,
                 )
                 continue
@@ -669,17 +708,33 @@ class CPUOffloadingWorker(OffloadingWorker):
             num_pinned,
             time.monotonic() - t0,
         )
+        self._cpu_memory_pinned = num_pinned == len(tensors_to_pin)
+
+    def _ensure_cpu_memory_ready(self) -> None:
+        """Wait for registration before any transfer touches host memory."""
+        if self._cpu_memory_ready:
+            return
+        with self._pin_lock:
+            if self._cpu_memory_ready:
+                return
+            if self.pin_thread is not None:
+                self.pin_thread.join()
+                self.pin_thread = None
+            self._load_handler.configure_cpu_load_backend(self._cpu_memory_pinned)
+            self._cpu_memory_ready = True
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
         """Async GPU -> CPU."""
+        self._ensure_cpu_memory_ready()
         return self._store_handler.transfer_async(job_id, src_spec, dst_spec)
 
     def submit_load(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
         """Async CPU -> GPU."""
+        self._ensure_cpu_memory_ready()
         return self._load_handler.transfer_async(job_id, src_spec, dst_spec)
 
     def configure_layerwise_load(self, layer_names: tuple[str, ...]) -> bool:

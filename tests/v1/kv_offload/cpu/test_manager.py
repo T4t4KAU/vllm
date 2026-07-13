@@ -190,38 +190,46 @@ def test_filter_reused_manager_reports_stores_skipped_counter():
 
 
 def test_cpu_manager_reports_cache_usage_gauge():
-    def check_usage_stats(manager: CPUOffloadingManager, value: float):
+    def check_usage_stats(
+        manager: CPUOffloadingManager,
+        usage: float,
+        occupancy: float,
+    ):
         stats = manager.get_stats()
         assert stats is not None
-        assert stats.reduce()[
-            CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC
-        ] == pytest.approx(value)
+        reduced = stats.reduce()
+        assert reduced[CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC] == pytest.approx(
+            usage
+        )
+        assert reduced[CPUOffloadingMetrics.CPU_CACHE_OCCUPANCY_PERC] == pytest.approx(
+            occupancy
+        )
 
     # Zero-capacity manager always reports 0.0
     manager = make_cpu_manager(num_blocks=0)
-    check_usage_stats(manager, 0.0)
+    check_usage_stats(manager, 0.0, 0.0)
 
     # Empty manager (4 blocks, none allocated): usage = 0.0
     manager = make_cpu_manager(num_blocks=4)
-    check_usage_stats(manager, 0.0)
+    check_usage_stats(manager, 0.0, 0.0)
 
     # After allocating 2 of 4 blocks: usage = 0.5
     manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
-    check_usage_stats(manager, 0.5)
+    check_usage_stats(manager, 0.5, 0.5)
 
     # After filling all 4 blocks: usage = 1.0
     manager.prepare_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
-    check_usage_stats(manager, 1.0)
+    check_usage_stats(manager, 1.0, 1.0)
 
     # After completing store, the blocks becomes evictable as it is not actively used
     # and usage drops.
     manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
-    check_usage_stats(manager, 0.5)
+    check_usage_stats(manager, 0.5, 1.0)
 
     # After completing store, the blocks becomes evictable as it is not actively used
-    # and usage drops.
+    # and usage drops while occupancy remains full.
     manager.complete_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
-    check_usage_stats(manager, 0.0)
+    check_usage_stats(manager, 0.0, 1.0)
 
 
 def test_cpu_manager():

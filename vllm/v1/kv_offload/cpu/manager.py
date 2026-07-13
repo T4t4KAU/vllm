@@ -299,6 +299,12 @@ class CPUOffloadingManager(OffloadingManager):
         )
         usage = num_used / self._num_blocks if self._num_blocks > 0 else 0.0
         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
+        num_occupied = self._num_allocated_blocks - len(self._free_list)
+        occupancy = num_occupied / self._num_blocks if self._num_blocks > 0 else 0.0
+        stats.set_gauge(
+            CPUOffloadingMetrics.CPU_CACHE_OCCUPANCY_PERC,
+            occupancy,
+        )
 
         if self.store_threshold >= 2:
             stats.increase_counter(
