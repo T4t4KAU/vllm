@@ -10,7 +10,10 @@ import torch
 import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    get_block_table_num_blocks,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     _compute_fork_common_prefix_len,
     should_use_fork_dynamic_forest,
@@ -49,6 +52,10 @@ def _make_manager() -> CudaGraphManager:
     manager._graphs_captured = True
     manager._fork_dispatch_stats = defaultdict(int)
     return manager
+
+
+def test_fork_graph_uses_aligned_block_table_capacity() -> None:
+    assert get_block_table_num_blocks(max_model_len=11424, block_size=16) == 720
 
 
 def test_fork_cudagraph_dispatch_has_flash_and_fork_decode_graphs(

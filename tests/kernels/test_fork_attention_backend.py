@@ -176,7 +176,7 @@ def test_fork_cudagraph_workspace_uses_scheduler_capacity(
         causal=True,
     )
     builder._update_cudagraph_workspace(metadata, workspace)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert workspace.kv_in_ctas[1][:2].tolist() == [64, 64]
     assert workspace.num_split_per_seq[:2].tolist() == [1, 1]
@@ -210,6 +210,50 @@ def test_fork_cudagraph_workspace_uses_prefix_bucket(
     assert workspace.query_tables[0].shape == (2, 16)
     assert workspace.block_tables[0].shape == (2, 256)
     assert workspace.split_out.shape[2] == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fork_cudagraph_workspace_matches_aligned_block_table() -> None:
+    builder = _make_builder(
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+    builder.device = torch.device("cuda")
+    builder.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=16)
+    )
+    builder.compilation_config = SimpleNamespace(max_cudagraph_capture_size=32)
+    builder.model_config = SimpleNamespace(max_model_len=11424)
+
+    workspace = builder._get_cudagraph_workspace(4)
+    metadata = FlashAttentionMetadata(
+        num_actual_tokens=2,
+        max_query_len=1,
+        query_start_loc=torch.arange(3, dtype=torch.int32, device="cuda"),
+        max_seq_len=8193,
+        seq_lens=torch.full((2,), 8193, dtype=torch.int32, device="cuda"),
+        block_table=torch.zeros((2, 720), dtype=torch.int32, device="cuda"),
+        slot_mapping=torch.arange(2, dtype=torch.int64, device="cuda"),
+        use_cascade=True,
+        common_prefix_len=499 * 16,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+        causal=True,
+    )
+    kwargs = builder._update_cudagraph_workspace(
+        metadata,
+        workspace,
+        num_active_reqs=2,
+    )
+    torch.accelerator.synchronize()
+
+    assert workspace.max_blocks == 720
+    assert workspace.block_tables[1].shape == (16, 720)
+    assert kwargs["fork_enabled"] is True
+    assert workspace.num_split_per_seq[:2].tolist() == [5, 5]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -288,7 +332,7 @@ def test_fork_cudagraph_workspace_excludes_padding(
         workspace,
         active_reqs,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert kwargs["fork_enabled"]
     assert workspace.prefix_chunk_capacity_blocks == 256
@@ -387,7 +431,7 @@ def test_fork_forest_metadata_without_global_common_prefix(
     builder._fork_seq_lens_cpu = torch.full((4,), 64, dtype=torch.int32)
 
     kwargs = builder._build_fork_kwargs(metadata)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert kwargs["fork_enabled"]
     assert kwargs["fork_num_split_per_seq"].tolist() == [2, 2, 2, 2]
@@ -441,7 +485,7 @@ def test_fork_forest_metadata_emits_hierarchical_segments(
     )
 
     kwargs = builder._build_fork_kwargs(metadata)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     assert kwargs["fork_enabled"]
     assert kwargs["fork_num_split_per_seq"].tolist() == [2, 2, 2]
@@ -758,7 +802,7 @@ def test_fork_forest_cudagraph_replay_handles_noncontiguous_pages(
         )
 
     run_fork()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run_fork()
@@ -766,7 +810,7 @@ def test_fork_forest_cudagraph_replay_handles_noncontiguous_pages(
     replay_q = torch.randn_like(q)
     q.copy_(replay_q)
     graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     ref = _run_flash_ref(
         replay_q[:, 0],

@@ -29,7 +29,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, get_block_table_num_blocks
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     set_fork_cudagraph_prefix_bucket,
@@ -58,7 +58,7 @@ def _get_fork_forest_max_splits(block_size: int, max_model_len: int) -> int:
         if max_splits > 32:
             raise ValueError("VLLM_FORK_ATTN_FOREST_MAX_SPLITS must be <= 32")
         return max_splits
-    max_blocks = (max_model_len + block_size - 1) // block_size
+    max_blocks = get_block_table_num_blocks(max_model_len, block_size)
     chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
     return min(32, (max_blocks + chunk_blocks - 1) // chunk_blocks + 4)
 
@@ -296,9 +296,10 @@ class CudaGraphManager:
         requested_tokens = envs.VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE
         if requested_tokens <= 0:
             raise ValueError("VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE must be positive")
-        max_blocks = (
-            self.vllm_config.model_config.max_model_len + block_size - 1
-        ) // block_size
+        max_blocks = get_block_table_num_blocks(
+            self.vllm_config.model_config.max_model_len,
+            block_size,
+        )
         chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
         num_chunks = (prefix_blocks + chunk_blocks - 1) // chunk_blocks
         for bucket in self._fork_prefix_chunk_buckets:
@@ -332,18 +333,18 @@ class CudaGraphManager:
             return ()
         raw_config = envs.VLLM_FORK_ATTN_CUDAGRAPH_CAPTURE_BUCKETS.strip()
         if not raw_config:
-            plans = [
+            default_plans = [
                 ForkGraphPlan("common", capacity)
                 for capacity in self._fork_prefix_chunk_buckets
             ]
             if envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH:
-                plans.extend(
+                default_plans.extend(
                     ForkGraphPlan("forest", capacity)
                     for capacity in self._fork_forest_cta_buckets
                 )
-            return tuple(plans)
+            return tuple(default_plans)
 
-        plans: set[ForkGraphPlan] = set()
+        configured_plans: set[ForkGraphPlan] = set()
         for group in raw_config.split(";"):
             kind, separator, capacities = group.partition(":")
             if not separator or kind not in ("common", "forest"):
@@ -365,8 +366,10 @@ class CudaGraphManager:
                 plan_kind: Literal["common", "forest"] = (
                     "common" if kind == "common" else "forest"
                 )
-                plans.add(ForkGraphPlan(plan_kind, capacity))
-        return tuple(sorted(plans, key=lambda plan: (plan.kind, plan.capacity)))
+                configured_plans.add(ForkGraphPlan(plan_kind, capacity))
+        return tuple(
+            sorted(configured_plans, key=lambda plan: (plan.kind, plan.capacity))
+        )
 
     def get_fork_forest_cta_bucket(
         self,

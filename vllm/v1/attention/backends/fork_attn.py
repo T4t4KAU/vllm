@@ -37,7 +37,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, get_block_table_num_blocks
 
 logger = init_logger(__name__)
 
@@ -195,7 +195,7 @@ def _get_prefix_chunk_blocks(block_size: int, max_blocks: int) -> int:
 
 
 def _get_default_prefix_chunk_bucket(block_size: int, max_model_len: int) -> int:
-    max_blocks = (max_model_len + block_size - 1) // block_size
+    max_blocks = get_block_table_num_blocks(max_model_len, block_size)
     prefix_chunk_blocks = _get_prefix_chunk_blocks(block_size, max_blocks)
     return (max_blocks + prefix_chunk_blocks - 1) // prefix_chunk_blocks
 
@@ -399,19 +399,19 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         prefix_chunk_bucket = self._get_cudagraph_prefix_chunk_bucket()
         forest_cta_bucket = self._get_cudagraph_forest_cta_bucket()
         if prefix_chunk_bucket is not None:
-            workspace = self._get_cudagraph_workspace(prefix_chunk_bucket)
-            self._clear_cudagraph_workspace(workspace)
+            prefix_workspace = self._get_cudagraph_workspace(prefix_chunk_bucket)
+            self._clear_cudagraph_workspace(prefix_workspace)
             return ForkAttentionMetadata(
                 **_flash_metadata_kwargs(base_metadata),
-                **self._workspace_kwargs(workspace),
+                **self._workspace_kwargs(prefix_workspace),
             )
         if forest_cta_bucket is None:
             return ForkAttentionMetadata(**_flash_metadata_kwargs(base_metadata))
-        workspace = self._get_cudagraph_forest_workspace(forest_cta_bucket)
-        self._clear_cudagraph_workspace(workspace)
+        forest_workspace = self._get_cudagraph_forest_workspace(forest_cta_bucket)
+        self._clear_cudagraph_workspace(forest_workspace)
         return ForkAttentionMetadata(
             **_flash_metadata_kwargs(base_metadata),
-            **self._forest_workspace_kwargs(workspace),
+            **self._forest_workspace_kwargs(forest_workspace),
         )
 
     def build(
@@ -444,9 +444,9 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             num_active_reqs = metadata.num_actual_tokens
         cudagraph_bucket = self._get_cudagraph_prefix_chunk_bucket()
         if cudagraph_bucket is not None:
-            workspace = self._get_cudagraph_workspace(cudagraph_bucket)
+            prefix_workspace = self._get_cudagraph_workspace(cudagraph_bucket)
             if not self._can_use_fork(metadata):
-                self._clear_cudagraph_workspace(workspace)
+                self._clear_cudagraph_workspace(prefix_workspace)
                 raise RuntimeError(
                     "ForkAttention prefix graph was selected without an "
                     "eligible common prefix"
@@ -455,7 +455,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             started_at = time.perf_counter() if profile_metadata else None
             kwargs = self._update_cudagraph_workspace(
                 metadata,
-                workspace,
+                prefix_workspace,
                 num_active_reqs,
             )
             metadata_ms = (
@@ -478,9 +478,9 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
         forest_cta_bucket = self._get_cudagraph_forest_cta_bucket()
         if forest_cta_bucket is not None:
-            workspace = self._get_cudagraph_forest_workspace(forest_cta_bucket)
+            forest_workspace = self._get_cudagraph_forest_workspace(forest_cta_bucket)
             if not self._can_use_fork_decode(metadata):
-                self._clear_cudagraph_workspace(workspace)
+                self._clear_cudagraph_workspace(forest_workspace)
                 raise RuntimeError(
                     "ForkAttention forest graph was selected without an "
                     "eligible decode batch"
@@ -489,7 +489,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             started_at = time.perf_counter() if profile_metadata else None
             kwargs = self._update_cudagraph_forest_workspace(
                 metadata,
-                workspace,
+                forest_workspace,
                 num_active_reqs,
             )
             metadata_ms = (
@@ -688,7 +688,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             complete_blocks = seq_len // self.block_size
             if complete_blocks > 0:
                 _add_trie_path(root, req_id, block_rows[req_id][:complete_blocks])
-        boxes = []
+        boxes: list[_ForkSegmentBox] = []
         rank_by_req = [0] * num_reqs
         chunk_blocks = _get_prefix_chunk_blocks(
             self.block_size,
@@ -767,9 +767,11 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         key = f"{reason}:{'enabled' if enabled else 'fallback'}"
         first_for_path = counters[key] == 0
         counters[key] += 1
-        timings = getattr(self, "_fork_profile_metadata_ms", None)
+        timings: defaultdict[str, float] | None = getattr(
+            self, "_fork_profile_metadata_ms", None
+        )
         if timings is None:
-            timings = Counter()
+            timings = defaultdict(float)
             self._fork_profile_metadata_ms = timings
         if metadata_ms is not None:
             timings[key] += metadata_ms
@@ -793,11 +795,15 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
     def _get_cudagraph_prefix_chunk_bucket(self) -> int | None:
         plan = getattr(self, "_fork_cudagraph_plan", None)
-        return plan.capacity if getattr(plan, "kind", None) == "common" else None
+        if plan is None or getattr(plan, "kind", None) != "common":
+            return None
+        return int(plan.capacity)
 
     def _get_cudagraph_forest_cta_bucket(self) -> int | None:
         plan = getattr(self, "_fork_cudagraph_plan", None)
-        return plan.capacity if getattr(plan, "kind", None) == "forest" else None
+        if plan is None or getattr(plan, "kind", None) != "forest":
+            return None
+        return int(plan.capacity)
 
     def _get_cudagraph_workspace(
         self,
@@ -822,9 +828,10 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             max_active_reqs,
             self.compilation_config.max_cudagraph_capture_size or 0,
         )
-        max_blocks = (
-            self.model_config.max_model_len + self.block_size - 1
-        ) // self.block_size
+        max_blocks = get_block_table_num_blocks(
+            self.model_config.max_model_len,
+            self.block_size,
+        )
         prefix_chunk_capacity_blocks = _get_prefix_chunk_blocks(
             self.block_size, max_blocks
         )
@@ -945,9 +952,10 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             max_active_reqs,
             self.compilation_config.max_cudagraph_capture_size or 0,
         )
-        max_blocks = (
-            self.model_config.max_model_len + self.block_size - 1
-        ) // self.block_size
+        max_blocks = get_block_table_num_blocks(
+            self.model_config.max_model_len,
+            self.block_size,
+        )
         chunk_blocks = _get_prefix_chunk_blocks(self.block_size, max_blocks)
         max_split_per_seq = _get_default_forest_max_split_per_seq(
             self.block_size,

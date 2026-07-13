@@ -25,6 +25,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def get_block_table_num_blocks(
+    max_model_len: int,
+    block_size: int,
+    dcp_size: int = 1,
+) -> int:
+    """Return the per-request block-table width used by GPU model runners."""
+    num_blocks = cdiv(max_model_len, block_size * dcp_size)
+    if block_size <= 128:
+        alignment = 128 // block_size
+        num_blocks = cdiv(num_blocks, alignment) * alignment
+    return num_blocks
+
+
 # ---------------------------------------------------------------------------
 # KV cache quantization mode
 # ---------------------------------------------------------------------------
