@@ -212,6 +212,7 @@ class Scheduler(SchedulerInterface):
             self.fork_fanout_gpu_hotset_budget_blocks,
         ) = self._init_fork_fanout_gpu_hotset_config()
         self.fork_fanout_admission_bypass_counts: dict[str, int] = {}
+        self.fork_fanout_admission_last_step: int = -1
         self.fork_fanout_reserved_blocks: list[KVCacheBlock] = []
 
         # The request IDs that are finished in between the previous and the
@@ -1969,7 +1970,9 @@ class Scheduler(SchedulerInterface):
         if self.policy == SchedulingPolicy.FCFS:
             if self.skipped_waiting:
                 return self.skipped_waiting
-            self._promote_fanout_waiting_request()
+            if self.fork_fanout_admission_last_step != self.current_step:
+                self._promote_fanout_waiting_request()
+                self.fork_fanout_admission_last_step = self.current_step
             return self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.

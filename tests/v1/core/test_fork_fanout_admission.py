@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import Counter
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -237,6 +238,22 @@ def test_fork_fanout_admission_head_shared_pulls_later_cohort_member() -> None:
         "private",
     ]
     assert not scheduler.fork_fanout_admission_bypass_counts
+
+
+def test_fork_fanout_admission_scans_once_per_scheduler_step(monkeypatch) -> None:
+    scheduler = _make_scheduler_for_admission(fork=True)
+    request = create_requests(1, num_tokens=32, req_ids=["waiting"])[0]
+    scheduler.waiting.add_request(request)
+    promote = MagicMock()
+    monkeypatch.setattr(scheduler, "_promote_fanout_waiting_request", promote)
+
+    assert scheduler._select_waiting_queue_for_scheduling() is scheduler.waiting
+    assert scheduler._select_waiting_queue_for_scheduling() is scheduler.waiting
+    promote.assert_called_once_with()
+
+    scheduler.current_step += 1
+    assert scheduler._select_waiting_queue_for_scheduling() is scheduler.waiting
+    assert promote.call_count == 2
 
 
 def test_fork_fanout_admission_reserves_cached_gpu_hotset(monkeypatch) -> None:
