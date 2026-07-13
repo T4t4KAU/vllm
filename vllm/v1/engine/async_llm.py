@@ -263,12 +263,12 @@ class AsyncLLM(EngineClient):
         if renderer := getattr(self, "renderer", None):
             renderer.shutdown()
 
-        if engine_core := getattr(self, "engine_core", None):
-            engine_core.shutdown(timeout=timeout)
-
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+
+        if engine_core := getattr(self, "engine_core", None):
+            engine_core.shutdown(timeout=timeout)
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
