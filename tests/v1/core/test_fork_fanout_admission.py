@@ -6,6 +6,7 @@ from collections import Counter
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm import envs
 from vllm.config import KVTransferConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.outputs import ModelRunnerOutput
@@ -364,6 +365,33 @@ def test_fork_fanout_gpu_hotset_uses_kv_connector_extra_config() -> None:
         512,
         0.75,
         512,
+    )
+
+
+def test_fork_fanout_policy_switch_disables_all_scheduler_policies(
+    monkeypatch,
+) -> None:
+    scheduler = _make_scheduler_for_admission(fork=False)
+    scheduler.vllm_config.attention_config.backend = AttentionBackendEnum.FORK_ATTN
+    scheduler.vllm_config.kv_transfer_config = KVTransferConfig(
+        kv_connector="ExampleConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "fanout_admission_window": 7,
+            "fanout_preemption_window": 5,
+            "fanout_gpu_hotset_enabled": True,
+        },
+    )
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED", False)
+
+    assert scheduler._init_fork_fanout_admission_config() == (0, 0)
+    assert scheduler._init_fork_fanout_preemption_config() == (0, 0)
+    assert scheduler._init_fork_fanout_gpu_hotset_config() == (
+        False,
+        0,
+        0,
+        1.0,
+        0,
     )
 
 

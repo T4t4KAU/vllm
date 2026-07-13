@@ -2126,7 +2126,10 @@ class Scheduler(SchedulerInterface):
         return True
 
     def _init_fork_fanout_admission_config(self) -> tuple[int, int]:
-        if not self._is_fork_attention_backend():
+        if (
+            not self._is_fork_attention_backend()
+            or not envs.VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED
+        ):
             return 0, 0
 
         extra_config = self._get_fork_fanout_extra_config()
@@ -2149,7 +2152,10 @@ class Scheduler(SchedulerInterface):
         return window, max_bypasses
 
     def _init_fork_fanout_preemption_config(self) -> tuple[int, int]:
-        if not self._is_fork_attention_backend():
+        if (
+            not self._is_fork_attention_backend()
+            or not envs.VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED
+        ):
             return 0, 0
 
         extra_config = self._get_fork_fanout_extra_config()
@@ -2177,7 +2183,10 @@ class Scheduler(SchedulerInterface):
     def _init_fork_fanout_gpu_hotset_config(
         self,
     ) -> tuple[bool, int, int, float, int]:
-        if not self._is_fork_attention_backend():
+        if (
+            not self._is_fork_attention_backend()
+            or not envs.VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED
+        ):
             return False, 0, 0, 1.0, 0
         extra_config = self._get_fork_fanout_extra_config()
         enabled = bool(extra_config.get("fanout_gpu_hotset_enabled", True))
