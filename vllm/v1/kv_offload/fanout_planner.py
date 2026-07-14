@@ -249,12 +249,14 @@ class FanoutChunkPlanner:
     ) -> bool:
         if chunk.lifecycle_state is FanoutLifecycleState.COLD:
             return True
+        # OffloadingConnector creates a CPU backup; it does not release the
+        # GPU block. Back up a hot prefix while it is still resident so a
+        # later GPU eviction can reload it instead of recomputing it.
+        if chunk.lifecycle_state is FanoutLifecycleState.HOT:
+            return self.allow_hot_shared_prefix_backup
         if chunk.lifecycle_state is FanoutLifecycleState.COOLING:
             return pressure_level is not FanoutPressureLevel.NORMAL
-        return (
-            pressure_level is FanoutPressureLevel.CRITICAL
-            and self.allow_hot_shared_prefix_backup
-        )
+        return False
 
     def _can_merge(
         self,

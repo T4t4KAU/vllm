@@ -711,6 +711,72 @@ class OffloadingConnectorScheduler:
         self._fanout_step = 0
         self._fanout_pressure_state = FanoutPressureLevel.NORMAL
         self._fanout_lifecycle: dict[OffloadKey, FanoutLifecycle] = {}
+        self._fanout_admitted_keys: set[OffloadKey] = set()
+        self._fanout_admitted_locations: dict[
+            OffloadKey, set[tuple[ReqId, int, int]]
+        ] = {}
+
+    def _record_fanout_admission(
+        self,
+        offload_key: OffloadKey,
+        req_id: ReqId,
+        group_idx: int,
+        group_state: RequestGroupState,
+        logical_idx: int,
+    ) -> None:
+        self._fanout_admitted_keys.add(offload_key)
+        group_state.fanout_admitted_block_indices.add(logical_idx)
+        self._fanout_admitted_locations.setdefault(offload_key, set()).add(
+            (req_id, group_idx, logical_idx)
+        )
+
+    def _reuse_fanout_admission(
+        self,
+        offload_key: OffloadKey,
+        req_id: ReqId,
+        group_idx: int,
+        group_state: RequestGroupState,
+        logical_idx: int,
+    ) -> bool:
+        """Reuse one CPU copy for every request sharing the same KV key."""
+        if offload_key not in self._fanout_admitted_keys:
+            return False
+        self._record_fanout_admission(
+            offload_key,
+            req_id,
+            group_idx,
+            group_state,
+            logical_idx,
+        )
+        return True
+
+    def _invalidate_fanout_admissions(self, evicted_keys: Iterable[OffloadKey]) -> None:
+        """Make CPU-evicted blocks eligible for another fanout backup."""
+        for offload_key in evicted_keys:
+            self._fanout_admitted_keys.discard(offload_key)
+            locations = self._fanout_admitted_locations.pop(offload_key, ())
+            for req_id, group_idx, logical_idx in locations:
+                req_status = self._req_status.get(req_id)
+                if req_status is None:
+                    continue
+                req_status.group_states[
+                    group_idx
+                ].fanout_admitted_block_indices.discard(logical_idx)
+
+    def _forget_fanout_request(
+        self, req_id: ReqId, req_status: RequestOffloadState
+    ) -> None:
+        for group_idx, group_state in enumerate(req_status.group_states):
+            for logical_idx in group_state.fanout_admitted_block_indices:
+                if logical_idx >= len(group_state.offload_keys):
+                    continue
+                offload_key = group_state.offload_keys[logical_idx]
+                locations = self._fanout_admitted_locations.get(offload_key)
+                if locations is None:
+                    continue
+                locations.discard((req_id, group_idx, logical_idx))
+                if not locations:
+                    del self._fanout_admitted_locations[offload_key]
 
     def _profile_fanout(
         self,
@@ -1382,6 +1448,14 @@ class OffloadingConnectorScheduler:
                     if logical_idx >= len(group_state.offload_keys):
                         break
                     offload_key = group_state.offload_keys[logical_idx]
+                    if self._reuse_fanout_admission(
+                        offload_key,
+                        req_id,
+                        group_config.group_idx,
+                        group_state,
+                        logical_idx,
+                    ):
+                        continue
                     block_fanout = fanout[(group_config.group_idx, block_id)]
                     block_fanout += waiting_demand.get(
                         get_offload_block_hash(offload_key),
@@ -1534,7 +1608,9 @@ class OffloadingConnectorScheduler:
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
-            fanout_key_indices: dict[OffloadKey, tuple[RequestGroupState, int]] = {}
+            fanout_key_indices: dict[
+                OffloadKey, tuple[int, RequestGroupState, int]
+            ] = {}
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states
             ):
@@ -1590,6 +1666,7 @@ class OffloadingConnectorScheduler:
                     new_offload_keys.append(offload_key)
                     if fanout_selected_keys is not None:
                         fanout_key_indices[offload_key] = (
+                            group_config.group_idx,
                             group_state,
                             logical_idx,
                         )
@@ -1606,11 +1683,19 @@ class OffloadingConnectorScheduler:
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
+            self._invalidate_fanout_admissions(store_output.evicted_keys)
+
             for offload_key in new_offload_keys:
                 location = fanout_key_indices.get(offload_key)
                 if location is not None:
-                    group_state, logical_idx = location
-                    group_state.fanout_admitted_block_indices.add(logical_idx)
+                    group_idx, group_state, logical_idx = location
+                    self._record_fanout_admission(
+                        offload_key,
+                        req_id,
+                        group_idx,
+                        group_state,
+                        logical_idx,
+                    )
 
             if not store_output.keys_to_store:
                 if fanout_selected_keys is None:
@@ -1842,6 +1927,7 @@ class OffloadingConnectorScheduler:
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
+                self._forget_fanout_request(job_status.req_id, req_status)
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1888,6 +1974,7 @@ class OffloadingConnectorScheduler:
         if not req_status.transfer_jobs:
             # No in-flight jobs: no later complete_store()/complete_load() calls
             # need this request's state.
+            self._forget_fanout_request(request.request_id, req_status)
             del self._req_status[request.request_id]
             return False, None
 
@@ -1927,6 +2014,7 @@ class OffloadingConnectorScheduler:
 
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
+                self._forget_fanout_request(req_id, status)
                 del self._req_status[req_id]
 
         # Reset offloading manager cache
@@ -1938,6 +2026,8 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_block_idx = 0
                 group_state.fanout_admitted_block_indices.clear()
         self._fanout_lifecycle.clear()
+        self._fanout_admitted_keys.clear()
+        self._fanout_admitted_locations.clear()
         self._fanout_step = 0
 
         # Discard jobs and save job_counter to be able to discard worker responses

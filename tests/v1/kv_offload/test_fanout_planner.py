@@ -159,7 +159,7 @@ def test_select_skips_hot_shared_prefix_by_default() -> None:
     assert plan.num_protected_hot_shared_blocks == 2
 
 
-def test_select_can_backup_hot_shared_prefix_when_explicitly_allowed() -> None:
+def test_select_backs_up_hot_shared_prefix_when_explicitly_allowed() -> None:
     planner = FanoutChunkPlanner(allow_hot_shared_prefix_backup=True)
     blocks = [
         make_block(0, request_id="hot_shared", fanout=8, is_hot_shared_prefix=True),
@@ -169,7 +169,7 @@ def test_select_can_backup_hot_shared_prefix_when_explicitly_allowed() -> None:
     plan = planner.select(
         blocks,
         budget_blocks=2,
-        pressure_level=FanoutPressureLevel.CRITICAL,
+        pressure_level=FanoutPressureLevel.NORMAL,
     )
 
     assert [chunk.request_id for chunk in plan.chunks] == ["hot_shared"]
@@ -205,17 +205,17 @@ def test_select_only_releases_cooling_prefix_under_pressure() -> None:
     assert [chunk.request_id for chunk in high_pressure_plan.chunks] == ["cooling"]
 
 
-def test_select_defers_hot_prefix_until_critical_pressure() -> None:
+def test_select_hot_prefix_backup_does_not_wait_for_critical_pressure() -> None:
     planner = FanoutChunkPlanner(allow_hot_shared_prefix_backup=True)
     blocks = [
         make_block(0, fanout=8, is_hot_shared_prefix=True),
         make_block(1, fanout=8, is_hot_shared_prefix=True),
     ]
 
-    high_pressure_plan = planner.select(
+    normal_pressure_plan = planner.select(
         blocks,
         budget_blocks=2,
-        pressure_level=FanoutPressureLevel.HIGH,
+        pressure_level=FanoutPressureLevel.NORMAL,
     )
     critical_pressure_plan = planner.select(
         blocks,
@@ -223,7 +223,7 @@ def test_select_defers_hot_prefix_until_critical_pressure() -> None:
         pressure_level=FanoutPressureLevel.CRITICAL,
     )
 
-    assert high_pressure_plan.chunks == ()
+    assert [chunk.request_id for chunk in normal_pressure_plan.chunks] == ["request"]
     assert [chunk.request_id for chunk in critical_pressure_plan.chunks] == ["request"]
 
 
