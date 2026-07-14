@@ -531,6 +531,51 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        counter_fork_attention_observed_steps = self._counter_cls(
+            name="vllm:fork_attention_observed_steps",
+            documentation=(
+                "Model execution steps observed by the ForkAttention backend."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_fork_attention_observed_steps = create_metric_per_engine(
+            counter_fork_attention_observed_steps, per_engine_labelvalues
+        )
+
+        counter_fork_attention_active_steps = self._counter_cls(
+            name="vllm:fork_attention_active_steps",
+            documentation=(
+                "Model execution steps with at least one physically shared "
+                "ForkAttention CTA."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_fork_attention_active_steps = create_metric_per_engine(
+            counter_fork_attention_active_steps, per_engine_labelvalues
+        )
+
+        counter_fork_attention_shared_ctas = self._counter_cls(
+            name="vllm:fork_attention_shared_ctas",
+            documentation=(
+                "ForkAttention shared CTA-plan entries accumulated once per step."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_fork_attention_shared_ctas = create_metric_per_engine(
+            counter_fork_attention_shared_ctas, per_engine_labelvalues
+        )
+
+        counter_fork_attention_singleton_ctas = self._counter_cls(
+            name="vllm:fork_attention_singleton_ctas",
+            documentation=(
+                "ForkAttention singleton CTA-plan entries accumulated once per step."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_fork_attention_singleton_ctas = create_metric_per_engine(
+            counter_fork_attention_singleton_ctas, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1084,6 +1129,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_skipped_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+
+            fork_stats = scheduler_stats.fork_execution_stats
+            if fork_stats is not None:
+                _, _, _, shared_ctas, singleton_ctas = fork_stats
+                self.counter_fork_attention_observed_steps[engine_idx].inc()
+                if shared_ctas > 0:
+                    self.counter_fork_attention_active_steps[engine_idx].inc()
+                self.counter_fork_attention_shared_ctas[engine_idx].inc(shared_ctas)
+                self.counter_fork_attention_singleton_ctas[engine_idx].inc(
+                    singleton_ctas
+                )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

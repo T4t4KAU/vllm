@@ -18,7 +18,11 @@ from vllm.v1.worker.gpu.attn_utils import (
     _compute_fork_common_prefix_len,
     should_use_fork_dynamic_forest,
 )
-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager, ForkGraphPlan
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    CudaGraphManager,
+    ForkGraphPlan,
+    _get_fork_forest_max_splits,
+)
 from vllm.v1.worker.gpu.dp_utils import _resolve_synced_fork_plan
 
 
@@ -56,6 +60,14 @@ def _make_manager() -> CudaGraphManager:
 
 def test_fork_graph_uses_aligned_block_table_capacity() -> None:
     assert get_block_table_num_blocks(max_model_len=11424, block_size=16) == 720
+
+
+def test_fork_forest_graph_default_reserves_all_gather_splits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_FOREST_MAX_SPLITS", 0)
+
+    assert _get_fork_forest_max_splits(block_size=16, max_model_len=11424) == 32
 
 
 def test_fork_cudagraph_dispatch_has_flash_and_fork_decode_graphs(

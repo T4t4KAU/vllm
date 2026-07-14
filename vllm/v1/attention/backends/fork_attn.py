@@ -209,10 +209,10 @@ def _get_default_forest_max_split_per_seq(
         if max_split_per_seq > 32:
             raise ValueError("VLLM_FORK_ATTN_FOREST_MAX_SPLITS must be <= 32")
         return max_split_per_seq
-    # A forest path usually has the long shared prefix chunks plus a small
-    # number of branch-local suffix chunks. Keep gather_kernel within its
-    # existing static switch range.
-    return min(32, _get_default_prefix_chunk_bucket(block_size, max_model_len) + 4)
+    # Branch points add splits independently of sequence length. Reserve the
+    # full gather-kernel range so a valid captured plan cannot under-allocate
+    # its per-request split workspace.
+    return 32
 
 
 def _add_trie_path(root: _PrefixTrieNode, req_id: int, blocks: list[int]) -> None:
@@ -498,9 +498,14 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 else None
             )
             if not kwargs:
+                mismatch = getattr(
+                    self,
+                    "_fork_forest_graph_mismatch_reason",
+                    "unknown mismatch",
+                )
                 raise RuntimeError(
                     "ForkAttention forest graph workspace does not match "
-                    "the selected graph bucket"
+                    f"the selected graph bucket: {mismatch}"
                 )
             self._profile_fork_metadata(
                 metadata,
@@ -1223,10 +1228,16 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         num_reqs = (
             metadata.num_actual_tokens if num_active_reqs is None else num_active_reqs
         )
+        self._fork_forest_graph_mismatch_reason = None
         if (
             num_reqs > workspace.max_active_reqs
             or metadata.block_table.shape[1] > workspace.max_blocks
         ):
+            self._fork_forest_graph_mismatch_reason = (
+                f"requests={num_reqs}/{workspace.max_active_reqs}, "
+                f"block_columns={metadata.block_table.shape[1]}/"
+                f"{workspace.max_blocks}"
+            )
             return {}
 
         forest = self._build_fork_forest_boxes(
@@ -1235,6 +1246,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             require_shared=False,
         )
         if forest is None:
+            self._fork_forest_graph_mismatch_reason = "forest planner returned no boxes"
             self._clear_cudagraph_workspace(workspace)
             return {}
         boxes, num_split_per_seq = forest
@@ -1242,6 +1254,11 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             len(boxes) > workspace.max_ctas
             or max(num_split_per_seq) > workspace.max_split_per_seq
         ):
+            self._fork_forest_graph_mismatch_reason = (
+                f"ctas={len(boxes)}/{workspace.max_ctas}, "
+                f"splits={max(num_split_per_seq)}/"
+                f"{workspace.max_split_per_seq}"
+            )
             self._clear_cudagraph_workspace(workspace)
             return {}
 
@@ -1266,6 +1283,11 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 len(box.q_ids) > max_q_per_cta
                 or len(box.blocks) > workspace.chunk_blocks
             ):
+                self._fork_forest_graph_mismatch_reason = (
+                    f"queries_per_cta={len(box.q_ids)}/{max_q_per_cta}, "
+                    f"blocks_per_cta={len(box.blocks)}/"
+                    f"{workspace.chunk_blocks}"
+                )
                 self._clear_cudagraph_workspace(workspace)
                 return {}
             grouped_boxes[group_idx].append(box)
@@ -1273,6 +1295,9 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         for group_idx, group in enumerate(grouped_boxes):
             num_ctas = len(group)
             if num_ctas > workspace.max_ctas:
+                self._fork_forest_graph_mismatch_reason = (
+                    f"group_{group_idx}_ctas={num_ctas}/{workspace.max_ctas}"
+                )
                 self._clear_cudagraph_workspace(workspace)
                 return {}
             if num_ctas == 0:
@@ -1371,7 +1396,7 @@ class ForkAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability >= DeviceCapability(12, 0)
+        return capability >= DeviceCapability(8, 0)
 
     @classmethod
     def supports_combination(

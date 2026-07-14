@@ -40,6 +40,9 @@ def test_fork_attention_backend_device_capability(
     capability: DeviceCapability,
     expected_error: str | None,
 ) -> None:
+    assert ForkAttentionBackend.supports_compute_capability(capability) is (
+        expected_error is None
+    )
     error = ForkAttentionBackend.supports_combination(
         head_size=128,
         dtype=torch.float16,

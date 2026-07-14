@@ -58,9 +58,9 @@ def _get_fork_forest_max_splits(block_size: int, max_model_len: int) -> int:
         if max_splits > 32:
             raise ValueError("VLLM_FORK_ATTN_FOREST_MAX_SPLITS must be <= 32")
         return max_splits
-    max_blocks = get_block_table_num_blocks(max_model_len, block_size)
-    chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
-    return min(32, (max_blocks + chunk_blocks - 1) // chunk_blocks + 4)
+    # Branch points add splits independently of sequence length, so the graph
+    # workspace must reserve the full range supported by gather_kernel.
+    return 32
 
 
 def _estimate_fork_forest_ctas(
