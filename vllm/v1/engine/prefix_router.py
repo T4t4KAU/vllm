@@ -6,6 +6,7 @@ import time
 from collections import Counter, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from math import ceil
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -55,8 +56,11 @@ class PrefixAwareDPRouter:
         graph_buckets: Sequence[int] = (),
         graph_slack_buckets: int = 1,
         prefix_chunk_blocks: int = 128,
-        work_slack_tokens: int = 8192,
+        work_slack_tokens: int = 0,
         decode_token_weight: int = 16,
+        kv_capacity_blocks: int = 0,
+        max_num_seqs: int = 0,
+        replication_relax_ratio: float = 0.20,
         reload_min_fanout_gain: int = 1,
         reload_min_prefix_gain_blocks: int = 4,
         reload_max_kv_usage: float = 0.90,
@@ -82,6 +86,12 @@ class PrefixAwareDPRouter:
             raise ValueError("work_slack_tokens must be non-negative")
         if decode_token_weight <= 0:
             raise ValueError("decode_token_weight must be positive")
+        if kv_capacity_blocks < 0:
+            raise ValueError("kv_capacity_blocks must be non-negative")
+        if max_num_seqs < 0:
+            raise ValueError("max_num_seqs must be non-negative")
+        if not 0 < replication_relax_ratio <= 1:
+            raise ValueError("replication_relax_ratio must be in (0, 1]")
         if reload_min_fanout_gain < 0:
             raise ValueError("reload_min_fanout_gain must be non-negative")
         if reload_min_prefix_gain_blocks <= 0:
@@ -100,6 +110,9 @@ class PrefixAwareDPRouter:
         self.prefix_chunk_blocks = prefix_chunk_blocks
         self.work_slack_tokens = work_slack_tokens
         self.decode_token_weight = decode_token_weight
+        self.kv_capacity_blocks = kv_capacity_blocks
+        self.max_num_seqs = max_num_seqs
+        self.replication_relax_ratio = replication_relax_ratio
         self.reload_min_fanout_gain = reload_min_fanout_gain
         self.reload_min_prefix_gain_blocks = reload_min_prefix_gain_blocks
         self.reload_max_kv_usage = reload_max_kv_usage
@@ -123,6 +136,10 @@ class PrefixAwareDPRouter:
         self.routing_time_ns = 0
         self.last_affinity_blocks = 0
         self.graph_bound_route_count = 0
+        self.replication_relaxed_route_count = 0
+        self.long_prefix_bootstrap_route_count = 0
+        self.ordinary_bypass_route_count = 0
+        self.cohort_locked_route_count = 0
         self.arrival_wave_count = 0
         self.reload_intent_count = 0
         self.reload_local_count = 0
@@ -252,7 +269,13 @@ class PrefixAwareDPRouter:
         active_depth, _ = self._deepest_match(keys, self._active[rank])
         live_depth, _ = self._deepest_match(keys, self._live[rank])
         warm_depth, _ = self._deepest_match(keys, self._warm[rank])
-        cached_tokens = max(active_depth, live_depth, warm_depth) * self.block_size
+        cached_blocks = max(active_depth, live_depth, warm_depth)
+        # A few shared template blocks are not worth skewing a long request's
+        # placement.  Only credit reuse that is large enough to materially
+        # affect per-rank KV capacity; otherwise balance the full prompt work.
+        if cached_blocks < self._affinity_threshold_blocks():
+            cached_blocks = 0
+        cached_tokens = cached_blocks * self.block_size
         prompt_tokens = len(request.prompt_token_ids or ())
         private_prompt_tokens = max(0, prompt_tokens - cached_tokens)
         sampling_params = getattr(request, "sampling_params", None)
@@ -336,6 +359,114 @@ class PrefixAwareDPRouter:
                 return depth, fanout
         return 0, 0
 
+    def _resident_depth(self, keys: Sequence[PrefixKey]) -> int:
+        return max(
+            (
+                max(
+                    self._deepest_match(keys, self._active[rank])[0],
+                    self._deepest_match(keys, self._live[rank])[0],
+                    self._deepest_match(keys, self._warm[rank])[0],
+                )
+                for rank in range(self.num_ranks)
+            ),
+            default=0,
+        )
+
+    def _affinity_threshold_blocks(self) -> int:
+        if not self.kv_capacity_blocks:
+            return self.min_prefix_blocks
+        return max(
+            self.min_prefix_blocks,
+            ceil(self.kv_capacity_blocks * self.replication_relax_ratio),
+        )
+
+    def _requires_prefix_routing(self, keys: Sequence[PrefixKey]) -> bool:
+        if not self.kv_capacity_blocks:
+            return True
+        return len(keys) >= self._affinity_threshold_blocks()
+
+    def _rank_affinity_score(
+        self,
+        keys: Sequence[PrefixKey],
+        rank: int,
+        load_scores: Sequence[int],
+        start_index: int,
+    ) -> tuple[tuple[int, ...], int]:
+        active_depth, active_fanout = self._deepest_match(keys, self._active[rank])
+        live_depth, live_fanout = self._deepest_match(keys, self._live[rank])
+        warm_depth, warm_fanout = self._deepest_match(keys, self._warm[rank])
+        depth = max(active_depth, live_depth, warm_depth)
+        fanout = max(
+            active_fanout if active_depth == depth else 0,
+            live_fanout if live_depth == depth else 0,
+            warm_fanout if warm_depth == depth else 0,
+        )
+        # Match depth is the primary reuse signal.  Residency class only
+        # breaks ties at the same depth: a shallow active ancestor must not
+        # beat a deeper case-specific warm prefix.
+        score = (
+            depth,
+            int(depth > 0 and active_depth == depth),
+            int(depth > 0 and live_depth == depth),
+            int(depth > 0 and warm_depth == depth),
+            fanout,
+            -load_scores[rank],
+            -((rank - start_index) % self.num_ranks),
+        )
+        return score, depth
+
+    def _cohort_owner(
+        self,
+        keys: Sequence[PrefixKey],
+        load_scores: Sequence[int],
+        start_index: int,
+    ) -> tuple[int, int] | None:
+        """Choose a deep-prefix owner under a stable cumulative skew bound."""
+        if not self.kv_capacity_blocks or not self.max_num_seqs:
+            return None
+        scores: list[tuple[tuple[int, ...], int, int]] = []
+        for rank in range(self.num_ranks):
+            score, depth = self._rank_affinity_score(
+                keys,
+                rank,
+                load_scores,
+                start_index,
+            )
+            scores.append((score, rank, depth))
+        _, owner, depth = max(scores)
+        if depth < self._affinity_threshold_blocks():
+            return None
+
+        cohort_budget = max(
+            1,
+            ceil(min(1.0, depth / self.kv_capacity_blocks) * self.max_num_seqs),
+        )
+        min_routes = min(self.rank_route_counts)
+        if self.rank_route_counts[owner] >= min_routes + cohort_budget:
+            return None
+        return owner, depth
+
+    def should_coalesce(self, request: EngineCoreRequest) -> bool:
+        """Return whether this request benefits from prefix-aware wave routing."""
+        token_ids = request.prompt_token_ids
+        if self.kv_capacity_blocks and token_ids is not None:
+            complete_blocks = len(token_ids) // self.block_size
+            if complete_blocks < self._affinity_threshold_blocks():
+                return False
+        prefix = self._pending_prefixes.get(request.request_id)
+        if prefix is None:
+            prefix = self._build_prefix(request)
+        if prefix is None:
+            return False
+        self._pending_prefixes[request.request_id] = prefix
+        return self._requires_prefix_routing(prefix[2])
+
+    def record_ordinary_route(self, rank: int) -> None:
+        """Account for a cheap request routed by the native DP policy."""
+        self.route_count += 1
+        self.ordinary_bypass_route_count += 1
+        self.rank_route_counts[rank] += 1
+
     def choose_rank(
         self,
         request: EngineCoreRequest,
@@ -350,11 +481,48 @@ class PrefixAwareDPRouter:
         if prefix is not None:
             self._pending_prefixes[request.request_id] = prefix
         load_scores = [waiting * 4 + running for waiting, running in engine_counts]
+        use_prefix_routing = prefix is not None and self._requires_prefix_routing(
+            prefix[2]
+        )
+        cohort_owner = (
+            self._cohort_owner(prefix[2], load_scores, start_index)
+            if use_prefix_routing and prefix is not None
+            else None
+        )
+        if use_prefix_routing and prefix is not None and self.kv_capacity_blocks:
+            if self._resident_depth(prefix[2]) >= self._affinity_threshold_blocks():
+                self.replication_relaxed_route_count += 1
+            else:
+                self.long_prefix_bootstrap_route_count += 1
+        elif prefix is not None:
+            self.ordinary_bypass_route_count += 1
         min_load = min(load_scores)
+        effective_load_slack = self.load_slack
+        if (
+            use_prefix_routing
+            and prefix is not None
+            and self.kv_capacity_blocks
+            and self.max_num_seqs
+        ):
+            resident_depth = self._resident_depth(prefix[2])
+            if resident_depth >= self._affinity_threshold_blocks():
+                reusable_fraction = min(
+                    1.0,
+                    resident_depth / self.kv_capacity_blocks,
+                )
+                # waiting requests carry weight 4 in load_scores.  Permit a
+                # whole expensive prefix cohort to land before transient queue
+                # imbalance splits it, but bound that skew by the fraction of
+                # per-rank KV capacity the reused prefix represents.
+                cohort_load_slack = ceil(reusable_fraction * self.max_num_seqs) * 4
+                effective_load_slack = max(
+                    effective_load_slack,
+                    cohort_load_slack,
+                )
         eligible = {
             rank
             for rank, load in enumerate(load_scores)
-            if load <= min_load + self.load_slack
+            if load <= min_load + effective_load_slack
         }
 
         baseline_rank = min(
@@ -368,7 +536,7 @@ class PrefixAwareDPRouter:
 
         chosen_rank = baseline_rank
         affinity_blocks = 0
-        if prefix is not None:
+        if use_prefix_routing and prefix is not None:
             keys = prefix[2]
             graph_indices = self._predicted_graph_bucket_indices(keys)
             if graph_indices is not None:
@@ -384,7 +552,13 @@ class PrefixAwareDPRouter:
                 }
                 if len(graph_eligible) < self.num_ranks:
                     self.graph_bound_route_count += 1
-                eligible = (eligible & graph_eligible) or graph_eligible
+                # Graph capacity is an optimization constraint, not a reason to
+                # overload a rank.  If no graph-compatible rank is inside the
+                # load-balanced set, preserve the load constraint and accept a
+                # larger graph bucket (or an eager fallback) instead.
+                graph_and_load_eligible = eligible & graph_eligible
+                if graph_and_load_eligible:
+                    eligible = graph_and_load_eligible
                 if chosen_rank not in eligible:
                     chosen_rank = min(
                         eligible,
@@ -398,35 +572,67 @@ class PrefixAwareDPRouter:
                 for rank in range(self.num_ranks)
             ]
             min_work = min(candidate_work[rank] for rank in eligible)
+            # Splitting a large resident prefix can cost more than the small
+            # work imbalance it removes.  Treat the reusable prefix tokens as
+            # a bounded work slack, while the request-count load constraint
+            # above still prevents an arbitrarily hot rank from winning.
+            reuse_slack_tokens = 0
+            if self.kv_capacity_blocks:
+                reuse_slack_tokens = max(
+                    (
+                        max(
+                            self._deepest_match(keys, self._active[rank])[0],
+                            self._deepest_match(keys, self._live[rank])[0],
+                            self._deepest_match(keys, self._warm[rank])[0],
+                        )
+                        * self.block_size
+                        for rank in eligible
+                    ),
+                    default=0,
+                )
+            effective_work_slack = max(
+                self.work_slack_tokens,
+                reuse_slack_tokens,
+            )
             work_eligible = {
                 rank
                 for rank in eligible
-                if candidate_work[rank] <= min_work + self.work_slack_tokens
+                if candidate_work[rank] <= min_work + effective_work_slack
             }
             eligible = work_eligible or eligible
-            scores: list[tuple[tuple[int, ...], int]] = []
+            if chosen_rank not in eligible:
+                # The affinity threshold below may reject every prefix match.
+                # Keep the fallback inside the work-balanced set instead of
+                # silently retaining the pre-filter baseline rank.
+                chosen_rank = min(
+                    eligible,
+                    key=lambda rank: (
+                        candidate_work[rank],
+                        load_scores[rank],
+                        (rank - start_index) % self.num_ranks,
+                    ),
+                )
+            scores: list[tuple[tuple[int, ...], int, int]] = []
             for rank in eligible:
-                active_depth, active_fanout = self._deepest_match(
-                    keys, self._active[rank]
+                score, depth = self._rank_affinity_score(
+                    keys,
+                    rank,
+                    load_scores,
+                    start_index,
                 )
-                live_depth, live_fanout = self._deepest_match(keys, self._live[rank])
-                warm_depth, warm_fanout = self._deepest_match(keys, self._warm[rank])
-                score = (
-                    active_depth,
-                    active_fanout,
-                    live_depth,
-                    live_fanout,
-                    warm_depth,
-                    warm_fanout,
-                    -load_scores[rank],
-                    -((rank - start_index) % self.num_ranks),
-                )
-                scores.append((score, rank))
-            best_score, best_rank = max(scores)
-            affinity_blocks = max(best_score[0], best_score[2], best_score[4])
-            if affinity_blocks >= self.min_prefix_blocks:
+                scores.append((score, rank, depth))
+            _, best_rank, affinity_blocks = max(scores)
+            affinity_selected = False
+            if affinity_blocks >= self._affinity_threshold_blocks():
                 chosen_rank = best_rank
                 self.affinity_route_count += 1
+                affinity_selected = True
+            if cohort_owner is not None:
+                chosen_rank, cohort_depth = cohort_owner
+                affinity_blocks = max(affinity_blocks, cohort_depth)
+                if not affinity_selected:
+                    self.affinity_route_count += 1
+                self.cohort_locked_route_count += 1
             self._pending_work[request.request_id] = self._candidate_work(
                 request, keys, chosen_rank
             )

@@ -1454,6 +1454,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             tuple[EngineCoreRequest, asyncio.Future[None]]
         ] = []
         self._prefix_wave_task: asyncio.Task[None] | None = None
+        self._prefix_ordinary_requests: set[str] = set()
         if envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING:
             backend = vllm_config.attention_config.backend
             if backend is None or backend.name != "FORK_ATTN":
@@ -1493,6 +1494,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     ),
                     work_slack_tokens=(envs.VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS),
                     decode_token_weight=(envs.VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT),
+                    kv_capacity_blocks=max(
+                        0,
+                        int(vllm_config.cache_config.kv_cache_size_tokens or 0)
+                        // block_size,
+                    ),
+                    max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
+                    replication_relax_ratio=(
+                        envs.VLLM_FORK_ATTN_DP_PREFIX_REPLICATION_RELAX_RATIO
+                    ),
                     reload_min_fanout_gain=(
                         envs.VLLM_FORK_ATTN_DP_RELOAD_MIN_FANOUT_GAIN
                     ),
@@ -1519,15 +1529,34 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 )
                 logger.info(
                     "Enabled ForkAttention DP prefix routing: block_size=%d, "
-                    "load_slack=%d, warm_ttl=%.1fs, min_prefix_blocks=%d",
+                    "load_slack=%d, "
+                    "replication_relax_ratio=%.2f, kv_capacity_blocks=%d, "
+                    "warm_ttl=%.1fs, min_prefix_blocks=%d",
                     vllm_config.cache_config.block_size,
                     envs.VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_REPLICATION_RELAX_RATIO,
+                    max(
+                        0,
+                        int(vllm_config.cache_config.kv_cache_size_tokens or 0)
+                        // block_size,
+                    ),
                     envs.VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL,
                     envs.VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS,
                 )
 
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        if self.prefix_router is None or self._prefix_arrival_wave_s <= 0:
+        if self.prefix_router is None:
+            await super().add_request_async(request)
+            return
+        if not self.prefix_router.should_coalesce(request):
+            self.prefix_router.discard_pending([request.request_id])
+            self._prefix_ordinary_requests.add(request.request_id)
+            try:
+                await super().add_request_async(request)
+            finally:
+                self._prefix_ordinary_requests.discard(request.request_id)
+            return
+        if self._prefix_arrival_wave_s <= 0:
             await super().add_request_async(request)
             return
 
@@ -1604,6 +1633,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 future.cancel()
         self._prefix_wave_pending.clear()
         self._prefix_wave_inflight.clear()
+        self._prefix_ordinary_requests.clear()
         for placement in getattr(self, "_dp_reload_placements", {}).values():
             if placement.timeout_task is not None:
                 placement.timeout_task.cancel()
@@ -1618,7 +1648,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ) is None:
             current_counts = self.lb_engines
             prefix_router = getattr(self, "prefix_router", None)
-            if prefix_router is not None:
+            ordinary_prefix_bypass = (
+                prefix_router is not None
+                and request.request_id in getattr(self, "_prefix_ordinary_requests", ())
+            )
+            if prefix_router is not None and not ordinary_prefix_bypass:
                 eng_index = prefix_router.choose_rank(
                     request, current_counts, self.eng_start_index
                 )
@@ -1645,7 +1679,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         chosen_engine = self.core_engines[eng_index]
         prefix_router = getattr(self, "prefix_router", None)
         if prefix_router is not None:
-            prefix_router.add_request(request, eng_index)
+            if request.request_id in getattr(self, "_prefix_ordinary_requests", ()):
+                prefix_router.record_ordinary_route(eng_index)
+                if prefix_router.route_count % 16 == 0:
+                    self._log_prefix_router_stats()
+            else:
+                prefix_router.add_request(request, eng_index)
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         if getattr(self, "dp_reload_rebalance_enabled", False):
@@ -1662,12 +1701,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         logger.info(
             "ForkAttention DP prefix routing stats: requests=%d, "
             "affinity_routes=%d, graph_bound_routes=%d, arrival_waves=%d, "
+            "replication_relaxed_routes=%d, "
+            "long_prefix_bootstrap_routes=%d, "
+            "ordinary_bypass_routes=%d, "
+            "cohort_locked_routes=%d, "
             "rank_routes=%s, "
             "avg_route_us=%.1f telemetry=%s",
             prefix_router.route_count,
             prefix_router.affinity_route_count,
             prefix_router.graph_bound_route_count,
             prefix_router.arrival_wave_count,
+            prefix_router.replication_relaxed_route_count,
+            prefix_router.long_prefix_bootstrap_route_count,
+            prefix_router.ordinary_bypass_route_count,
+            prefix_router.cohort_locked_route_count,
             prefix_router.rank_route_counts,
             prefix_router.average_route_us,
             prefix_router.telemetry_snapshot,

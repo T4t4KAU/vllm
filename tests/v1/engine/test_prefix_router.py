@@ -149,6 +149,269 @@ def test_graph_bound_overrides_affinity_when_bucket_would_grow() -> None:
     assert router.graph_bound_route_count == 1
 
 
+def test_graph_bound_never_overrides_load_balance() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=0,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        graph_buckets=(8, 16),
+        graph_slack_buckets=0,
+        prefix_chunk_blocks=4,
+    )
+    first = _request("first", list(range(16)))
+    router.add_request(first, rank=0)
+    router.update_engine_telemetry(
+        [
+            (("forest", 8, 1, 1, 0), 0.5),
+            (("forest", 16, 15, 0, 15), 0.5),
+        ]
+    )
+
+    matching = _request("matching", list(range(16)))
+    assert router.choose_rank(matching, [[0, 1], [0, 0]]) == 1
+    assert router.graph_bound_route_count == 1
+
+
+def test_zero_work_slack_balances_before_prefix_affinity() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+    )
+    shared = list(range(16))
+    router.add_request(_request("shared", shared), rank=0)
+    router.add_request(_request("private", list(range(100, 180))), rank=0)
+
+    matching = _request("matching", shared)
+    assert router.choose_rank(matching, [[0, 0], [0, 0]]) == 1
+
+
+def test_work_balance_can_keep_a_cheaper_warm_prefix_owner() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+    )
+    shared = list(range(64))
+    warm = _request("warm", shared)
+    router.add_request(warm, rank=0)
+    router.finish_request(warm.request_id)
+
+    matching = _request("matching", shared)
+    assert router.choose_rank(matching, [[1, 1], [0, 1]]) == 0
+
+
+def test_short_prefix_bypasses_to_ordinary_load_balance() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    shared = list(range(16))
+    warm = _request("warm", shared)
+    router.add_request(warm, rank=0)
+    router.finish_request(warm.request_id)
+
+    matching = _request("matching", shared)
+    assert router.choose_rank(matching, [[1, 0], [0, 0]]) == 1
+    assert router.replication_relaxed_route_count == 0
+    assert router.ordinary_bypass_route_count == 1
+
+
+def test_native_ordinary_route_accounting_does_not_track_prefix() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    short = _request("short", list(range(16)))
+    assert not router.should_coalesce(short)
+
+    router.record_ordinary_route(rank=1)
+    assert router.route_count == 1
+    assert router.ordinary_bypass_route_count == 1
+    assert router.rank_route_counts == [0, 1]
+    assert short.request_id not in router._pending_prefixes
+    assert short.request_id not in router._requests
+
+
+def test_expensive_prefix_relaxes_request_count_but_balances_work() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    shared = list(range(32))
+    warm = _request("warm", shared)
+    router.add_request(warm, rank=0)
+    router.finish_request(warm.request_id)
+
+    matching = _request("matching", shared)
+    assert router.choose_rank(matching, [[1, 0], [0, 0]]) == 0
+    assert router.replication_relaxed_route_count == 1
+    assert router.ordinary_bypass_route_count == 0
+
+
+def test_only_expensive_resident_prefixes_coalesce() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    short = list(range(16))
+    long = list(range(100, 132))
+    for request_id, tokens in (("short-warm", short), ("long-warm", long)):
+        warm = _request(request_id, tokens)
+        router.add_request(warm, rank=0)
+        router.finish_request(warm.request_id)
+
+    assert not router.should_coalesce(_request("short", short))
+    assert router.should_coalesce(_request("long", long))
+
+
+def test_long_prefix_coalesces_to_bootstrap_owners() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    long = list(range(32))
+    request = _request("long", long)
+
+    assert router.should_coalesce(request)
+    assert router.choose_rank(request, [[0, 0], [0, 0]]) == 0
+    assert router.long_prefix_bootstrap_route_count == 1
+    assert router.replication_relaxed_route_count == 0
+
+
+def test_shallow_template_match_does_not_skew_long_request() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    template = list(range(16))
+    warm = _request("warm-template", template)
+    router.add_request(warm, rank=0)
+    router.finish_request(warm.request_id)
+
+    long = _request("long", template + list(range(100, 212)))
+    assert router.should_coalesce(long)
+    assert router.choose_rank(long, [[1, 0], [0, 0]]) == 1
+    assert router.affinity_route_count == 0
+    assert router.replication_relaxed_route_count == 0
+    assert router.long_prefix_bootstrap_route_count == 1
+
+
+def test_deep_prefix_reuse_allows_bounded_work_imbalance() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+        kv_capacity_blocks=32,
+        replication_relax_ratio=0.20,
+    )
+    shared = list(range(128))
+    warm = _request("warm", shared)
+    router.add_request(warm, rank=0)
+    router.finish_request(warm.request_id)
+    router.add_request(_request("rank-zero-work", list(range(1000, 1200))), rank=0)
+
+    matching = _request("matching", shared)
+    assert router.choose_rank(matching, [[0, 0], [0, 0]]) == 0
+    assert router.affinity_route_count == 1
+
+
+def test_deep_prefix_allows_capacity_bounded_queue_skew() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=0,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+        kv_capacity_blocks=128,
+        max_num_seqs=64,
+        replication_relax_ratio=0.20,
+    )
+    shared = list(range(128))
+    warm = _request("warm", shared)
+    router.add_request(warm, rank=0)
+    router.finish_request(warm.request_id)
+
+    within_bound = _request("within-bound", shared)
+    assert router.choose_rank(within_bound, [[100, 0], [0, 0]]) == 0
+    assert router.cohort_locked_route_count == 1
+
+    router.rank_route_counts[:] = [16, 0]
+    beyond_bound = _request("beyond-bound", shared)
+    assert router.choose_rank(beyond_bound, [[17, 0], [0, 0]]) == 1
+
+
+def test_deeper_warm_prefix_beats_shallow_active_prefix() -> None:
+    router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=4,
+        load_slack=32,
+        warm_ttl_s=30,
+        min_prefix_blocks=1,
+        work_slack_tokens=0,
+        kv_capacity_blocks=32,
+        max_num_seqs=64,
+        replication_relax_ratio=0.20,
+    )
+    shallow = list(range(32))
+    deep = shallow + list(range(100, 164))
+    active = _request("active-shallow", shallow)
+    router.add_request(active, rank=0)
+    router.set_resident(active.request_id, rank=0, resident=True)
+    warm = _request("warm-deep", deep)
+    router.add_request(warm, rank=1)
+    router.finish_request(warm.request_id)
+
+    matching = _request("matching", deep)
+    assert router.choose_rank(matching, [[0, 0], [0, 0]]) == 1
+    assert router.cohort_locked_route_count == 1
+
+
 def test_graph_bound_uses_logical_forest_before_telemetry_arrives() -> None:
     router = PrefixAwareDPRouter(
         num_ranks=2,
