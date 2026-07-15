@@ -527,7 +527,11 @@ class VllmConfig:
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
-        if not self._is_default_v2_model_runner_model():
+        # ForkAttention CUDA graph planning is implemented by the V2 runner.
+        if (
+            not self._uses_fork_attention_backend()
+            and not self._is_default_v2_model_runner_model()
+        ):
             return False
 
         if not HAS_TRITON:
@@ -546,6 +550,10 @@ class VllmConfig:
             return False
 
         return True
+
+    def _uses_fork_attention_backend(self) -> bool:
+        backend = self.attention_config.backend
+        return getattr(backend, "name", None) == "FORK_ATTN"
 
     def _is_default_v2_model_runner_model(self) -> bool:
         model_config = self.model_config

@@ -68,6 +68,55 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
 
 
 @pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, True), ("0", False), ("1", True)],
+)
+def test_fork_forest_cudagraph_env(monkeypatch, env_value, expected):
+    if env_value is None:
+        monkeypatch.delenv("VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH", env_value)
+
+    assert envs.VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH is expected
+
+
+def test_fork_attention_uses_v2_model_runner_by_default(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", None)
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", True)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(is_diffusion=False),
+        attention_config=SimpleNamespace(
+            backend=SimpleNamespace(name="FORK_ATTN"),
+        ),
+        _uses_fork_attention_backend=lambda: True,
+        _is_default_v2_model_runner_model=lambda: False,
+        _get_v2_model_runner_unsupported_features=lambda: [],
+    )
+
+    assert VllmConfig.use_v2_model_runner.fget(config) is True
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "expected"),
+    [("FORK_ATTN", True), ("FLASH_ATTN", False), (None, False)],
+)
+def test_uses_fork_attention_backend(backend_name, expected):
+    backend = None if backend_name is None else SimpleNamespace(name=backend_name)
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(backend=backend),
+    )
+
+    assert VllmConfig._uses_fork_attention_backend(config) is expected
+
+
+def test_fork_attention_respects_explicit_v1_model_runner(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", False)
+    config = SimpleNamespace()
+
+    assert VllmConfig.use_v2_model_runner.fget(config) is False
+
+
+@pytest.mark.parametrize(
     ("model_config", "expected"),
     [
         (

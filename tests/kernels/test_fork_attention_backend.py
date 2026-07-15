@@ -19,6 +19,8 @@ from vllm.v1.attention.backends.fork_attn import (
     ForkAttentionMetadata,
     ForkAttentionMetadataBuilder,
     _flash_metadata_kwargs,
+    _get_adaptive_prefix_chunk_blocks,
+    _get_mnw,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -106,6 +108,47 @@ def test_fork_decode_supports_model_gqa_geometry(
     )
 
     assert builder._can_use_fork_decode(metadata) is expected
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "prefix_blocks", "expected"),
+    [
+        (2, 512, 64),
+        (16, 512, 128),
+        (2, 128, 128),
+    ],
+    ids=["long_tail_splits", "full_cohort_unchanged", "short_prefix_unchanged"],
+)
+def test_adaptive_prefix_chunks_target_tail_occupancy(
+    monkeypatch: pytest.MonkeyPatch,
+    num_reqs: int,
+    prefix_blocks: int,
+    expected: int,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_TARGET_CTA_WAVES", 2)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS", 4096)
+
+    chunk_blocks = _get_adaptive_prefix_chunk_blocks(
+        block_size=16,
+        prefix_blocks=prefix_blocks,
+        base_chunk_blocks=128,
+        num_reqs=num_reqs,
+        num_kv_heads=8,
+        num_sms=48,
+        prefix_cohorts=1,
+        max_prefix_chunks=8,
+    )
+
+    assert chunk_blocks == expected
+
+
+def test_tail_tile_override_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_TAIL_TILE_N", 0)
+    default = _get_mnw(2, 2, 8192, 16)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_TAIL_TILE_N", 32)
+
+    assert default == (16, 64, 1)
+    assert _get_mnw(2, 2, 8192, 16) == (16, 32, 1)
 
 
 def _run_flash_ref(

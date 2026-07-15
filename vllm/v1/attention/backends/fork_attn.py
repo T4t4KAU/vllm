@@ -20,6 +20,7 @@ from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
@@ -158,6 +159,11 @@ def _get_mnw(
     if page_block_size is not None:
         while tile_n > 16 and tile_n // (warps * 32 // 8) > page_block_size:
             tile_n //= 2
+    tail_tile_n = envs.VLLM_FORK_ATTN_TAIL_TILE_N
+    if tail_tile_n not in (0, 16, 32, 64, 128):
+        raise ValueError("VLLM_FORK_ATTN_TAIL_TILE_N must be one of 0, 16, 32, 64, 128")
+    if tile_m == 16 and tail_tile_n > 0 and kv_len >= 128:
+        tile_n = min(tile_n, tail_tile_n)
     return tile_m, tile_n, warps
 
 
@@ -192,6 +198,46 @@ def _get_prefix_chunk_blocks(block_size: int, max_blocks: int) -> int:
     # Bound the graph topology while keeping 2K chunks for prefixes up to 16K.
     min_blocks = max(1, (max_blocks + 7) // 8)
     return max(requested_blocks, min_blocks)
+
+
+def _get_adaptive_prefix_chunk_blocks(
+    *,
+    block_size: int,
+    prefix_blocks: int,
+    base_chunk_blocks: int,
+    num_reqs: int,
+    num_kv_heads: int,
+    num_sms: int,
+    prefix_cohorts: int,
+    max_prefix_chunks: int,
+) -> int:
+    target_waves = envs.VLLM_FORK_ATTN_TARGET_CTA_WAVES
+    min_tokens = envs.VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS
+    if target_waves < 0:
+        raise ValueError("VLLM_FORK_ATTN_TARGET_CTA_WAVES must be non-negative")
+    if min_tokens < 0:
+        raise ValueError(
+            "VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS must be non-negative"
+        )
+    if (
+        target_waves == 0
+        or prefix_blocks * block_size < min_tokens
+        or num_reqs <= 0
+        or num_kv_heads <= 0
+        or num_sms <= 0
+        or prefix_cohorts <= 0
+        or max_prefix_chunks <= 0
+    ):
+        return base_chunk_blocks
+
+    base_chunks = (prefix_blocks + base_chunk_blocks - 1) // base_chunk_blocks
+    target_plan_ctas = (target_waves * num_sms + num_kv_heads - 1) // num_kv_heads
+    required_prefix_ctas = max(0, target_plan_ctas - num_reqs)
+    target_chunks = (required_prefix_ctas + prefix_cohorts - 1) // prefix_cohorts
+    target_chunks = min(max_prefix_chunks, max(base_chunks, target_chunks))
+    if target_chunks <= base_chunks:
+        return base_chunk_blocks
+    return max(1, (prefix_blocks + target_chunks - 1) // target_chunks)
 
 
 def _get_default_prefix_chunk_bucket(block_size: int, max_model_len: int) -> int:
@@ -380,6 +426,17 @@ def _pack_fork_segment_boxes(
 class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     supports_update_block_table: bool = False
 
+    def _get_fork_num_sms(self) -> int:
+        num_sms = getattr(self, "_fork_num_sms", None)
+        if num_sms is None:
+            try:
+                num_sms = current_platform.num_compute_units()
+            except NotImplementedError:
+                num_sms = 1
+            num_sms = max(1, int(num_sms))
+            self._fork_num_sms = num_sms
+        return num_sms
+
     @classmethod
     def get_cudagraph_support(
         cls,
@@ -515,11 +572,12 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             )
             return kwargs
 
-        if not self._can_use_fork_decode(metadata):
+        fallback_reason = self._fork_decode_fallback_reason(metadata)
+        if fallback_reason is not None:
             self._profile_fork_metadata(
                 metadata,
                 enabled=False,
-                reason="fallback",
+                reason=f"fallback_{fallback_reason}",
             )
             return {}
 
@@ -543,7 +601,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         self._profile_fork_metadata(
             metadata,
             enabled=False,
-            reason="fallback",
+            reason=f"fallback_{self._fork_forest_fallback_reason or 'forest'}",
         )
         return {}
 
@@ -635,9 +693,12 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         *,
         require_shared: bool,
     ) -> tuple[list[_ForkSegmentBox], list[int]] | None:
+        self._fork_forest_fallback_reason = None
         if num_reqs <= 1:
+            self._fork_forest_fallback_reason = "single_request"
             return None
         if metadata.block_table.shape[0] < num_reqs:
+            self._fork_forest_fallback_reason = "block_table_rows"
             return None
 
         hratio = self.num_heads_q // self.num_heads_kv
@@ -651,6 +712,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         else:
             seq_lens_cpu = [int(seq_len) for seq_len in seq_lens_source[:num_reqs]]
         if any(seq_len <= 0 for seq_len in seq_lens_cpu):
+            self._fork_forest_fallback_reason = "sequence_length"
             return None
 
         block_counts = [
@@ -659,6 +721,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         ]
         max_blocks = max(block_counts)
         if metadata.block_table.shape[1] < max_blocks:
+            self._fork_forest_fallback_reason = "block_table_columns"
             return None
 
         partial_segments: list[tuple[int, int, int]] = []
@@ -681,11 +744,13 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 else:
                     assert block_rows is not None
                     if complete_blocks >= len(block_rows[req_id]):
+                        self._fork_forest_fallback_reason = "partial_block"
                         return None
                     partial_block = int(block_rows[req_id][complete_blocks])
                 partial_segments.append((req_id, partial_block, partial_tokens))
 
         if max_complete_blocks <= 0 and not partial_segments:
+            self._fork_forest_fallback_reason = "empty_kv"
             return None
 
         root = _PrefixTrieNode()
@@ -693,58 +758,97 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             complete_blocks = seq_len // self.block_size
             if complete_blocks > 0:
                 _add_trie_path(root, req_id, block_rows[req_id][:complete_blocks])
-        boxes: list[_ForkSegmentBox] = []
-        rank_by_req = [0] * num_reqs
-        chunk_blocks = _get_prefix_chunk_blocks(
+        base_chunk_blocks = _get_prefix_chunk_blocks(
             self.block_size,
             max(1, max_complete_blocks),
         )
-        _emit_forest_segments(
-            root,
-            boxes,
-            rank_by_req,
-            self.block_size,
-            chunk_blocks,
-            max_q_per_cta,
-        )
 
-        for req_id, block, partial_tokens in partial_segments:
-            _append_segment_boxes(
+        def build_boxes(chunk_blocks: int) -> tuple[list[_ForkSegmentBox], list[int]]:
+            boxes: list[_ForkSegmentBox] = []
+            rank_by_req = [0] * num_reqs
+            _emit_forest_segments(
+                root,
                 boxes,
-                [req_id],
-                [block],
-                partial_tokens,
                 rank_by_req,
+                self.block_size,
+                chunk_blocks,
                 max_q_per_cta,
             )
+            for req_id, block, partial_tokens in partial_segments:
+                _append_segment_boxes(
+                    boxes,
+                    [req_id],
+                    [block],
+                    partial_tokens,
+                    rank_by_req,
+                    max_q_per_cta,
+                )
+            return boxes, rank_by_req
+
+        boxes, rank_by_req = build_boxes(base_chunk_blocks)
+        has_shared = any(len(box.q_ids) > 1 for box in boxes)
+        if has_shared:
+            target_waves = envs.VLLM_FORK_ATTN_TARGET_CTA_WAVES
+            target_ctas = target_waves * self._get_fork_num_sms()
+            target_plan_ctas = (
+                target_ctas + self.num_heads_kv - 1
+            ) // self.num_heads_kv
+            missing_ctas = max(0, target_plan_ctas - len(boxes))
+            base_chunks = (
+                max_complete_blocks + base_chunk_blocks - 1
+            ) // base_chunk_blocks
+            target_chunks = min(31, base_chunks + missing_ctas)
+            adaptive_chunk_blocks = _get_adaptive_prefix_chunk_blocks(
+                block_size=self.block_size,
+                prefix_blocks=max_complete_blocks,
+                base_chunk_blocks=base_chunk_blocks,
+                num_reqs=num_reqs,
+                num_kv_heads=self.num_heads_kv,
+                num_sms=self._get_fork_num_sms(),
+                prefix_cohorts=1,
+                max_prefix_chunks=target_chunks,
+            )
+            if adaptive_chunk_blocks < base_chunk_blocks:
+                adaptive_boxes, adaptive_ranks = build_boxes(adaptive_chunk_blocks)
+                if max(adaptive_ranks) <= 32:
+                    boxes, rank_by_req = adaptive_boxes, adaptive_ranks
 
         if require_shared and not any(len(box.q_ids) > 1 for box in boxes):
+            self._fork_forest_fallback_reason = "no_shared_kv"
             return None
         num_split_per_seq = rank_by_req
         if any(split <= 0 for split in num_split_per_seq):
+            self._fork_forest_fallback_reason = "empty_split"
             return None
         return boxes, num_split_per_seq
 
-    def _can_use_fork_decode(self, metadata: FlashAttentionMetadata) -> bool:
+    def _fork_decode_fallback_reason(
+        self, metadata: FlashAttentionMetadata
+    ) -> str | None:
         if envs.VLLM_BATCH_INVARIANT:
-            return False
+            return "batch_invariant"
         if metadata.max_query_len != 1:
-            return False
+            return "non_decode"
         if metadata.num_actual_tokens > metadata.seq_lens.shape[0]:
-            return False
+            return "token_count"
         if metadata.causal is not True:
-            return False
+            return "non_causal"
         if metadata.mm_prefix_range_tensor is not None:
-            return False
+            return "multimodal_prefix"
         if metadata.rswa_prefix_lens is not None:
-            return False
+            return "restricted_window"
         if self.headdim not in (64, 128):
-            return False
+            return "head_dimension"
         if self.block_size % 16 != 0:
-            return False
+            return "block_size"
         if not _is_supported_fork_kv_cache_dtype(self.kv_cache_dtype):
-            return False
-        return self.num_heads_q % self.num_heads_kv == 0
+            return "kv_dtype"
+        if self.num_heads_q % self.num_heads_kv != 0:
+            return "head_ratio"
+        return None
+
+    def _can_use_fork_decode(self, metadata: FlashAttentionMetadata) -> bool:
+        return self._fork_decode_fallback_reason(metadata) is None
 
     def _can_use_fork(self, metadata: FlashAttentionMetadata) -> bool:
         return (
@@ -1141,25 +1245,40 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
         prefix_len = max(metadata.common_prefix_len, 0)
         prefix_blocks = min(prefix_len // self.block_size, workspace.max_blocks)
-        prefix_chunk_blocks = workspace.prefix_chunk_capacity_blocks
-        num_prefix_chunks = (
-            prefix_blocks + prefix_chunk_blocks - 1
-        ) // prefix_chunk_blocks
-        if num_prefix_chunks > workspace.max_prefix_chunks:
-            return {}
         total_blocks = min(metadata.block_table.shape[1], workspace.max_blocks)
         has_prefix = prefix_blocks > 0 and metadata.use_cascade
         if not has_prefix:
             prefix_len = 0
             prefix_blocks = 0
-            num_prefix_chunks = 0
+        prefix_cohorts = (
+            (num_reqs + workspace.prefix_queries_per_cta - 1)
+            // workspace.prefix_queries_per_cta
+            if has_prefix
+            else 0
+        )
+        prefix_chunk_blocks = workspace.prefix_chunk_capacity_blocks
+        if has_prefix:
+            prefix_chunk_blocks = _get_adaptive_prefix_chunk_blocks(
+                block_size=self.block_size,
+                prefix_blocks=prefix_blocks,
+                base_chunk_blocks=prefix_chunk_blocks,
+                num_reqs=num_reqs,
+                num_kv_heads=self.num_heads_kv,
+                num_sms=self._get_fork_num_sms(),
+                prefix_cohorts=prefix_cohorts,
+                max_prefix_chunks=workspace.max_prefix_chunks,
+            )
+        num_prefix_chunks = (
+            (prefix_blocks + prefix_chunk_blocks - 1) // prefix_chunk_blocks
+            if has_prefix
+            else 0
+        )
+        if num_prefix_chunks > workspace.max_prefix_chunks:
+            return {}
         suffix_start = prefix_blocks
         suffix_blocks = max(0, total_blocks - suffix_start)
 
         if has_prefix:
-            prefix_cohorts = (num_reqs + workspace.prefix_queries_per_cta - 1) // (
-                workspace.prefix_queries_per_cta
-            )
             for chunk_id in range(num_prefix_chunks):
                 block_start = chunk_id * prefix_chunk_blocks
                 block_count = min(
