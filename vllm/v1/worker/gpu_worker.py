@@ -390,6 +390,22 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "LMCacheConnectorV1"
+        ):
+            # CacheBlend constructs its layerwise recompute model when the KV
+            # connector is initialized, which happens after load_model().
+            # Register the fully loaded runner model before that point.
+            from lmcache.integration.vllm.utils import ENGINE_NAME
+            from lmcache.v1.compute.models.utils import VLLMModelTracker
+
+            VLLMModelTracker.register_model(
+                ENGINE_NAME,
+                self.model_runner.get_model(),
+            )
+
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,
