@@ -295,6 +295,38 @@ def test_fork_prefix_bucket_returns_none_when_prefix_exceeds_capture(
     )
 
 
+def test_fork_prefix_bucket_expands_for_small_long_kv_cohort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _make_manager()
+    manager._fork_prefix_chunk_buckets = (4, 8, 12)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE", 2048)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_TARGET_CTA_WAVES", 2)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS", 4096)
+    assert (
+        manager.get_fork_prefix_chunk_bucket(
+            prefix_blocks=512,
+            block_size=16,
+            num_reqs=2,
+            num_query_heads=16,
+            num_kv_heads=8,
+            num_sms=48,
+        )
+        == 12
+    )
+    assert (
+        manager.get_fork_prefix_chunk_bucket(
+            prefix_blocks=512,
+            block_size=16,
+            num_reqs=16,
+            num_query_heads=16,
+            num_kv_heads=8,
+            num_sms=48,
+        )
+        == 4
+    )
+
+
 def test_fork_dynamic_forest_uses_dynamic_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

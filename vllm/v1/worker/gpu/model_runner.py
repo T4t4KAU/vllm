@@ -1189,10 +1189,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.num_common_prefix_blocks,
             )
             if fork_prefix_info is not None:
-                prefix_blocks, block_size = fork_prefix_info
+                (
+                    prefix_blocks,
+                    block_size,
+                    num_query_heads,
+                    num_kv_heads,
+                    num_sms,
+                ) = fork_prefix_info
                 capacity = self.cudagraph_manager.get_fork_prefix_chunk_bucket(
                     prefix_blocks,
                     block_size,
+                    num_reqs,
+                    num_query_heads,
+                    num_kv_heads,
+                    num_sms,
                 )
                 if capacity is not None:
                     fork_plan = ForkGraphPlan("common", capacity)

@@ -111,6 +111,44 @@ def test_fork_decode_supports_model_gqa_geometry(
 
 
 @pytest.mark.parametrize(
+    ("metadata_override", "expected"),
+    [
+        ({"max_query_len": 2}, "non_decode"),
+        ({"causal": False}, "non_causal"),
+        ({"mm_prefix_range_tensor": torch.empty(1)}, "multimodal_prefix"),
+        ({"rswa_prefix_lens": torch.empty(1)}, "restricted_window"),
+    ],
+)
+def test_fork_decode_reports_specific_fallback_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_override: dict[str, object],
+    expected: str,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    builder = _make_builder(
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+    metadata_fields = {
+        "max_query_len": 1,
+        "num_actual_tokens": 2,
+        "seq_lens": torch.empty(2),
+        "causal": True,
+        "mm_prefix_range_tensor": None,
+        "rswa_prefix_lens": None,
+    }
+    metadata_fields.update(metadata_override)
+
+    reason = builder._fork_decode_fallback_reason(
+        SimpleNamespace(**metadata_fields)
+    )
+
+    assert reason == expected
+
+
+@pytest.mark.parametrize(
     ("num_reqs", "prefix_blocks", "expected"),
     [
         (2, 512, 64),
@@ -149,6 +187,91 @@ def test_tail_tile_override_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert default == (16, 64, 1)
     assert _get_mnw(2, 2, 8192, 16) == (16, 32, 1)
+
+
+def test_eager_forest_adapts_long_tail_ctas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE", 2048)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_TARGET_CTA_WAVES", 2)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS", 4096)
+    builder = _make_builder(
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+    builder._fork_num_sms = 48
+    shared_blocks = list(range(512))
+    block_table = torch.tensor(
+        [shared_blocks + [512], shared_blocks + [513]],
+        dtype=torch.int32,
+    )
+    metadata = SimpleNamespace(
+        block_table=block_table,
+        seq_lens=torch.full((2,), 513 * 16, dtype=torch.int32),
+    )
+
+    forest = builder._build_fork_forest_boxes(
+        metadata,
+        num_reqs=2,
+        require_shared=True,
+    )
+
+    assert forest is not None
+    boxes, splits = forest
+    assert len(boxes) == 12
+    assert splits == [11, 11]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_common_cudagraph_workspace_adapts_long_tail_ctas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE", 2048)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_TARGET_CTA_WAVES", 2)
+    monkeypatch.setattr(envs, "VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS", 4096)
+    builder = _make_builder(
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=8,
+        head_dim=128,
+    )
+    builder._fork_num_sms = 48
+    builder.device = torch.device("cuda")
+    builder.vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=16)
+    )
+    builder.compilation_config = SimpleNamespace(max_cudagraph_capture_size=32)
+    builder.model_config = SimpleNamespace(max_model_len=10240)
+    workspace = builder._get_cudagraph_workspace(12)
+    block_table = torch.arange(
+        2 * 513,
+        dtype=torch.int32,
+        device="cuda",
+    ).view(2, 513)
+    metadata = FlashAttentionMetadata(
+        num_actual_tokens=2,
+        max_query_len=1,
+        query_start_loc=torch.arange(3, dtype=torch.int32, device="cuda"),
+        max_seq_len=513 * 16,
+        seq_lens=torch.full((2,), 513 * 16, dtype=torch.int32, device="cuda"),
+        block_table=block_table,
+        slot_mapping=torch.arange(2, dtype=torch.int64, device="cuda"),
+        use_cascade=True,
+        common_prefix_len=512 * 16,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+        causal=True,
+    )
+
+    kwargs = builder._update_cudagraph_workspace(metadata, workspace, 2)
+    torch.accelerator.synchronize()
+
+    assert kwargs["fork_enabled"]
+    assert int((workspace.num_seqs_per_ctas[0] > 0).sum().item()) == 10
+    assert workspace.num_split_per_seq[:2].tolist() == [11, 11]
 
 
 def _run_flash_ref(

@@ -470,7 +470,7 @@ def get_fork_cudagraph_prefix_info(
     num_reqs: int,
     uniform_token_count: int | None,
     num_common_prefix_blocks: Sequence[int] | None,
-) -> tuple[int, int] | None:
+) -> tuple[int, int, int, int, int] | None:
     if not _is_fork_attention_backend(vllm_config):
         return None
     if uniform_token_count != 1 or num_reqs <= 0:
@@ -520,7 +520,13 @@ def get_fork_cudagraph_prefix_info(
                 dcp_world_size=getattr(builder, "dcp_world_size", 1),
             ):
                 continue
-            return num_common_prefix_blocks[i], kv_cache_spec.block_size
+            return (
+                num_common_prefix_blocks[i],
+                kv_cache_spec.block_size,
+                num_query_heads,
+                kv_cache_spec.num_kv_heads,
+                max(1, int(num_sms)),
+            )
     return None
 
 

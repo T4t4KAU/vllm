@@ -52,6 +52,52 @@ def _get_fork_prefix_chunk_blocks(block_size: int, max_blocks: int) -> int:
     return max(requested_blocks, min_blocks)
 
 
+def _get_fork_adaptive_prefix_chunk_blocks(
+    *,
+    block_size: int,
+    prefix_blocks: int,
+    base_chunk_blocks: int,
+    num_reqs: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    num_sms: int,
+    max_prefix_chunks: int,
+) -> int:
+    target_waves = envs.VLLM_FORK_ATTN_TARGET_CTA_WAVES
+    min_tokens = envs.VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS
+    if target_waves < 0:
+        raise ValueError("VLLM_FORK_ATTN_TARGET_CTA_WAVES must be non-negative")
+    if min_tokens < 0:
+        raise ValueError(
+            "VLLM_FORK_ATTN_ADAPTIVE_SPLIT_MIN_TOKENS must be non-negative"
+        )
+    if (
+        target_waves == 0
+        or prefix_blocks * block_size < min_tokens
+        or num_reqs <= 0
+        or num_query_heads <= 0
+        or num_kv_heads <= 0
+        or num_query_heads % num_kv_heads != 0
+        or num_sms <= 0
+        or max_prefix_chunks <= 0
+    ):
+        return base_chunk_blocks
+
+    hratio = num_query_heads // num_kv_heads
+    prefix_queries_per_cta = max(1, 32 // hratio)
+    prefix_cohorts = (
+        num_reqs + prefix_queries_per_cta - 1
+    ) // prefix_queries_per_cta
+    base_chunks = (prefix_blocks + base_chunk_blocks - 1) // base_chunk_blocks
+    target_plan_ctas = (target_waves * num_sms + num_kv_heads - 1) // num_kv_heads
+    required_prefix_ctas = max(0, target_plan_ctas - num_reqs)
+    target_chunks = (required_prefix_ctas + prefix_cohorts - 1) // prefix_cohorts
+    target_chunks = min(max_prefix_chunks, max(base_chunks, target_chunks))
+    if target_chunks <= base_chunks:
+        return base_chunk_blocks
+    return max(1, (prefix_blocks + target_chunks - 1) // target_chunks)
+
+
 def _get_fork_forest_max_splits(block_size: int, max_model_len: int) -> int:
     max_splits = envs.VLLM_FORK_ATTN_FOREST_MAX_SPLITS
     if max_splits > 0:
@@ -290,6 +336,10 @@ class CudaGraphManager:
         self,
         prefix_blocks: int,
         block_size: int,
+        num_reqs: int | None = None,
+        num_query_heads: int | None = None,
+        num_kv_heads: int | None = None,
+        num_sms: int | None = None,
     ) -> int | None:
         if not self._uses_fork_attention or prefix_blocks <= 0:
             return None
@@ -301,6 +351,22 @@ class CudaGraphManager:
             block_size,
         )
         chunk_blocks = _get_fork_prefix_chunk_blocks(block_size, max_blocks)
+        if (
+            num_reqs is not None
+            and num_query_heads is not None
+            and num_kv_heads is not None
+            and num_sms is not None
+        ):
+            chunk_blocks = _get_fork_adaptive_prefix_chunk_blocks(
+                block_size=block_size,
+                prefix_blocks=prefix_blocks,
+                base_chunk_blocks=chunk_blocks,
+                num_reqs=num_reqs,
+                num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
+                num_sms=num_sms,
+                max_prefix_chunks=self._fork_prefix_chunk_buckets[-1],
+            )
         num_chunks = (prefix_blocks + chunk_blocks - 1) // chunk_blocks
         for bucket in self._fork_prefix_chunk_buckets:
             if bucket >= num_chunks:
