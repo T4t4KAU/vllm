@@ -20,7 +20,7 @@ Key Design Principles:
    protecting blocks from eviction until complete_read() is called
 """
 
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -33,6 +33,7 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
+    OffloadEvictionMetadata,
     OffloadingEvent,
     OffloadingManager,
     OffloadKey,
@@ -226,12 +227,16 @@ class TieringOffloadingManager(OffloadingManager):
                         job_metadata.req_context,
                         completed_job.success,
                     )
+                    if completed_job.success:
+                        self.primary_tier.mark_secondary_backed(job_metadata.keys)
                 else:
                     # primary→secondary transfer completed.
                     # Decrement ref_cnt on primary blocks.
                     self.primary_tier.complete_read(
                         job_metadata.keys, job_metadata.req_context
                     )
+                    if completed_job.success:
+                        self.primary_tier.mark_secondary_backed(job_metadata.keys)
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -390,6 +395,15 @@ class TieringOffloadingManager(OffloadingManager):
         self.primary_tier.touch(keys, req_context)
         for tier in self.secondary_tiers:
             tier.touch(keys, req_context)
+
+    @override
+    def update_eviction_metadata(
+        self,
+        metadata: Mapping[OffloadKey, OffloadEvictionMetadata],
+        *,
+        replace: bool = False,
+    ) -> None:
+        self.primary_tier.update_eviction_metadata(metadata, replace=replace)
 
     @override
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):

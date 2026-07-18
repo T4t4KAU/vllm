@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from typing import Literal
 
 from typing_extensions import override
@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
+    OffloadEvictionMetadata,
     OffloadingEvent,
     OffloadingManager,
     OffloadKey,
@@ -25,17 +26,19 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
 from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
+from vllm.v1.kv_offload.cpu.policies.cohort_lru import CohortAwareLRUCachePolicy
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 
 _CACHE_POLICIES: dict[str, type[CachePolicy]] = {
     "lru": LRUCachePolicy,
     "arc": ARCCachePolicy,
+    "cohort_lru": CohortAwareLRUCachePolicy,
 }
 
 
 class CPUOffloadingManager(OffloadingManager):
     """
-    An OffloadingManager with a pluggable CachePolicy (LRU or ARC).
+    An OffloadingManager with a pluggable replacement policy.
 
     The manager owns all shared logic: ref-counting, event emission,
     block pool management, and the prepare_store/complete_store skeletons.
@@ -46,7 +49,7 @@ class CPUOffloadingManager(OffloadingManager):
     def __init__(
         self,
         num_blocks: int,
-        cache_policy: Literal["lru", "arc"] = "lru",
+        cache_policy: Literal["lru", "arc", "cohort_lru"] = "lru",
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
@@ -151,6 +154,18 @@ class CPUOffloadingManager(OffloadingManager):
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
         self._policy.touch(keys)
+
+    @override
+    def update_eviction_metadata(
+        self,
+        metadata: Mapping[OffloadKey, OffloadEvictionMetadata],
+        *,
+        replace: bool = False,
+    ) -> None:
+        self._policy.update_eviction_metadata(metadata, replace=replace)
+
+    def mark_secondary_backed(self, keys: Iterable[OffloadKey]) -> None:
+        self._policy.mark_secondary_backed(keys)
 
     @override
     def complete_load(

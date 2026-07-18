@@ -13,11 +13,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     FanoutCandidateObservation,
     OffloadingConnectorScheduler,
     _is_hot_shared_prefix,
+    _make_fanout_eviction_metadata,
     _resolve_fanout_chunk_blocks,
     _resolve_fanout_hot_prefix_config,
     _resolve_fanout_pressure_config,
 )
 from vllm.v1.kv_offload.fanout_planner import (
+    FanoutBlock,
     FanoutLifecycleState,
     FanoutPressureLevel,
 )
@@ -315,6 +317,41 @@ def test_fanout_candidate_observation_merge_is_order_independent() -> None:
     assert short.prefix_position == 0.125
     assert short.reuse_score == 512
     assert short.is_active_tail
+
+
+def test_fanout_candidate_builds_cpu_eviction_metadata() -> None:
+    observation = FanoutCandidateObservation(
+        request_id="request",
+        group_idx=0,
+        logical_block_idx=3,
+        physical_block_id=7,
+        offload_key=b"key",
+        fanout=8,
+        prefix_position=0.25,
+        reuse_score=448,
+        is_active_tail=False,
+    )
+    candidate = FanoutBlock(
+        request_id="request",
+        group_idx=0,
+        logical_block_idx=3,
+        physical_block_id=7,
+        offload_key=b"key",
+        fanout=8,
+        prefix_position=0.25,
+        last_access_time=4,
+        lifecycle_state=FanoutLifecycleState.HOT,
+        historical_max_fanout=16,
+        residency_value=2048,
+    )
+
+    metadata = _make_fanout_eviction_metadata(candidate, observation)
+
+    assert metadata.lifecycle_value == FanoutLifecycleState.HOT.value
+    assert metadata.reuse_score == 448
+    assert metadata.fanout == 16
+    assert metadata.residency_value == 2048
+    assert metadata.prefix_position == 0.25
 
 
 @pytest.mark.parametrize(

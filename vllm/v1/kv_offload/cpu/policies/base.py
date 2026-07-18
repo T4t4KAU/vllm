@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ctypes
 from abc import ABC, abstractmethod
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
-from vllm.v1.kv_offload.base import OffloadKey
+from vllm.v1.kv_offload.base import OffloadEvictionMetadata, OffloadKey
 
 
 class BlockStatus(ctypes.Structure):
@@ -89,4 +89,17 @@ class CachePolicy(ABC):
 
     def mark_non_evictable(self, key: OffloadKey) -> None:
         """Called when a block's ref_cnt transitions from 0."""
+        return
+
+    def update_eviction_metadata(
+        self,
+        metadata: Mapping[OffloadKey, OffloadEvictionMetadata],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Update optional scheduler-side value signals."""
+        return
+
+    def mark_secondary_backed(self, keys: Iterable[OffloadKey]) -> None:
+        """Mark keys whose secondary-tier Store has completed."""
         return

@@ -40,6 +40,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LookupResult,
+    OffloadEvictionMetadata,
     OffloadingManager,
     OffloadingSpec,
     OffloadKey,
@@ -197,6 +198,19 @@ def _is_hot_shared_prefix(
     )
 
 
+def _make_fanout_eviction_metadata(
+    candidate: FanoutBlock,
+    observation: "FanoutCandidateObservation",
+) -> OffloadEvictionMetadata:
+    return OffloadEvictionMetadata(
+        lifecycle_value=candidate.lifecycle_state.value,
+        reuse_score=observation.reuse_score,
+        fanout=max(candidate.fanout, candidate.historical_max_fanout),
+        residency_value=candidate.residency_value,
+        prefix_position=candidate.prefix_position,
+    )
+
+
 @dataclass(slots=True)
 class FanoutLifecycle:
     historical_max_fanout: int = 1
@@ -220,12 +234,14 @@ class FanoutCandidateObservation:
     prefix_position: float
     reuse_score: int
     is_active_tail: bool
+    needs_backup: bool = True
 
     def merge(self, other: "FanoutCandidateObservation") -> None:
         self.fanout = max(self.fanout, other.fanout)
         self.prefix_position = min(self.prefix_position, other.prefix_position)
         self.reuse_score = max(self.reuse_score, other.reuse_score)
         self.is_active_tail = self.is_active_tail or other.is_active_tail
+        self.needs_backup = self.needs_backup or other.needs_backup
 
 
 @dataclass(slots=True)
@@ -1437,10 +1453,8 @@ class OffloadingConnectorScheduler:
                     0,
                     num_blocks - self.config.fanout_recent_tail_blocks,
                 )
-                block_data: list[tuple[int, int, OffloadKey, int]] = []
+                block_data: list[tuple[int, int, OffloadKey, int, bool]] = []
                 for logical_idx in range(num_blocks):
-                    if logical_idx in group_state.fanout_admitted_block_indices:
-                        continue
                     physical_idx = logical_idx * self.config.block_size_factor
                     if physical_idx >= len(group_state.block_ids):
                         break
@@ -1448,21 +1462,26 @@ class OffloadingConnectorScheduler:
                     if logical_idx >= len(group_state.offload_keys):
                         break
                     offload_key = group_state.offload_keys[logical_idx]
-                    if self._reuse_fanout_admission(
+                    already_admitted = self._reuse_fanout_admission(
                         offload_key,
                         req_id,
                         group_config.group_idx,
                         group_state,
                         logical_idx,
-                    ):
-                        continue
+                    )
                     block_fanout = fanout[(group_config.group_idx, block_id)]
                     block_fanout += waiting_demand.get(
                         get_offload_block_hash(offload_key),
                         0,
                     )
                     block_data.append(
-                        (logical_idx, block_id, offload_key, block_fanout)
+                        (
+                            logical_idx,
+                            block_id,
+                            offload_key,
+                            block_fanout,
+                            not already_admitted,
+                        )
                     )
 
                 reuse_scores: dict[int, int] = {}
@@ -1481,7 +1500,13 @@ class OffloadingConnectorScheduler:
                         reuse_scores[block_data[run_idx][0]] = run_reuse_score
                     run_start = run_end
 
-                for logical_idx, block_id, offload_key, block_fanout in block_data:
+                for (
+                    logical_idx,
+                    block_id,
+                    offload_key,
+                    block_fanout,
+                    needs_backup,
+                ) in block_data:
                     if block_id == 0:
                         continue
                     prefix_position = (logical_idx + 1) / max(num_blocks, 1)
@@ -1496,6 +1521,7 @@ class OffloadingConnectorScheduler:
                         prefix_position=prefix_position,
                         reuse_score=reuse_score,
                         is_active_tail=logical_idx >= tail_start,
+                        needs_backup=needs_backup,
                     )
                     previous = observations.get(offload_key)
                     if previous is None:
@@ -1540,12 +1566,79 @@ class OffloadingConnectorScheduler:
                     historical_max_fanout=lifecycle.historical_max_fanout,
                     recent_access_count=lifecycle.recent_access_count,
                     residency_value=residency_value,
+                    needs_backup=observation.needs_backup,
                 )
             )
 
+        eviction_metadata = {
+            candidate.offload_key: _make_fanout_eviction_metadata(
+                candidate,
+                observations[candidate.offload_key],
+            )
+            for candidate in candidates
+        }
+        observed_keys = set(eviction_metadata)
+        for offload_key, locations in self._fanout_admitted_locations.items():
+            if offload_key in observed_keys:
+                continue
+            active_locations = [
+                (req_id, group_idx, logical_idx)
+                for req_id, group_idx, logical_idx in locations
+                if req_id in self._req_status
+            ]
+            if not active_locations:
+                continue
+            fanout_value = len({location[0] for location in active_locations})
+            fanout_value += waiting_demand.get(
+                get_offload_block_hash(offload_key),
+                0,
+            )
+            prefix_position = 1.0
+            for req_id, group_idx, logical_idx in active_locations:
+                group_state = self._req_status[req_id].group_states[group_idx]
+                prefix_position = min(
+                    prefix_position,
+                    (logical_idx + 1) / max(len(group_state.offload_keys), 1),
+                )
+            previous_lifecycle = self._fanout_lifecycle.get(offload_key)
+            historical_reuse = (
+                previous_lifecycle.historical_max_reuse_score
+                if previous_lifecycle is not None
+                else 0
+            )
+            reuse_score = max(0, fanout_value - 1)
+            base_hot = _is_hot_shared_prefix(
+                fanout=fanout_value,
+                prefix_position=prefix_position,
+                min_fanout=self.config.fanout_hot_prefix_min_fanout,
+                max_prefix_position=self.config.fanout_hot_prefix_max_position,
+                reuse_score=max(reuse_score, historical_reuse),
+                min_reuse_score=self.config.fanout_hot_prefix_min_reuse_blocks,
+            )
+            lifecycle_state, lifecycle = self._update_fanout_lifecycle(
+                offload_key,
+                fanout=fanout_value,
+                reuse_score=reuse_score,
+                base_hot=base_hot,
+            )
+            residency_value = (
+                reuse_score * 16
+                + lifecycle.historical_max_reuse_score * 4
+                + min(lifecycle.recent_access_count, 8)
+                * max(1, lifecycle.historical_max_fanout)
+            )
+            eviction_metadata[offload_key] = OffloadEvictionMetadata(
+                lifecycle_value=lifecycle_state.value,
+                reuse_score=reuse_score,
+                fanout=max(fanout_value, lifecycle.historical_max_fanout),
+                residency_value=residency_value,
+                prefix_position=prefix_position,
+            )
+        self.manager.update_eviction_metadata(eviction_metadata, replace=True)
+
         self._prune_fanout_lifecycle()
         plan = planner.select(
-            candidates,
+            (candidate for candidate in candidates if candidate.needs_backup),
             self.config.fanout_budget_blocks,
             pressure_level,
         )

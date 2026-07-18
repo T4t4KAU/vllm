@@ -9,8 +9,8 @@ and configurable secondary tiers (e.g., Storage, Network).
 Configuration via kv_connector_extra_config:
   - cpu_bytes_to_use: (required) Bytes to allocate for CPU primary tier
   - block_size: (optional) Block size for offloaded blocks (default: GPU block size)
-  - eviction_policy: (optional) Primary tier eviction policy: "lru" or
-    "arc" (default: "lru")
+  - eviction_policy: (optional) Primary tier eviction policy: "lru", "arc",
+    or "cohort_lru" (default: "lru")
   - secondary_tiers: (optional) List of secondary tier configurations
     Each secondary tier config is a dict with:
       - type: (required) Type of secondary tier (e.g., "example", "storage", "network")
@@ -61,7 +61,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
     Spec for multi-tier KV cache offloading.
 
     Creates a TieringOffloadingManager with:
-    - Primary tier: CPU (LRU or ARC eviction policy)
+    - Primary tier: CPU (LRU, ARC, or cohort-aware LRU eviction policy)
     - Secondary tiers: Configurable via extra_config
 
     The CPU primary tier has direct GPU access and serves as the gateway for
@@ -114,7 +114,7 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         Get the TieringOffloadingManager.
 
         Creates a TieringOffloadingManager with:
-        - Primary tier: CPU (LRU or ARC)
+        - Primary tier: CPU (LRU, ARC, or cohort-aware LRU)
         - Secondary tiers: As configured in extra_config
 
         Returns:

@@ -5,7 +5,7 @@ Core abstractions for KV cache offloading in vLLM v1.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, NewType
@@ -51,6 +51,17 @@ def get_offload_group_idx(key: OffloadKey) -> int:
 class ReqContext:
     req_id: str
     kv_transfer_params: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OffloadEvictionMetadata:
+    """Scheduler-side value signals used by cohort-aware eviction."""
+
+    lifecycle_value: int = 0
+    reuse_score: int = 0
+    fanout: int = 1
+    residency_value: int = 0
+    prefix_position: float = 1.0
 
 
 class LookupResult(Enum):
@@ -213,6 +224,15 @@ class OffloadingManager(ABC):
             keys: the keys identifying the blocks.
             req_context: per-request context (e.g. kv_transfer_params).
         """
+        return
+
+    def update_eviction_metadata(
+        self,
+        metadata: Mapping[OffloadKey, OffloadEvictionMetadata],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """Update optional value signals used by the eviction policy."""
         return
 
     def complete_load(self, keys: Collection[OffloadKey], req_context: ReqContext):

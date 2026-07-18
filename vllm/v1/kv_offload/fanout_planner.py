@@ -46,6 +46,7 @@ class FanoutBlock:
     recent_access_count: int = 1
     residency_value: int = 0
     in_flight: bool = False
+    needs_backup: bool = True
 
     @property
     def is_offload_candidate(self) -> bool:
@@ -56,6 +57,7 @@ class FanoutBlock:
             and self.is_sealed
             and not self.is_active_tail
             and not self.in_flight
+            and self.needs_backup
         )
 
     @property

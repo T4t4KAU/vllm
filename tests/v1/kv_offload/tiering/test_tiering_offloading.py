@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.v1.kv_offload.base import (
     LookupResult,
+    OffloadEvictionMetadata,
     OffloadingCounterMetadata,
     OffloadKey,
     OffloadPolicy,
@@ -255,6 +256,71 @@ class TestTieringOffloadingManager:
 
         # Blocks should be in primary tier
         assert count_hits(self.primary_tier, blocks) == 3
+
+    def test_completed_secondary_store_marks_primary_copy_backed(self):
+        mock_region = _mock_mmap_region(2)
+        primary = CPUPrimaryTierOffloadingManager(
+            num_blocks=2,
+            mmap_region=mock_region,
+            cache_policy="cohort_lru",
+        )
+        secondary = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_region.create_kv_memoryview(),
+            tier_type="example",
+        )
+        manager = TieringOffloadingManager(primary, [secondary])
+        keys = to_keys([1, 2])
+        manager.on_new_request(_CTX)
+
+        result = manager.prepare_store(keys, _CTX)
+        assert result is not None
+        manager.complete_store(keys, _CTX)
+        manager.on_schedule_end()
+        manager.on_schedule_end()
+
+        assert primary._policy.secondary_backed == set(keys)
+
+    def test_tiering_forwards_cohort_eviction_metadata(self):
+        mock_region = _mock_mmap_region(1)
+        primary = CPUPrimaryTierOffloadingManager(
+            num_blocks=1,
+            mmap_region=mock_region,
+            cache_policy="cohort_lru",
+        )
+        manager = TieringOffloadingManager(primary)
+        key = to_keys([1])[0]
+        metadata = OffloadEvictionMetadata(
+            lifecycle_value=3,
+            reuse_score=256,
+            fanout=16,
+        )
+
+        manager.update_eviction_metadata({key: metadata}, replace=True)
+
+        assert primary._policy.eviction_metadata == {key: metadata}
+
+    def test_secondary_promotion_restores_backed_status(self):
+        mock_region = _mock_mmap_region(1)
+        primary = CPUPrimaryTierOffloadingManager(
+            num_blocks=1,
+            mmap_region=mock_region,
+            cache_policy="cohort_lru",
+        )
+        secondary = ExampleSecondaryTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=mock_region.create_kv_memoryview(),
+            tier_type="example",
+        )
+        manager = TieringOffloadingManager(primary, [secondary])
+        key = to_keys([1])[0]
+        secondary.blocks[key] = True
+
+        assert manager.lookup(key, _CTX) is LookupResult.RETRY
+        manager.on_schedule_end()
+        manager.on_schedule_end()
+
+        assert primary._policy.secondary_backed == {key}
 
     def test_cascade_to_all_secondary_tiers(self, manager_setup):
         """Test that blocks are cascaded to ALL secondary tiers."""
