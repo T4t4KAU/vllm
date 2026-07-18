@@ -237,6 +237,12 @@ class SchedulerInterface(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        """Release live KV blocks for an idle resumable request."""
+
+        raise NotImplementedError
+
+    @abstractmethod
     def get_request_counts(self) -> tuple[int, int]:
         """Returns (num_running_reqs, num_waiting_reqs)."""
         raise NotImplementedError

@@ -182,6 +182,9 @@ class EngineCoreClient(ABC):
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        raise NotImplementedError
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         raise NotImplementedError
 
@@ -257,6 +260,9 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
+        raise NotImplementedError
+
+    async def trim_tool_kv_async(self, request_id: str) -> dict[str, object]:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
@@ -345,6 +351,9 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
+
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        return self.engine_core.trim_tool_kv(request_id)
 
     def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if mode == "wait":
@@ -933,6 +942,9 @@ class SyncMPClient(MPClient):
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        return self.call_utility("trim_tool_kv", request_id)
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1180,6 +1192,9 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
+
+    async def trim_tool_kv_async(self, request_id: str) -> dict[str, object]:
+        return await self.call_utility_async("trim_tool_kv", request_id)
 
     async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
         await self.call_utility_async("sleep", level, mode)
@@ -1994,6 +2009,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         placement.target_engine = None
         placement.source_epoch = -1
         placement.target_epoch = -1
+
+    async def trim_tool_kv_async(self, request_id: str) -> dict[str, object]:
+        engine = self.reqs_in_flight.get(request_id)
+        if engine is None:
+            return await super().trim_tool_kv_async(request_id)
+        return await self._call_utility_async("trim_tool_kv", request_id, engine=engine)
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.

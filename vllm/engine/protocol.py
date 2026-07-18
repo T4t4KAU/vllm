@@ -154,6 +154,12 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        """Release live KV blocks for one idle resumable request."""
+
+        ...
+
+    @abstractmethod
     async def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

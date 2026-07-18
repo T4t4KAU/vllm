@@ -221,6 +221,11 @@ class Scheduler(SchedulerInterface):
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
 
+        # Requests whose live blocks were released by the application while
+        # waiting for streaming input. The next scheduler output reports them
+        # as preempted so model-runner and connector request state is flushed.
+        self.pending_tool_kv_trim_req_ids: set[str] = set()
+
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
@@ -1181,6 +1186,8 @@ class Scheduler(SchedulerInterface):
                 len(num_scheduled_tokens)
             ]
 
+        preempted_req_ids = {req.request_id for req in preempted_reqs}
+        preempted_req_ids.update(self.pending_tool_kv_trim_req_ids)
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1189,7 +1196,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
-            preempted_req_ids={req.request_id for req in preempted_reqs},
+            preempted_req_ids=preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
             # It contains the request IDs that are finished in between
@@ -1227,6 +1234,7 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self.pending_tool_kv_trim_req_ids.clear()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1317,7 +1325,12 @@ class Scheduler(SchedulerInterface):
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
-        num_computed_tokens = session.num_computed_tokens
+        trimmed_boundary = session.tool_kv_trimmed_num_computed_tokens
+        num_computed_tokens = (
+            trimmed_boundary
+            if trimmed_boundary is not None
+            else session.num_computed_tokens
+        )
         kept_output_tokens = session._all_token_ids[
             session.num_prompt_tokens : num_computed_tokens
         ]
@@ -1340,6 +1353,7 @@ class Scheduler(SchedulerInterface):
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
+        session.tool_kv_trimmed_num_computed_tokens = None
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -2825,8 +2839,65 @@ class Scheduler(SchedulerInterface):
         return (
             self.has_unfinished_requests()
             or self.has_finished_requests()
+            or bool(self.pending_tool_kv_trim_req_ids)
             or (self.connector is not None and self.connector.has_pending_push_work())
         )
+
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        """Release GPU KV blocks for a resumable session waiting on a tool.
+
+        The token history remains in the Request. On the next streaming input,
+        normal prefix-cache or connector lookup is attempted, with recompute as
+        the fallback. Active and non-resumable requests are never modified.
+        """
+
+        usage_before = self.kv_cache_manager.usage
+        request = self.requests.get(request_id)
+        if request is None:
+            return {
+                "request_id": request_id,
+                "trimmed": False,
+                "reason": "not_found",
+                "kv_cache_usage_before": usage_before,
+                "kv_cache_usage_after": usage_before,
+            }
+        if not request.resumable:
+            reason = "not_resumable"
+        elif request.status != RequestStatus.WAITING_FOR_STREAMING_REQ:
+            reason = "not_waiting_for_streaming_input"
+        elif request.tool_kv_trimmed_num_computed_tokens is not None:
+            reason = "already_trimmed"
+        else:
+            block_ids = self.kv_cache_manager.get_block_ids(request_id)
+            block_references = sum(len(group) for group in block_ids)
+            if block_references == 0:
+                reason = "no_live_blocks"
+            else:
+                request.tool_kv_trimmed_num_computed_tokens = (
+                    request.num_computed_tokens
+                )
+                self._free_request_blocks(request)
+                self._record_dp_prefix_residency(request, resident=False)
+                request.num_computed_tokens = 0
+                if request.spec_token_ids:
+                    request.spec_token_ids = []
+                self.pending_tool_kv_trim_req_ids.add(request_id)
+                return {
+                    "request_id": request_id,
+                    "trimmed": True,
+                    "reason": "trimmed",
+                    "released_block_references": block_references,
+                    "kv_cache_usage_before": usage_before,
+                    "kv_cache_usage_after": self.kv_cache_manager.usage,
+                }
+
+        return {
+            "request_id": request_id,
+            "trimmed": False,
+            "reason": reason,
+            "kv_cache_usage_before": usage_before,
+            "kv_cache_usage_after": self.kv_cache_manager.usage,
+        }
 
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

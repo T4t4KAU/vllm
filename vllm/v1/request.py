@@ -196,6 +196,11 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+        # Set when an application releases this session's live KV blocks while
+        # it waits for streaming input. The saved boundary is needed to fold
+        # the prior chunk's computed output into the next prompt even though
+        # num_computed_tokens is reset to force cache lookup or recomputation.
+        self.tool_kv_trimmed_num_computed_tokens: int | None = None
 
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.

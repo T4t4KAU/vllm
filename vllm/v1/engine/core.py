@@ -710,6 +710,11 @@ class EngineCore:
         # Reset the GPU model runner's encoder cache (physical storage)
         self.model_executor.reset_encoder_cache()
 
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        """Release live KV blocks for one idle streaming-input session."""
+
+        return self.scheduler.trim_tool_kv(request_id)
+
     def _reset_caches(
         self,
         reset_running_requests: bool = True,

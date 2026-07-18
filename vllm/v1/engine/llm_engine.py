@@ -358,6 +358,11 @@ class LLMEngine:
         """
         self.engine_core.reset_encoder_cache()
 
+    def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        """Release live KV blocks for one idle streaming-input session."""
+
+        return self.engine_core.trim_tool_kv(request_id)
+
     def sleep(self, level: int = 1, mode: PauseMode = "abort"):
         if level >= 1:
             self.renderer.clear_mm_cache()

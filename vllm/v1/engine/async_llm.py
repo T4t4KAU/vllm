@@ -928,6 +928,19 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def trim_tool_kv(self, request_id: str) -> dict[str, object]:
+        """Release live KV blocks for one idle streaming-input session."""
+
+        internal_ids = list(self.output_processor.external_req_ids.get(request_id, ()))
+        internal_request_id = internal_ids[0] if internal_ids else request_id
+        result = await self.engine_core.trim_tool_kv_async(internal_request_id)
+        if internal_request_id == request_id:
+            return result
+        external_result = dict(result)
+        external_result["request_id"] = request_id
+        external_result["internal_request_id"] = internal_request_id
+        return external_result
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
             await self.renderer.clear_mm_cache_async()

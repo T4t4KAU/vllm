@@ -48,18 +48,19 @@ class DummyRequest(Request):
         )
 
 
-def create_scheduler() -> Scheduler:
+def create_scheduler(num_blocks: int = 1000) -> Scheduler:
     vllm_config = VllmConfig(device_config=DeviceConfig("cpu"))
     vllm_config.model_config = MagicMock()
     vllm_config.model_config.skip_tokenizer_init = True
     vllm_config.model_config.is_multimodal_model = False
+    vllm_config.model_config.is_encoder_decoder = False
     vllm_config.model_config.max_model_len = 1024
     vllm_config.model_config.enable_return_routed_experts = False
     vllm_config.cache_config = MagicMock()
-    vllm_config.cache_config.num_gpu_blocks = 1000
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
     vllm_config.cache_config.enable_prefix_caching = False
     kv_cache_config = KVCacheConfig(
-        num_blocks=1000,
+        num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(
@@ -81,6 +82,65 @@ def create_scheduler() -> Scheduler:
 
 
 class TestStreamingScheduler(unittest.TestCase):
+    def test_tool_kv_trim_reduces_live_occupancy_and_resumes(self):
+        scheduler = create_scheduler(num_blocks=9)
+        session = DummyRequest(
+            request_id="tool-session",
+            prompt_token_ids=list(range(64)),
+            resumable=True,
+        )
+        scheduler.add_request(session)
+        scheduler.schedule()
+
+        # Simulate the stop transition after the model yields a tool call.
+        scheduler.running.remove(session)
+        session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.num_waiting_for_streaming_input += 1
+        scheduler._enqueue_waiting_request(session)
+
+        usage_before = scheduler.kv_cache_manager.usage
+        result = scheduler.trim_tool_kv(session.request_id)
+        usage_after = scheduler.kv_cache_manager.usage
+
+        assert result["trimmed"] is True
+        assert result["released_block_references"] == 4
+        assert usage_before == 0.5
+        assert usage_after == 0.0
+        assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        assert session.num_computed_tokens == 0
+
+        # The existing preemption channel flushes model-runner and connector
+        # state without finishing the resumable request.
+        trim_output = scheduler.schedule()
+        assert trim_output.preempted_req_ids == {session.request_id}
+        assert session.request_id in scheduler.requests
+
+        next_request = DummyRequest(
+            request_id=session.request_id,
+            prompt_token_ids=[64, 65],
+            resumable=True,
+        )
+        scheduler.add_request(next_request)
+        assert session.prompt_token_ids == list(range(66))
+        assert session.num_computed_tokens == 0
+
+        resume_output = scheduler.schedule()
+        assert resume_output.num_scheduled_tokens[session.request_id] == 66
+
+    def test_tool_kv_trim_rejects_active_request(self):
+        scheduler = create_scheduler()
+        request = DummyRequest(
+            request_id="active-session",
+            prompt_token_ids=[1, 2, 3],
+            resumable=True,
+        )
+        scheduler.add_request(request)
+
+        result = scheduler.trim_tool_kv(request.request_id)
+
+        assert result["trimmed"] is False
+        assert result["reason"] == "not_waiting_for_streaming_input"
+
     def test_add_request(self):
         scheduler = create_scheduler()
 

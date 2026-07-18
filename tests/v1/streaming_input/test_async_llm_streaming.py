@@ -11,6 +11,7 @@ from vllm.engine.protocol import StreamingInput
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.core_client import DPLBAsyncMPClient
 from vllm.v1.engine.output_processor import RequestOutputCollector
 
 
@@ -170,3 +171,46 @@ async def test_generate_with_async_generator():
     assert outputs[2].finished is True
     # Both inputs were processed
     assert inputs_received == ["Hello", " world"]
+
+
+@pytest.mark.asyncio
+async def test_trim_tool_kv_resolves_external_request_id():
+    llm = MagicMock(spec=AsyncLLM)
+    llm.output_processor = MagicMock()
+    llm.output_processor.external_req_ids = {"external-request": ["internal-request"]}
+    llm.engine_core = MagicMock()
+    llm.engine_core.trim_tool_kv_async = AsyncMock(
+        return_value={
+            "request_id": "internal-request",
+            "trimmed": True,
+            "reason": "trimmed",
+        }
+    )
+    llm.trim_tool_kv = AsyncLLM.trim_tool_kv.__get__(llm, AsyncLLM)
+
+    result = await llm.trim_tool_kv("external-request")
+
+    llm.engine_core.trim_tool_kv_async.assert_awaited_once_with("internal-request")
+    assert result == {
+        "request_id": "external-request",
+        "internal_request_id": "internal-request",
+        "trimmed": True,
+        "reason": "trimmed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_trim_tool_kv_targets_request_owner_in_dp():
+    client = object.__new__(DPLBAsyncMPClient)
+    owner = b"owner-engine"
+    client.reqs_in_flight = {"internal-request": owner}
+    client._call_utility_async = AsyncMock(
+        return_value={"request_id": "internal-request", "trimmed": True}
+    )
+
+    result = await client.trim_tool_kv_async("internal-request")
+
+    client._call_utility_async.assert_awaited_once_with(
+        "trim_tool_kv", "internal-request", engine=owner
+    )
+    assert result["trimmed"] is True
