@@ -148,6 +148,15 @@ class SecondaryTierManager(ABC):
         """
         pass
 
+    def submit_load_batch(self, jobs: Collection[JobMetadata]) -> None:
+        """Submit multiple independent load jobs in one scheduler call.
+
+        Tiers may override this to reduce queue-lock and notification overhead.
+        Each job retains its own completion and failure boundary.
+        """
+        for job_metadata in jobs:
+            self.submit_load(job_metadata)
+
     @abstractmethod
     def get_finished_jobs(self) -> Iterable[JobResult]:
         """

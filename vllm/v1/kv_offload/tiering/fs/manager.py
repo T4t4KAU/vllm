@@ -18,13 +18,27 @@ File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
 import functools
 import json
 import os
-from collections.abc import Iterable
-from typing import TYPE_CHECKING
+import threading
+import time
+from collections import Counter
+from collections.abc import Collection, Iterable
+from typing import TYPE_CHECKING, Any
 
 from typing_extensions import override
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+)
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.base import LookupResult, OffloadKey, ReqContext
+from vllm.v1.kv_offload.base import (
+    LookupResult,
+    OffloadingCounterMetadata,
+    OffloadingGaugeMetadata,
+    OffloadingHistogramMetadata,
+    OffloadingMetricMetadata,
+    OffloadKey,
+    ReqContext,
+)
 from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.async_lookup import AsyncLookupManager
 from vllm.v1.kv_offload.tiering.base import (
@@ -40,6 +54,23 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 logger = init_logger(__name__)
+
+
+class FileSystemTierMetrics:
+    """Prometheus names for physical secondary-tier activity."""
+
+    SUBMITTED_JOBS = "vllm:kv_offload_secondary_submitted_jobs"
+    SUBMITTED_BLOCKS = "vllm:kv_offload_secondary_submitted_blocks"
+    SUBMITTED_BYTES = "vllm:kv_offload_secondary_submitted_bytes"
+    TRANSFERRED_BLOCKS = "vllm:kv_offload_secondary_transferred_blocks"
+    TRANSFERRED_BYTES = "vllm:kv_offload_secondary_transferred_bytes"
+    DEDUP_SKIPPED_BLOCKS = "vllm:kv_offload_secondary_dedup_skipped_blocks"
+    DEDUP_SKIPPED_BYTES = "vllm:kv_offload_secondary_dedup_skipped_bytes"
+    COMPLETED_JOBS = "vllm:kv_offload_secondary_completed_jobs"
+    FAILED_JOBS = "vllm:kv_offload_secondary_failed_jobs"
+    JOB_LATENCY = "vllm:kv_offload_secondary_job_latency_seconds"
+    LOOKUPS = "vllm:kv_offload_secondary_lookups"
+    INFLIGHT_JOBS = "vllm:kv_offload_secondary_inflight_jobs"
 
 
 class FsAsyncLookupManager(AsyncLookupManager):
@@ -131,6 +162,74 @@ class FileSystemTierManager(SecondaryTierManager):
         )
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
+        self._metrics_lock = threading.Lock()
+        self._metric_counters: Counter[tuple[str, str]] = Counter()
+        self._lookup_counters: Counter[str] = Counter()
+        self._job_latencies: list[tuple[str, float]] = []
+        self._inflight_jobs: Counter[str] = Counter()
+        self._job_observations: dict[int, tuple[str, float]] = {}
+
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        direction_labels = ("tier", "direction")
+        definitions: dict[str, OffloadingMetricMetadata] = {}
+        for name, description in (
+            (FileSystemTierMetrics.SUBMITTED_JOBS, "Submitted secondary-tier jobs."),
+            (
+                FileSystemTierMetrics.SUBMITTED_BLOCKS,
+                "KV blocks submitted to the secondary tier.",
+            ),
+            (
+                FileSystemTierMetrics.SUBMITTED_BYTES,
+                "Logical KV bytes submitted to the secondary tier.",
+            ),
+            (
+                FileSystemTierMetrics.TRANSFERRED_BLOCKS,
+                "KV blocks physically transferred by the secondary tier.",
+            ),
+            (
+                FileSystemTierMetrics.TRANSFERRED_BYTES,
+                "KV bytes physically transferred by the secondary tier.",
+            ),
+            (
+                FileSystemTierMetrics.DEDUP_SKIPPED_BLOCKS,
+                "Store blocks skipped because the physical file already exists.",
+            ),
+            (
+                FileSystemTierMetrics.DEDUP_SKIPPED_BYTES,
+                "Store bytes skipped because the physical file already exists.",
+            ),
+            (
+                FileSystemTierMetrics.COMPLETED_JOBS,
+                "Successfully completed secondary-tier jobs.",
+            ),
+            (FileSystemTierMetrics.FAILED_JOBS, "Failed secondary-tier jobs."),
+        ):
+            definitions[name] = OffloadingCounterMetadata(
+                documentation=description,
+                labelnames=direction_labels,
+            )
+        definitions[FileSystemTierMetrics.JOB_LATENCY] = (
+            OffloadingHistogramMetadata(
+                documentation=(
+                    "Secondary-tier job latency from submission to completion."
+                ),
+                labelnames=direction_labels,
+                buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+            )
+        )
+        definitions[FileSystemTierMetrics.LOOKUPS] = OffloadingCounterMetadata(
+            documentation="Resolved secondary-tier lookup observations.",
+            labelnames=("tier", "result"),
+        )
+        definitions[FileSystemTierMetrics.INFLIGHT_JOBS] = OffloadingGaugeMetadata(
+            documentation="Currently in-flight secondary-tier jobs.",
+            labelnames=direction_labels,
+        )
+        return definitions
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
@@ -140,18 +239,78 @@ class FileSystemTierManager(SecondaryTierManager):
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         result = self._lookup_manager.lookup(key, req_context)
         if result is None:
+            with self._metrics_lock:
+                self._lookup_counters["retry"] += 1
             return LookupResult.RETRY
+        outcome = "hit" if result else "miss"
+        with self._metrics_lock:
+            self._lookup_counters[outcome] += 1
         return LookupResult.HIT if result else LookupResult.MISS
+
+    def _record_submitted_job(self, job_metadata: JobMetadata, direction: str) -> None:
+        num_blocks = len(job_metadata.keys)
+        with self._metrics_lock:
+            self._metric_counters[
+                (FileSystemTierMetrics.SUBMITTED_JOBS, direction)
+            ] += 1
+            self._metric_counters[
+                (FileSystemTierMetrics.SUBMITTED_BLOCKS, direction)
+            ] += num_blocks
+            self._metric_counters[
+                (FileSystemTierMetrics.SUBMITTED_BYTES, direction)
+            ] += num_blocks * self._block_size
+            self._inflight_jobs[direction] += 1
+            self._job_observations[job_metadata.job_id] = (
+                direction,
+                time.monotonic(),
+            )
+
+    def _store_block(self, path: str, offset: int) -> None:
+        bytes_written = store_block(
+            path,
+            self._primary_kv_view,
+            offset,
+            self._block_size,
+        )
+        with self._metrics_lock:
+            if bytes_written:
+                self._metric_counters[
+                    (FileSystemTierMetrics.TRANSFERRED_BLOCKS, "store")
+                ] += 1
+                self._metric_counters[
+                    (FileSystemTierMetrics.TRANSFERRED_BYTES, "store")
+                ] += bytes_written
+            else:
+                self._metric_counters[
+                    (FileSystemTierMetrics.DEDUP_SKIPPED_BLOCKS, "store")
+                ] += 1
+                self._metric_counters[
+                    (FileSystemTierMetrics.DEDUP_SKIPPED_BYTES, "store")
+                ] += self._block_size
+
+    def _load_block(self, path: str, offset: int) -> None:
+        bytes_read = load_block(
+            path,
+            self._primary_kv_view,
+            offset,
+            self._block_size,
+        )
+        with self._metrics_lock:
+            self._metric_counters[
+                (FileSystemTierMetrics.TRANSFERRED_BLOCKS, "load")
+            ] += 1
+            self._metric_counters[
+                (FileSystemTierMetrics.TRANSFERRED_BYTES, "load")
+            ] += bytes_read
 
     @override
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        self._record_submitted_job(job_metadata, "store")
         tasks = (
             functools.partial(
-                store_block,
+                self._store_block,
                 self.file_mapper.get_file_name(key),
-                self._primary_kv_view,
                 int(bid) * self._block_size,
-                self._block_size,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
@@ -159,27 +318,84 @@ class FileSystemTierManager(SecondaryTierManager):
 
     @override
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        self._record_submitted_job(job_metadata, "load")
         tasks = (
             functools.partial(
-                load_block,
+                self._load_block,
                 self.file_mapper.get_file_name(key),
-                self._primary_kv_view,
                 int(bid) * self._block_size,
-                self._block_size,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
         self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
 
     @override
+    def submit_load_batch(self, jobs: Collection[JobMetadata]) -> None:
+        queued_jobs = []
+        for job_metadata in jobs:
+            self._record_submitted_job(job_metadata, "load")
+            tasks = (
+                functools.partial(
+                    self._load_block,
+                    self.file_mapper.get_file_name(key),
+                    int(bid) * self._block_size,
+                )
+                for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
+            )
+            queued_jobs.append(
+                (job_metadata.job_id, len(job_metadata.keys), tasks)
+            )
+        self._pool.enqueue_load_batch(queued_jobs)
+
+    @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
         """
         Collect completed jobs from the finished-jobs queue.
         """
-        return (
-            JobResult(job_id=job_id, success=success)
-            for job_id, success in self._pool.get_finished()
-        )
+        results = []
+        now = time.monotonic()
+        for job_id, success in self._pool.get_finished():
+            with self._metrics_lock:
+                direction, submitted_at = self._job_observations.pop(job_id)
+                self._inflight_jobs[direction] -= 1
+                metric = (
+                    FileSystemTierMetrics.COMPLETED_JOBS
+                    if success
+                    else FileSystemTierMetrics.FAILED_JOBS
+                )
+                self._metric_counters[(metric, direction)] += 1
+                self._job_latencies.append((direction, now - submitted_at))
+            results.append(JobResult(job_id=job_id, success=success))
+        return results
+
+    @override
+    def get_stats(self) -> OffloadingConnectorStats | None:
+        stats = OffloadingConnectorStats()
+        with self._metrics_lock:
+            for (metric, direction), value in self._metric_counters.items():
+                stats.increase_counter(metric, value, (self.tier_type, direction))
+            for result, value in self._lookup_counters.items():
+                stats.increase_counter(
+                    FileSystemTierMetrics.LOOKUPS,
+                    value,
+                    (self.tier_type, result),
+                )
+            for direction, latency in self._job_latencies:
+                stats.observe_histogram(
+                    FileSystemTierMetrics.JOB_LATENCY,
+                    latency,
+                    (self.tier_type, direction),
+                )
+            for direction in ("load", "store"):
+                stats.set_gauge(
+                    FileSystemTierMetrics.INFLIGHT_JOBS,
+                    self._inflight_jobs[direction],
+                    (self.tier_type, direction),
+                )
+            self._metric_counters.clear()
+            self._lookup_counters.clear()
+            self._job_latencies.clear()
+        return stats
 
     @override
     def drain_jobs(self) -> None:

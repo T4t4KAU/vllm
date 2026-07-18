@@ -337,6 +337,7 @@ class TieringOffloadingManager(OffloadingManager):
             return
 
         for tier, pending_by_ctx in self._pending_load_submissions.items():
+            jobs = []
             for entry in pending_by_ctx.values():
                 job_id = self._next_job_id()
                 job_metadata = JobMetadata(
@@ -347,7 +348,8 @@ class TieringOffloadingManager(OffloadingManager):
                     req_context=entry.req_context,
                 )
                 self._transfer_jobs[job_id] = job_metadata
-                tier.submit_load(job_metadata)
+                jobs.append(job_metadata)
+            tier.submit_load_batch(jobs)
 
         self._pending_load_submissions.clear()
 

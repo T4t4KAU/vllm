@@ -104,6 +104,41 @@ class DualQueueThreadPool:
                 self._load_q.append((fn, state))
             self._condition.notify(n_tasks)
 
+    def enqueue_load_batch(
+        self,
+        jobs: Iterable[tuple[JobId, int, Iterable[Callable]]],
+    ) -> None:
+        """Enqueue independent load jobs with one lock acquisition.
+
+        Tasks are interleaved round-robin across jobs so one large request
+        cannot hold all later requests behind its final block. Job completion
+        and failure state remain independent.
+        """
+        pending: deque[tuple[deque[Callable], JobState]] = deque()
+        total_tasks = 0
+        job_count = 0
+        for job_id, n_tasks, tasks in jobs:
+            if n_tasks <= 0:
+                raise ValueError("Batched load jobs must contain at least one task")
+            task_queue = deque(tasks)
+            if len(task_queue) != n_tasks:
+                raise ValueError(
+                    f"Job {job_id} declared {n_tasks} tasks, "
+                    f"but supplied {len(task_queue)}"
+                )
+            pending.append((task_queue, JobState(job_id, n_tasks)))
+            total_tasks += n_tasks
+            job_count += 1
+
+        with self._condition:
+            self._inflight_jobs += job_count
+            while pending:
+                task_queue, state = pending.popleft()
+                self._load_q.append((task_queue.popleft(), state))
+                if task_queue:
+                    pending.append((task_queue, state))
+            self._condition.notify(total_tasks)
+
     def enqueue_store(
         self,
         job_id: JobId,

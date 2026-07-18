@@ -34,13 +34,13 @@ def store_block(
     buffer: memoryview,
     offset: int,
     block_size: int,
-) -> None:
+) -> int:
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
     """
     # Check if block already exists to avoid redundant writes
     if os.path.exists(dest_path):
-        return
+        return 0
 
     tmp_path = dest_path + _get_tmp_suffix()
     # Ensure parent directories exist
@@ -64,6 +64,7 @@ def store_block(
         finally:
             os.close(fd)
         os.replace(tmp_path, dest_path)
+        return written
     except Exception:
         try:
             os.remove(tmp_path)
@@ -77,7 +78,7 @@ def load_block(
     view: memoryview,
     offset: int,
     block_size: int,
-) -> None:
+) -> int:
     """
     Load callback: read one KV block from disk. Remove the file on failure.
     """
@@ -88,6 +89,7 @@ def load_block(
         bytes_read = os.readv(fd, [view_slice])
         if bytes_read < block_size:
             raise OSError(f"Short read: expected {block_size} bytes, read {bytes_read}")
+        return bytes_read
     except Exception:
         try:
             os.remove(source_path)

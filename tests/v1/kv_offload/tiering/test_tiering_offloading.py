@@ -459,17 +459,16 @@ class TestTieringOffloadingManager:
         self.secondary_tier2.submit_store.assert_not_called()
 
     def test_lookup_batches_submit_load_per_request(self, manager_setup):
-        """lookup() defers submit_load until on_schedule_end(), one per request.
-
-        Blocks from different requests each get their own submit_load call, each
-        carrying the correct req_context.
-        """
+        """A batch submission retains independent per-request jobs."""
         blocks = to_keys(range(4))
         for block in blocks:
             self.secondary_tier1.blocks[block] = True
 
         self.secondary_tier1.submit_load = MagicMock(
             wraps=self.secondary_tier1.submit_load
+        )
+        self.secondary_tier1.submit_load_batch = MagicMock(
+            wraps=self.secondary_tier1.submit_load_batch
         )
 
         ctx_a = ReqContext(req_id="req_a")
@@ -487,8 +486,9 @@ class TestTieringOffloadingManager:
         # simulate end of step
         self._simulate_on_schedule_end()
 
-        assert self.secondary_tier1.submit_load.call_count == 2
+        self.secondary_tier1.submit_load_batch.assert_called_once()
         calls = self.secondary_tier1.submit_load.call_args_list
+        assert len(calls) == 2
         jm_a = calls[0].args[0]
         jm_b = calls[1].args[0]
         assert set(jm_a.keys) == {blocks[0], blocks[1]}

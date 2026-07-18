@@ -27,6 +27,7 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.tiering.base import JobMetadata
 from vllm.v1.kv_offload.tiering.fs.manager import (
     FileSystemTierManager,
+    FileSystemTierMetrics,
 )
 from vllm.v1.kv_offload.tiering.fs.thread_pool import DualQueueThreadPool
 
@@ -209,6 +210,51 @@ def test_store_then_load_roundtrip(fs_tier):
     ]
 
 
+def test_physical_io_metrics_and_store_dedup(fs_tier):
+    tier, _ = fs_tier
+    block_bytes = tier._block_size
+
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(result.success for result in drain(tier))
+    tier.submit_store(make_job(2, [key(1)], [0]))
+    assert all(result.success for result in drain(tier))
+    tier.submit_load(make_job(3, [key(1)], [1], is_promotion=True))
+    assert all(result.success for result in drain(tier))
+
+    reduced = tier.get_stats().reduce()
+    store_labels = ("fs", "store")
+    load_labels = ("fs", "load")
+    assert reduced[
+        f"{FileSystemTierMetrics.SUBMITTED_BLOCKS}:{store_labels}"
+    ] == 2
+    assert reduced[
+        f"{FileSystemTierMetrics.TRANSFERRED_BYTES}:{store_labels}"
+    ] == block_bytes
+    assert reduced[
+        f"{FileSystemTierMetrics.DEDUP_SKIPPED_BYTES}:{store_labels}"
+    ] == block_bytes
+    assert reduced[
+        f"{FileSystemTierMetrics.TRANSFERRED_BYTES}:{load_labels}"
+    ] == block_bytes
+    assert reduced[f"{FileSystemTierMetrics.COMPLETED_JOBS}:{store_labels}"] == 2
+    assert reduced[f"{FileSystemTierMetrics.COMPLETED_JOBS}:{load_labels}"] == 1
+    assert reduced[
+        f"{FileSystemTierMetrics.JOB_LATENCY}:{store_labels}_count"
+    ] == 2
+
+
+def test_fs_metric_definitions_include_direction_and_result_labels():
+    definitions = FileSystemTierManager.build_metric_definitions({})
+    assert definitions[FileSystemTierMetrics.TRANSFERRED_BYTES].labelnames == (
+        "tier",
+        "direction",
+    )
+    assert definitions[FileSystemTierMetrics.LOOKUPS].labelnames == (
+        "tier",
+        "result",
+    )
+
+
 def test_invalid_path_raises_at_construction():
     """Construction must fail immediately when the config file cannot be written."""
     tensor = _page_aligned_zero_tensor(32, _BLOCK_ELEMENTS)
@@ -246,6 +292,22 @@ def test_multiple_jobs_tracked_independently(fs_tier):
         LookupResult.HIT,
         LookupResult.HIT,
     ]
+
+
+def test_batched_load_jobs_keep_independent_completion(fs_tier):
+    tier, _ = fs_tier
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(result.success for result in drain(tier))
+
+    tier.submit_load_batch(
+        [
+            make_job(2, [key(1)], [1], is_promotion=True),
+            make_job(3, [key(99)], [2], is_promotion=True),
+        ]
+    )
+    results = {result.job_id: result.success for result in drain(tier)}
+
+    assert results == {2: True, 3: False}
 
 
 def test_multi_block_job_partial_failure(fs_tier):
@@ -332,3 +394,12 @@ def test_wait_idle_blocks_until_tasks_complete():
         gate.set()
         pool.shutdown(wait=True)
         waiter.join(timeout=5.0)
+
+
+def test_batched_load_rejects_empty_job():
+    pool = DualQueueThreadPool(n_read_threads=1, n_write_threads=1)
+    try:
+        with pytest.raises(ValueError, match="at least one task"):
+            pool.enqueue_load_batch([(1, 0, [])])
+    finally:
+        pool.shutdown(wait=True)
