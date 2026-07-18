@@ -3,10 +3,14 @@
 
 
 from fastapi import APIRouter, FastAPI, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
+from vllm.v1.engine.core_client import (
+    clear_demo_route_events,
+    get_demo_route_events,
+)
 
 logger = init_logger(__name__)
 
@@ -40,7 +44,20 @@ async def reset_prefix_cache(
     await engine_client(raw_request).reset_prefix_cache(
         reset_running_requests, reset_external
     )
+    clear_demo_route_events()
     return Response(status_code=200)
+
+
+@router.get("/agentrix/demo/routes")
+async def demo_routes(after: int = Query(default=0, ge=0)):
+    """Return actual API-server DP routing decisions for demo telemetry."""
+    events = get_demo_route_events(after)
+    return JSONResponse(
+        {
+            "events": events,
+            "latest_sequence": events[-1]["sequence"] if events else after,
+        }
+    )
 
 
 @router.post("/reset_mm_cache")

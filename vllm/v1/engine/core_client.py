@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -64,6 +65,31 @@ from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
+
+_DEMO_ROUTE_EVENTS: deque[dict[str, Any]] = deque(maxlen=4096)
+_DEMO_ROUTE_SEQUENCE = 0
+
+
+def record_demo_route(request_id: str, dp_rank: int) -> None:
+    global _DEMO_ROUTE_SEQUENCE
+    _DEMO_ROUTE_SEQUENCE += 1
+    _DEMO_ROUTE_EVENTS.append(
+        {
+            "sequence": _DEMO_ROUTE_SEQUENCE,
+            "request_id": request_id,
+            "dp_rank": dp_rank,
+            "timestamp": time.time(),
+        }
+    )
+
+
+def get_demo_route_events(after: int = 0) -> list[dict[str, Any]]:
+    return [event for event in _DEMO_ROUTE_EVENTS if event["sequence"] > after]
+
+
+def clear_demo_route_events() -> None:
+    _DEMO_ROUTE_EVENTS.clear()
+
 
 AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 
@@ -1692,6 +1718,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             current_counts[eng_index][0] += self.client_count
 
         chosen_engine = self.core_engines[eng_index]
+        record_demo_route(request.request_id, eng_index)
         prefix_router = getattr(self, "prefix_router", None)
         if prefix_router is not None:
             if request.request_id in getattr(self, "_prefix_ordinary_requests", ()):
