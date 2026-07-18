@@ -116,7 +116,10 @@ void fork_run_mha_fwd_splitkv_dispatch(std::vector<fork_fwd_params>& params,
   }
 
   dim3 grid_gather(params[0].b, params[0].h);
-  constexpr int WARPS = Headdim == 64 ? 2 : 4;
+  // The gather store assigns one thread to each output head coordinate.
+  // Qwen3.5/3.6 therefore need all 256 threads, not the 128-thread launch
+  // used by the previous maximum head dimension.
+  constexpr int WARPS = Headdim == 64 ? 2 : Headdim == 128 ? 4 : 8;
   GBLOCKM_SWITCH(params[0].max_split_per_seq, [&]() {
     gather_kernel<elem_type, Headdim, BLOCKM, WARPS>
         <<<grid_gather, WARPS * 32, 0, stream>>>(params[0]);

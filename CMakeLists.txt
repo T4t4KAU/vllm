@@ -1071,7 +1071,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_fp16.cu"
       "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim64_bf16.cu"
       "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_fp16.cu"
-      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_bf16.cu")
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim128_bf16.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim256_fp16.cu"
+      "csrc/libtorch_stable/attention/fork/fork_fwd_split_hdim256_bf16.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FORK_ATTN_SRCS}"
       CUDA_ARCHS "${FORK_ARCHS}")

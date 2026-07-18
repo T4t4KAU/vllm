@@ -837,7 +837,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             return "multimodal_prefix"
         if metadata.rswa_prefix_lens is not None:
             return "restricted_window"
-        if self.headdim not in (64, 128):
+        if not ForkAttentionBackend.supports_head_size(self.headdim):
             return "head_dimension"
         if self.block_size % 16 != 0:
             return "block_size"
@@ -1497,7 +1497,7 @@ class ForkAttentionBackend(FlashAttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size in (64, 128)
+        return head_size in (64, 128, 256)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -1541,6 +1541,15 @@ class ForkAttentionBackend(FlashAttentionBackend):
             return "FORK attention does not support sinks"
         if device_capability < DeviceCapability(8, 0):
             return "FORK attention requires compute capability >= 8.0"
+        # Qwen3.5/3.6-27B use 256-dim heads. The largest corresponding tile
+        # uses 160 KiB of dynamic shared memory, so keep this path on Hopper+.
+        if head_size == 256 and device_capability < DeviceCapability(9, 0):
+            return " ".join(
+                (
+                    "FORK attention with head size 256 requires",
+                    "compute capability >= 9.0",
+                )
+            )
         if dtype not in cls.supported_dtypes:
             return "dtype not supported"
         if not cls.supports_head_size(head_size):

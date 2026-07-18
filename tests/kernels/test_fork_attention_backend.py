@@ -30,6 +30,61 @@ def test_fork_attention_backend_registered() -> None:
     assert backend_cls.get_name() == "FORK_ATTN"
 
 
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+def test_fork_attention_backend_supported_head_sizes(head_size: int) -> None:
+    assert ForkAttentionBackend.supports_head_size(head_size)
+
+
+def test_fork_attention_backend_rejects_unknown_head_size() -> None:
+    assert not ForkAttentionBackend.supports_head_size(192)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_error"),
+    [
+        (DeviceCapability(8, 0), "head size 256 requires compute capability >= 9.0"),
+        (DeviceCapability(8, 9), "head size 256 requires compute capability >= 9.0"),
+        (DeviceCapability(9, 0), None),
+    ],
+)
+def test_fork_attention_head_size_256_requires_sm90(
+    capability: DeviceCapability,
+    expected_error: str | None,
+) -> None:
+    error = ForkAttentionBackend.supports_combination(
+        head_size=256,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=None,
+        block_size=16,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=capability,
+    )
+    if expected_error is None:
+        assert error is None
+    else:
+        assert error is not None
+        assert expected_error in error
+
+
+def test_qwen35_qwen36_hybrid_attention_geometry() -> None:
+    error = ForkAttentionBackend.supports_combination(
+        head_size=256,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="bfloat16",
+        block_size=784,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        device_capability=DeviceCapability(9, 0),
+    )
+
+    assert error is None
+
+
 @pytest.mark.parametrize(
     ("capability", "expected_error"),
     [
@@ -81,14 +136,20 @@ def _make_builder(
 
 
 @pytest.mark.parametrize(
-    ("num_heads", "num_kv_heads", "expected"),
-    [(14, 2, True), (32, 8, True), (14, 4, False)],
-    ids=["qwen2_5_gqa7", "llama3_2_gqa4", "non_divisible"],
+    ("num_heads", "num_kv_heads", "head_dim", "expected"),
+    [(14, 2, 64, True), (32, 8, 64, True), (24, 4, 256, True), (14, 4, 64, False)],
+    ids=[
+        "qwen2_5_gqa7",
+        "llama3_2_gqa4",
+        "qwen3_5_arch_gqa6",
+        "non_divisible",
+    ],
 )
 def test_fork_decode_supports_model_gqa_geometry(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
     num_kv_heads: int,
+    head_dim: int,
     expected: bool,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
@@ -96,7 +157,7 @@ def test_fork_decode_supports_model_gqa_geometry(
         block_size=16,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=64,
+        head_dim=head_dim,
     )
     metadata = SimpleNamespace(
         max_query_len=1,
@@ -141,9 +202,7 @@ def test_fork_decode_reports_specific_fallback_reason(
     }
     metadata_fields.update(metadata_override)
 
-    reason = builder._fork_decode_fallback_reason(
-        SimpleNamespace(**metadata_fields)
-    )
+    reason = builder._fork_decode_fallback_reason(SimpleNamespace(**metadata_fields))
 
     assert reason == expected
 
@@ -685,20 +744,45 @@ def test_fork_forest_metadata_emits_hierarchical_segments(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8,
     reason="FORK requires SM80+",
 )
+@pytest.mark.parametrize(
+    (
+        "num_heads",
+        "num_kv_heads",
+        "head_dim",
+        "dtype",
+        "query_table_shape",
+        "block_table_shape",
+    ),
+    [
+        (16, 4, 128, torch.float16, (2, 8), (2, 2)),
+        (24, 4, 256, torch.float16, (4, 5), (4, 2)),
+        (24, 4, 256, torch.bfloat16, (4, 5), (4, 2)),
+    ],
+    ids=[
+        "head_dim_128",
+        "qwen3_5_arch_head_dim_256_fp16",
+        "qwen3_5_arch_head_dim_256_bf16",
+    ],
+)
 def test_fork_attention_backend_forward_uses_fork(
     monkeypatch: pytest.MonkeyPatch,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    query_table_shape: tuple[int, int],
+    block_table_shape: tuple[int, int],
 ):
+    if head_dim == 256 and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("FORK head dimension 256 requires SM90+")
+
     monkeypatch.setattr(envs, "VLLM_FORK_ATTN_PREFIX_CHUNK_SIZE", 64)
     torch.manual_seed(2)
     device = torch.device("cuda")
-    dtype = torch.float16
     batch = 8
     block_size = 32
     prefix_blocks = 4
     suffix_blocks = 2
-    num_heads = 16
-    num_kv_heads = 4
-    head_dim = 128
     prefix_len = prefix_blocks * block_size
     seq_len = (prefix_blocks + suffix_blocks) * block_size
     total_blocks = prefix_blocks + batch * suffix_blocks
@@ -748,9 +832,9 @@ def test_fork_attention_backend_forward_uses_fork(
     assert metadata.fork_max_split_per_seq == 3
     assert metadata.fork_mnw == [32, 64, 2, 16, 64, 1]
     assert metadata.fork_query_tables is not None
-    assert metadata.fork_query_tables[0].shape == (2, 8)
+    assert metadata.fork_query_tables[0].shape == query_table_shape
     assert metadata.fork_block_tables is not None
-    assert metadata.fork_block_tables[0].shape == (2, 2)
+    assert metadata.fork_block_tables[0].shape == block_table_shape
 
     impl = ForkAttentionImpl(
         num_heads=num_heads,

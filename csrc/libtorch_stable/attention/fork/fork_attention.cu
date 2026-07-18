@@ -167,8 +167,9 @@ void fork_attention(Tensor& out, Tensor& softmax_lse, Tensor& split_out,
                   "softmax_lse must have shape [B, H, 1]");
   STD_TORCH_CHECK(q.size(1) == 1,
                   "ForkAttention currently supports decode q_len == 1");
-  STD_TORCH_CHECK(q.size(3) == 64 || q.size(3) == 128,
-                  "ForkAttention supports head size 64 or 128");
+  STD_TORCH_CHECK(
+      q.size(3) == 64 || q.size(3) == 128 || q.size(3) == 256,
+      "ForkAttention supports head size 64, 128, or 256");
   STD_TORCH_CHECK(
       k_cache.size(1) % 16 == 0,
       "ForkAttention requires page block size to be divisible by 16");
@@ -292,17 +293,23 @@ void fork_attention(Tensor& out, Tensor& softmax_lse, Tensor& split_out,
     if (q.size(3) == 64) {
       FORK_NAMESPACE::fork_run_mha_fwd_splitkv_dispatch<cute::half_t, 64>(
           params, stream);
-    } else {
+    } else if (q.size(3) == 128) {
       FORK_NAMESPACE::fork_run_mha_fwd_splitkv_dispatch<cute::half_t, 128>(
+          params, stream);
+    } else {
+      FORK_NAMESPACE::fork_run_mha_fwd_splitkv_dispatch<cute::half_t, 256>(
           params, stream);
     }
   } else {
     if (q.size(3) == 64) {
       FORK_NAMESPACE::fork_run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t,
                                                         64>(params, stream);
-    } else {
+    } else if (q.size(3) == 128) {
       FORK_NAMESPACE::fork_run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t,
                                                         128>(params, stream);
+    } else {
+      FORK_NAMESPACE::fork_run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t,
+                                                        256>(params, stream);
     }
   }
 }
