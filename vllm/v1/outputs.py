@@ -269,9 +269,10 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
-    # (graph kind, graph capacity, active CTAs, shared CTAs, singleton CTAs).
+    # (graph kind, graph capacity, active CTAs, shared CTAs, singleton CTAs,
+    # shared queries, maximum queries aggregated by one CTA).
     # Produced by the physical ForkAttention planner for DP routing feedback.
-    fork_execution_stats: tuple[str, int, int, int, int] | None = None
+    fork_execution_stats: tuple[str, int, int, int, int, int, int] | None = None
 
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,

@@ -1884,7 +1884,7 @@ class DPEngineCoreProc(EngineCoreProc):
         self.current_wave = 0
         self.last_counts = (0, 0)
         self.last_fork_telemetry: tuple[
-            tuple[str, int, int, int, int] | None, float
+            tuple[str, int, int, int, int, int, int] | None, float
         ] = (None, 0.0)
         self.publish_fork_dp_telemetry = envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING
 

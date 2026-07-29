@@ -576,7 +576,7 @@ def set_fork_cudagraph_prefix_bucket(
 
 def get_fork_execution_stats(
     attn_groups: list[list[AttentionGroup]],
-) -> tuple[str, int, int, int, int] | None:
+) -> tuple[str, int, int, int, int, int, int] | None:
     """Return the latest physical ForkAttention plan summary."""
     for groups in attn_groups:
         for attn_group in groups:
@@ -585,7 +585,7 @@ def get_fork_execution_stats(
             for builder in attn_group.metadata_builders:
                 stats = getattr(builder, "_fork_last_execution_stats", None)
                 if stats is not None:
-                    return cast(tuple[str, int, int, int, int], stats)
+                    return cast(tuple[str, int, int, int, int, int, int], stats)
     return None
 
 

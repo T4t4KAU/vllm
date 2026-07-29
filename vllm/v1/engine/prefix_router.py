@@ -218,7 +218,7 @@ class PrefixAwareDPRouter:
         state.kv_cache_usage = kv_cache_usage
         if not isinstance(execution_stats, (list, tuple)) or len(execution_stats) < 5:
             return
-        kind, capacity, active, shared, singleton = execution_stats
+        kind, capacity, active, shared, singleton = execution_stats[:5]
         state.graph_kind = str(kind)
         state.graph_capacity = int(capacity)
         state.active_ctas = int(active)

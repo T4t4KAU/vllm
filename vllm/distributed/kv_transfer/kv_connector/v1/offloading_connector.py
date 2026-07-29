@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
 )
 from vllm.forward_context import ForwardContext
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -129,6 +130,17 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def get_fanout_prefix_hint(
+        self,
+        request: Request,
+    ) -> tuple[int, int, int, int] | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_fanout_prefix_hint(request)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

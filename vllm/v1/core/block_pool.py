@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Sequence
+import heapq
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -29,6 +32,17 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class GPUBlockEvictionMetadata:
+    """Value signals used to rank idle GPU prefix-cache blocks."""
+
+    lifecycle_value: int = 0
+    reuse_score: int = 0
+    fanout: int = 1
+    residency_value: int = 0
+    prefix_position: float = 1.0
 
 
 class BlockHashToBlockMap:
@@ -195,6 +209,21 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # Lifecycle-aware eviction is opt-in. The ordinary linked-list LRU
+        # remains the fast path until a connector publishes GPU metadata.
+        self._lifecycle_eviction_enabled = False
+        self._gpu_eviction_metadata: dict[int, GPUBlockEvictionMetadata] = {}
+        self._eviction_heap: list[
+            tuple[tuple[int, int, float, int, int, int, int], int, int]
+        ] = []
+        self._eviction_generation = [0] * num_gpu_blocks
+        self._free_epoch = [0] * num_gpu_blocks
+        self._free_epoch_counter = num_gpu_blocks
+        self._eviction_step = 0
+        self._load_protected_until: dict[int, int] = {}
+        self._load_protection_expirations: list[tuple[int, int]] = []
+        self._lifecycle_eviction_counts: Counter[int] = Counter()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -553,7 +582,10 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self._lifecycle_eviction_enabled:
+            ret = self._get_lifecycle_ranked_blocks(num_blocks)
+        else:
+            ret = self.free_block_queue.popleft_n(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -571,6 +603,197 @@ class BlockPool:
                     self.metrics_collector.on_block_allocated(block)
         return ret
 
+    def enable_lifecycle_eviction(self) -> None:
+        """Enable value-aware eviction while retaining LRU within each tier."""
+        if self._lifecycle_eviction_enabled:
+            return
+        self._lifecycle_eviction_enabled = True
+        for free_epoch, block in enumerate(self.free_block_queue.get_all_free_blocks()):
+            self._free_epoch[block.block_id] = free_epoch
+            if block.block_hash is not None:
+                self._refresh_eviction_candidate(block)
+
+    def update_gpu_eviction_metadata(
+        self,
+        metadata: Mapping[int, GPUBlockEvictionMetadata],
+        *,
+        current_step: int,
+        replace: bool = False,
+    ) -> None:
+        """Publish lifecycle values used for future idle-block eviction."""
+        for block_id in metadata:
+            if block_id < 0 or block_id >= self.num_gpu_blocks:
+                raise ValueError(f"Invalid GPU block ID: {block_id}")
+        self.enable_lifecycle_eviction()
+        self._advance_eviction_step(current_step)
+
+        changed_block_ids: set[int] = set()
+        if replace:
+            removed_block_ids = self._gpu_eviction_metadata.keys() - metadata.keys()
+            changed_block_ids.update(removed_block_ids)
+            for block_id, value in metadata.items():
+                if self._gpu_eviction_metadata.get(block_id) != value:
+                    changed_block_ids.add(block_id)
+            self._gpu_eviction_metadata = dict(metadata)
+        else:
+            for block_id, value in metadata.items():
+                if self._gpu_eviction_metadata.get(block_id) != value:
+                    changed_block_ids.add(block_id)
+                    self._gpu_eviction_metadata[block_id] = value
+
+        for block_id in changed_block_ids:
+            block = self.blocks[block_id]
+            if self._is_idle_cached_block(block):
+                self._refresh_eviction_candidate(block)
+        self._maybe_compact_eviction_heap()
+
+    def mark_loaded_blocks(
+        self,
+        block_ids: Iterable[int],
+        *,
+        current_step: int,
+        min_residency_steps: int,
+    ) -> None:
+        """Soft-protect newly loaded GPU blocks from immediate re-eviction."""
+        if min_residency_steps <= 0:
+            return
+        self.enable_lifecycle_eviction()
+        self._advance_eviction_step(current_step)
+        protected_until = current_step + min_residency_steps
+        for block_id in block_ids:
+            if block_id <= 0 or block_id >= self.num_gpu_blocks:
+                continue
+            previous = self._load_protected_until.get(block_id, 0)
+            if protected_until <= previous:
+                continue
+            self._load_protected_until[block_id] = protected_until
+            heapq.heappush(
+                self._load_protection_expirations,
+                (protected_until, block_id),
+            )
+            block = self.blocks[block_id]
+            if self._is_idle_cached_block(block):
+                self._refresh_eviction_candidate(block)
+
+    def drain_lifecycle_eviction_counts(self) -> dict[int, int]:
+        """Return and reset GPU prefix evictions grouped by lifecycle value."""
+        counts = dict(self._lifecycle_eviction_counts)
+        self._lifecycle_eviction_counts.clear()
+        return counts
+
+    def get_lifecycle_block_counts(self) -> dict[int, int]:
+        """Return currently classified physical GPU blocks by lifecycle."""
+        return dict(
+            Counter(
+                value.lifecycle_value
+                for block_id, value in self._gpu_eviction_metadata.items()
+                if self.blocks[block_id].block_hash is not None
+            )
+        )
+
+    def _get_lifecycle_ranked_blocks(
+        self,
+        num_blocks: int,
+    ) -> list[KVCacheBlock]:
+        blocks: list[KVCacheBlock] = []
+        for _ in range(num_blocks):
+            first = self.free_block_queue.fake_free_list_head.next_free_block
+            assert first is not None and first is not (
+                self.free_block_queue.fake_free_list_tail
+            )
+            if first.block_hash is None:
+                block = self.free_block_queue.popleft()
+                self._invalidate_eviction_candidate(block.block_id)
+            else:
+                block = self._pop_eviction_candidate()
+                if block is None:
+                    block = self.free_block_queue.popleft()
+                else:
+                    self.free_block_queue.remove(block)
+                self._invalidate_eviction_candidate(block.block_id)
+            blocks.append(block)
+        return blocks
+
+    def _pop_eviction_candidate(self) -> KVCacheBlock | None:
+        while self._eviction_heap:
+            _, generation, block_id = heapq.heappop(self._eviction_heap)
+            if generation != self._eviction_generation[block_id]:
+                continue
+            block = self.blocks[block_id]
+            if not self._is_idle_cached_block(block):
+                continue
+            return block
+        return None
+
+    def _eviction_priority(
+        self,
+        block_id: int,
+    ) -> tuple[int, int, float, int, int, int, int]:
+        metadata = self._gpu_eviction_metadata.get(
+            block_id,
+            GPUBlockEvictionMetadata(),
+        )
+        protected_until = self._load_protected_until.get(block_id, 0)
+        protected = int(protected_until > 0 and protected_until >= self._eviction_step)
+        return (
+            protected,
+            metadata.lifecycle_value,
+            -metadata.prefix_position,
+            metadata.reuse_score,
+            metadata.fanout,
+            metadata.residency_value,
+            self._free_epoch[block_id],
+        )
+
+    def _refresh_eviction_candidate(self, block: KVCacheBlock) -> None:
+        block_id = block.block_id
+        self._eviction_generation[block_id] += 1
+        heapq.heappush(
+            self._eviction_heap,
+            (
+                self._eviction_priority(block_id),
+                self._eviction_generation[block_id],
+                block_id,
+            ),
+        )
+
+    def _invalidate_eviction_candidate(self, block_id: int) -> None:
+        self._eviction_generation[block_id] += 1
+
+    @staticmethod
+    def _is_idle_cached_block(block: KVCacheBlock) -> bool:
+        return (
+            block.ref_cnt == 0
+            and not block.is_null
+            and block.block_hash is not None
+            and block.prev_free_block is not None
+            and block.next_free_block is not None
+        )
+
+    def _advance_eviction_step(self, current_step: int) -> None:
+        if current_step < self._eviction_step:
+            return
+        self._eviction_step = current_step
+        while (
+            self._load_protection_expirations
+            and self._load_protection_expirations[0][0] < current_step
+        ):
+            protected_until, block_id = heapq.heappop(self._load_protection_expirations)
+            if self._load_protected_until.get(block_id) != protected_until:
+                continue
+            del self._load_protected_until[block_id]
+            block = self.blocks[block_id]
+            if self._is_idle_cached_block(block):
+                self._refresh_eviction_candidate(block)
+
+    def _maybe_compact_eviction_heap(self) -> None:
+        if len(self._eviction_heap) <= max(64, self.num_gpu_blocks * 4):
+            return
+        self._eviction_heap = []
+        for block in self.free_block_queue.get_all_free_blocks():
+            if self._is_idle_cached_block(block):
+                self._refresh_eviction_candidate(block)
+
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -586,13 +809,22 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        metadata = self._gpu_eviction_metadata.get(block.block_id)
         evicted_hashes = self._remove_cached_block_hashes(block)
+        self._clear_gpu_eviction_state(block.block_id)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        if metadata is not None:
+            self._lifecycle_eviction_counts[metadata.lifecycle_value] += 1
         self._emit_block_removed_events(evicted_hashes)
         return True
+
+    def _clear_gpu_eviction_state(self, block_id: int) -> None:
+        self._gpu_eviction_metadata.pop(block_id, None)
+        self._load_protected_until.pop(block_id, None)
+        self._invalidate_eviction_candidate(block_id)
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
@@ -606,6 +838,7 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
+                self._invalidate_eviction_candidate(block.block_id)
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -633,6 +866,11 @@ class BlockPool:
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+        if self._lifecycle_eviction_enabled:
+            for block in blocks_with_hash:
+                self._free_epoch_counter += 1
+                self._free_epoch[block.block_id] = self._free_epoch_counter
+                self._refresh_eviction_candidate(block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -674,6 +912,14 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self._gpu_eviction_metadata.clear()
+        self._eviction_heap.clear()
+        self._load_protected_until.clear()
+        self._load_protection_expirations.clear()
+        self._lifecycle_eviction_counts.clear()
+        self._eviction_step = 0
+        for block_id in range(self.num_gpu_blocks):
+            self._invalidate_eviction_candidate(block_id)
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

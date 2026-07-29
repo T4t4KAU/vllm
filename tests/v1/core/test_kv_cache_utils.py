@@ -20,7 +20,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
-from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.block_pool import BlockPool, GPUBlockEvictionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -505,6 +505,92 @@ def test_block_pool_temporarily_reserves_idle_cached_blocks() -> None:
     assert [
         block.block_id for block in pool.free_block_queue.get_all_free_blocks()
     ] == [3, 4, 2, 1]
+
+
+def _make_idle_cached_pool(num_cached_blocks: int) -> tuple[BlockPool, list[int]]:
+    pool = BlockPool(
+        num_gpu_blocks=num_cached_blocks + 1,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    blocks = pool.get_new_blocks(num_cached_blocks)
+    for block in blocks:
+        block_hash = make_block_hash_with_group_id(
+            BlockHash(bytes([block.block_id])),
+            0,
+        )
+        block.set_block_hash(block_hash)
+        pool.cached_block_hash_to_block.insert(block_hash, block)
+    pool.free_blocks(blocks)
+    return pool, [block.block_id for block in blocks]
+
+
+def test_block_pool_evicts_cold_before_cooling_and_hot() -> None:
+    pool, block_ids = _make_idle_cached_pool(3)
+    hot, cooling, cold = block_ids
+    pool.update_gpu_eviction_metadata(
+        {
+            hot: GPUBlockEvictionMetadata(lifecycle_value=3),
+            cooling: GPUBlockEvictionMetadata(lifecycle_value=2),
+            cold: GPUBlockEvictionMetadata(lifecycle_value=1),
+        },
+        current_step=1,
+        replace=True,
+    )
+
+    assert pool.get_new_blocks(1)[0].block_id == cold
+    assert pool.get_new_blocks(1)[0].block_id == cooling
+    assert pool.get_new_blocks(1)[0].block_id == hot
+    assert pool.drain_lifecycle_eviction_counts() == {1: 1, 2: 1, 3: 1}
+
+
+def test_block_pool_soft_protects_recently_loaded_blocks() -> None:
+    pool, block_ids = _make_idle_cached_pool(2)
+    loaded, ordinary = block_ids
+    metadata = {
+        block_id: GPUBlockEvictionMetadata(lifecycle_value=1) for block_id in block_ids
+    }
+    pool.update_gpu_eviction_metadata(
+        metadata,
+        current_step=1,
+        replace=True,
+    )
+    pool.mark_loaded_blocks(
+        [loaded],
+        current_step=1,
+        min_residency_steps=4,
+    )
+
+    assert pool.get_new_blocks(1)[0].block_id == ordinary
+
+
+def test_block_pool_loaded_protection_expires() -> None:
+    pool, block_ids = _make_idle_cached_pool(2)
+    loaded, ordinary = block_ids
+    metadata = {
+        block_id: GPUBlockEvictionMetadata(lifecycle_value=1) for block_id in block_ids
+    }
+    pool.update_gpu_eviction_metadata(
+        metadata,
+        current_step=1,
+        replace=True,
+    )
+    pool.mark_loaded_blocks(
+        [loaded],
+        current_step=1,
+        min_residency_steps=1,
+    )
+    pool.update_gpu_eviction_metadata(
+        metadata,
+        current_step=3,
+        replace=True,
+    )
+
+    # Once protection expires, ordinary LRU order is restored.
+    assert pool.get_new_blocks(1)[0].block_id == loaded
+    assert ordinary in [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ]
 
 
 def test_generate_block_hash_extra_keys():

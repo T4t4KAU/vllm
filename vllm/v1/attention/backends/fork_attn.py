@@ -496,7 +496,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         metadata: FlashAttentionMetadata,
         num_active_reqs: int | None = None,
     ) -> dict[str, Any]:
-        self._fork_last_execution_stats = ("base", 0, 0, 0, 0)
+        self._fork_last_execution_stats = ("base", 0, 0, 0, 0, 0, 0)
         if num_active_reqs is None:
             num_active_reqs = metadata.num_actual_tokens
         cudagraph_bucket = self._get_cudagraph_prefix_chunk_bucket()
@@ -678,12 +678,15 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     ) -> None:
         shared_ctas = sum(len(box.q_ids) > 1 for box in boxes)
         singleton_ctas = len(boxes) - shared_ctas
+        shared_boxes = [box for box in boxes if len(box.q_ids) > 1]
         self._fork_last_execution_stats = (
             kind,
             capacity,
             len(boxes),
             shared_ctas,
             singleton_ctas,
+            len({query_id for box in shared_boxes for query_id in box.q_ids}),
+            max((len(box.q_ids) for box in shared_boxes), default=0),
         )
 
     def _build_fork_forest_boxes(
@@ -1335,6 +1338,8 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             shared_ctas + singleton_ctas,
             shared_ctas,
             singleton_ctas,
+            num_reqs if has_prefix else 0,
+            min(num_reqs, workspace.prefix_queries_per_cta) if has_prefix else 0,
         )
         return self._workspace_kwargs(workspace)
 

@@ -97,7 +97,9 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.dp_engine_index = self.parallel_config.data_parallel_index
         self.log_stats = log_stats
-        self.fork_execution_stats: tuple[str, int, int, int, int] | None = None
+        self.fork_execution_stats: (
+            tuple[str, int, int, int, int, int, int] | None
+        ) = None
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -200,6 +202,13 @@ class Scheduler(SchedulerInterface):
             self.fork_fanout_admission_max_bypasses,
         ) = self._init_fork_fanout_admission_config()
         (
+            self.fork_fanout_join_max_deferral_steps,
+            self.fork_fanout_join_min_pending,
+            self.fork_fanout_join_min_prefix_blocks,
+            self.fork_fanout_arrival_wait_steps,
+            self.fork_fanout_arrival_min_fanout,
+        ) = self._init_fork_fanout_join_config()
+        (
             self.fork_fanout_preemption_window,
             self.fork_fanout_preemption_min_fanout,
         ) = self._init_fork_fanout_preemption_config()
@@ -213,6 +222,9 @@ class Scheduler(SchedulerInterface):
         ) = self._init_fork_fanout_gpu_hotset_config()
         self.fork_fanout_admission_bypass_counts: dict[str, int] = {}
         self.fork_fanout_admission_last_step: int = -1
+        self.fork_fanout_reload_promotion_last_step: int = -1
+        self.fork_fanout_join_deferral_counts: dict[str, int] = {}
+        self.fork_fanout_arrival_wait_counts: dict[str, int] = {}
         self.fork_fanout_reserved_blocks: list[KVCacheBlock] = []
 
         # The request IDs that are finished in between the previous and the
@@ -512,6 +524,9 @@ class Scheduler(SchedulerInterface):
                 # cadence-aligned step; decodes still run to fill this step.
                 req_index += 1
                 continue
+            if self._should_defer_for_fanout_join(request):
+                req_index += 1
+                continue
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -709,6 +724,9 @@ class Scheduler(SchedulerInterface):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
+
+                if self._should_wait_for_hot_fanout_arrivals(request):
+                    break
 
                 # Check that adding the request still respects the max_loras
                 # constraint.
@@ -1034,6 +1052,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.pop_request()
                 self.fork_fanout_admission_bypass_counts.pop(request_id, None)
+                self.fork_fanout_arrival_wait_counts.pop(request_id, None)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1983,6 +2002,12 @@ class Scheduler(SchedulerInterface):
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
             if self.skipped_waiting:
+                if (
+                    self.fork_fanout_reload_promotion_last_step
+                    != self.current_step
+                ):
+                    self._promote_ready_fanout_reload_cohort()
+                    self.fork_fanout_reload_promotion_last_step = self.current_step
                 return self.skipped_waiting
             if self.fork_fanout_admission_last_step != self.current_step:
                 self._promote_fanout_waiting_request()
@@ -2167,6 +2192,44 @@ class Scheduler(SchedulerInterface):
         if max_bypasses < 0:
             raise ValueError("fanout_admission_max_bypasses must be >= 0")
         return window, max_bypasses
+
+    def _init_fork_fanout_join_config(self) -> tuple[int, int, int, int, int]:
+        if (
+            not self._is_fork_attention_backend()
+            or not envs.VLLM_FORK_ATTN_FANOUT_SCHEDULING_ENABLED
+        ):
+            return 0, 0, 0, 0, 0
+        extra_config = self._get_fork_fanout_extra_config()
+        max_deferral_steps = int(
+            extra_config.get("fanout_join_max_deferral_steps", 1)
+        )
+        min_pending = int(extra_config.get("fanout_join_min_pending", 2))
+        min_prefix_blocks = int(
+            extra_config.get("fanout_join_min_prefix_blocks", 128)
+        )
+        arrival_wait_steps = int(
+            extra_config.get("fanout_arrival_wait_steps", 1)
+        )
+        arrival_min_fanout = int(
+            extra_config.get("fanout_arrival_min_fanout", 4)
+        )
+        if max_deferral_steps < 0:
+            raise ValueError("fanout_join_max_deferral_steps must be >= 0")
+        if min_pending < 1:
+            raise ValueError("fanout_join_min_pending must be >= 1")
+        if min_prefix_blocks < 1:
+            raise ValueError("fanout_join_min_prefix_blocks must be >= 1")
+        if arrival_wait_steps < 0:
+            raise ValueError("fanout_arrival_wait_steps must be >= 0")
+        if arrival_min_fanout < 2:
+            raise ValueError("fanout_arrival_min_fanout must be >= 2")
+        return (
+            max_deferral_steps,
+            min_pending,
+            min_prefix_blocks,
+            arrival_wait_steps,
+            arrival_min_fanout,
+        )
 
     def _init_fork_fanout_preemption_config(self) -> tuple[int, int]:
         if (
@@ -2354,10 +2417,205 @@ class Scheduler(SchedulerInterface):
                 len(waiting_window),
             )
 
+    def _promote_ready_fanout_reload_cohort(self) -> None:
+        window = self.fork_fanout_admission_window
+        if window <= 1 or not self.skipped_waiting:
+            return
+        skipped_window = list(itertools.islice(self.skipped_waiting, window))
+        ready_reloads = [
+            request
+            for request in skipped_window
+            if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            and request.request_id in self.finished_recving_kv_req_ids
+        ]
+        if len(ready_reloads) <= 1:
+            return
+
+        hash_counts: Counter[Any] = Counter()
+        for request in itertools.chain(self.running, ready_reloads):
+            hash_counts.update(request.block_hashes)
+        best_request: Request | None = None
+        best_score = (0, 0, 0)
+        for request in ready_reloads:
+            score = self._fanout_score_from_hash_counts(
+                request.block_hashes,
+                hash_counts,
+            )
+            if score > best_score:
+                best_request = request
+                best_score = score
+        if best_request is None or best_score[0] <= 0 or best_score[1] <= 0:
+            return
+
+        best_prefix = best_request.block_hashes[: best_score[1]]
+        cohort = [
+            request
+            for request in ready_reloads
+            if self._has_block_prefix(request.block_hashes, best_prefix)
+        ]
+        head_request = self.skipped_waiting.peek_request()
+        head_bypassed = head_request not in cohort
+        max_bypasses = self.fork_fanout_admission_max_bypasses
+        if (
+            head_bypassed
+            and head_request in ready_reloads
+            and max_bypasses > 0
+        ):
+            used_bypasses = self.fork_fanout_admission_bypass_counts.get(
+                head_request.request_id,
+                0,
+            )
+            remaining_bypasses = max_bypasses - used_bypasses
+            if remaining_bypasses <= 0:
+                return
+            cohort = cohort[:remaining_bypasses]
+        if len(cohort) <= 1 or self._waiting_front_matches_in_queue(
+            self.skipped_waiting,
+            cohort,
+        ):
+            return
+        if head_bypassed and head_request in ready_reloads and max_bypasses > 0:
+            self.fork_fanout_admission_bypass_counts[head_request.request_id] = (
+                self.fork_fanout_admission_bypass_counts.get(
+                    head_request.request_id,
+                    0,
+                )
+                + len(cohort)
+            )
+        for request in cohort:
+            self.fork_fanout_admission_bypass_counts.pop(
+                request.request_id,
+                None,
+            )
+        for request in reversed(cohort):
+            self.skipped_waiting.remove_request(request)
+            self.skipped_waiting.prepend_request(request)
+        if self.fork_fanout_profile:
+            logger.info(
+                "Fanout reload cohort promoted: size=%d reuse_score=%d "
+                "prefix_blocks=%d ready_reloads=%d skipped_window=%d",
+                len(cohort),
+                best_score[0],
+                best_score[1],
+                len(ready_reloads),
+                len(skipped_window),
+            )
+
+    def _should_defer_for_fanout_join(self, request: Request) -> bool:
+        max_deferrals = self.fork_fanout_join_max_deferral_steps
+        if (
+            max_deferrals <= 0
+            or request.is_prefill_chunk
+            or self.fork_fanout_join_deferral_counts.get(request.request_id, 0)
+            >= max_deferrals
+        ):
+            return False
+
+        request_hashes = self._resident_fanout_block_hashes(request)
+        if len(request_hashes) < self.fork_fanout_join_min_prefix_blocks:
+            return False
+        pending = 0
+        best_prefix_blocks = 0
+        for candidate in itertools.islice(
+            self.skipped_waiting,
+            self.fork_fanout_admission_window,
+        ):
+            if candidate.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            prefix_blocks = self._common_block_prefix_len(
+                request_hashes,
+                candidate.block_hashes,
+            )
+            if prefix_blocks < self.fork_fanout_join_min_prefix_blocks:
+                continue
+            pending += 1
+            best_prefix_blocks = max(best_prefix_blocks, prefix_blocks)
+        if pending < self.fork_fanout_join_min_pending:
+            self.fork_fanout_join_deferral_counts.pop(request.request_id, None)
+            return False
+
+        self.fork_fanout_join_deferral_counts[request.request_id] = (
+            self.fork_fanout_join_deferral_counts.get(request.request_id, 0) + 1
+        )
+        if self.fork_fanout_profile:
+            logger.info(
+                "Fanout join deferred decode: request=%s pending=%d "
+                "prefix_blocks=%d deferral=%d/%d",
+                request.request_id,
+                pending,
+                best_prefix_blocks,
+                self.fork_fanout_join_deferral_counts[request.request_id],
+                max_deferrals,
+            )
+        return True
+
+    def _should_wait_for_hot_fanout_arrivals(self, request: Request) -> bool:
+        max_wait_steps = self.fork_fanout_arrival_wait_steps
+        if (
+            max_wait_steps <= 0
+            or request.num_computed_tokens > 0
+            or self.fork_fanout_arrival_wait_counts.get(request.request_id, 0)
+            >= max_wait_steps
+        ):
+            return False
+        hint_getter = getattr(self.connector, "get_fanout_prefix_hint", None)
+        if hint_getter is None:
+            return False
+        hint = hint_getter(request)
+        if hint is None:
+            return False
+        lifecycle, expected_fanout, reuse_score, prefix_blocks = hint
+        if (
+            lifecycle < 2
+            or expected_fanout < self.fork_fanout_arrival_min_fanout
+            or prefix_blocks < self.fork_fanout_join_min_prefix_blocks
+        ):
+            return False
+
+        target_fanout = min(expected_fanout, self.max_num_running_reqs)
+        available_fanout = 0
+        candidates = itertools.chain(
+            self.running,
+            self.skipped_waiting,
+            self.waiting,
+        )
+        for candidate in candidates:
+            if self._common_block_prefix_len(
+                request.block_hashes,
+                candidate.block_hashes,
+            ) >= prefix_blocks:
+                available_fanout += 1
+        if available_fanout >= target_fanout:
+            return False
+
+        self.fork_fanout_arrival_wait_counts[request.request_id] = (
+            self.fork_fanout_arrival_wait_counts.get(request.request_id, 0) + 1
+        )
+        if self.fork_fanout_profile:
+            logger.info(
+                "Fanout arrival wait: request=%s available=%d target=%d "
+                "prefix_blocks=%d reuse_score=%d wait=%d/%d",
+                request.request_id,
+                available_fanout,
+                target_fanout,
+                prefix_blocks,
+                reuse_score,
+                self.fork_fanout_arrival_wait_counts[request.request_id],
+                max_wait_steps,
+            )
+        return True
+
     def _waiting_front_matches(self, requests: Sequence[Request]) -> bool:
+        return self._waiting_front_matches_in_queue(self.waiting, requests)
+
+    @staticmethod
+    def _waiting_front_matches_in_queue(
+        queue: RequestQueue,
+        requests: Sequence[Request],
+    ) -> bool:
         if not requests:
             return True
-        front = itertools.islice(self.waiting, len(requests))
+        front = itertools.islice(queue, len(requests))
         return all(
             front_request is request for front_request, request in zip(front, requests)
         )
@@ -2754,6 +3012,8 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
+        self.fork_fanout_join_deferral_counts.pop(request_id, None)
+        self.fork_fanout_arrival_wait_counts.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -2985,7 +3245,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
-        fork_execution_stats: tuple[str, int, int, int, int] | None = None,
+        fork_execution_stats: tuple[str, int, int, int, int, int, int] | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None

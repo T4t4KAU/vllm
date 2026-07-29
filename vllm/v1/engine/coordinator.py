@@ -140,7 +140,9 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         self.request_counts = [0, 0]  # [waiting, running]
-        self.fork_execution_stats: tuple[str, int, int, int, int] | None = None
+        self.fork_execution_stats: (
+            tuple[str, int, int, int, int, int, int] | None
+        ) = None
         self.kv_cache_usage = 0.0
 
 
@@ -477,7 +479,7 @@ class DPCoordinatorProc:
 
     def _get_engine_telemetry(
         self,
-    ) -> list[tuple[tuple[str, int, int, int, int] | None, float]]:
+    ) -> list[tuple[tuple[str, int, int, int, int, int, int] | None, float]]:
         return [
             (engine.fork_execution_stats, engine.kv_cache_usage)
             for engine in self.engines

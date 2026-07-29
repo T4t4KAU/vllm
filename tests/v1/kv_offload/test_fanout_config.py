@@ -11,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     FanoutCandidateObservation,
+    FanoutLifecycle,
     OffloadingConnectorScheduler,
     _is_hot_shared_prefix,
     _make_fanout_eviction_metadata,
@@ -18,6 +19,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     _resolve_fanout_hot_prefix_config,
     _resolve_fanout_pressure_config,
 )
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    make_block_hash_with_group_id,
+)
+from vllm.v1.kv_offload.base import OffloadEvictionMetadata
 from vllm.v1.kv_offload.fanout_planner import (
     FanoutBlock,
     FanoutLifecycleState,
@@ -303,7 +310,7 @@ def test_fanout_candidate_observation_merge_is_order_independent() -> None:
         request_id="long",
         group_idx=0,
         logical_block_idx=3,
-        physical_block_id=7,
+        physical_block_id=9,
         offload_key=b"key",
         fanout=8,
         prefix_position=0.125,
@@ -317,6 +324,7 @@ def test_fanout_candidate_observation_merge_is_order_independent() -> None:
     assert short.prefix_position == 0.125
     assert short.reuse_score == 512
     assert short.is_active_tail
+    assert short.physical_block_ids == {7, 9}
 
 
 def test_fanout_candidate_builds_cpu_eviction_metadata() -> None:
@@ -352,6 +360,87 @@ def test_fanout_candidate_builds_cpu_eviction_metadata() -> None:
     assert metadata.fanout == 16
     assert metadata.residency_value == 2048
     assert metadata.prefix_position == 0.25
+
+
+def test_gpu_lifecycle_survives_request_release_and_cools() -> None:
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    block = pool.blocks[1]
+    block_hash = make_block_hash_with_group_id(BlockHash(b"shared"), 0)
+    block.set_block_hash(block_hash)
+    pool.cached_block_hash_to_block.insert(block_hash, block)
+
+    offload_key = b"shared-key"
+    observation = FanoutCandidateObservation(
+        request_id="request",
+        group_idx=0,
+        logical_block_idx=0,
+        physical_block_id=block.block_id,
+        offload_key=offload_key,
+        fanout=8,
+        prefix_position=0.25,
+        reuse_score=256,
+        is_active_tail=False,
+    )
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._gpu_block_pool = pool
+    scheduler._fanout_step = 1
+    scheduler.config = SimpleNamespace(fanout_hot_prefix_cooldown_steps=2)
+    scheduler._fanout_lifecycle = {
+        offload_key: FanoutLifecycle(
+            historical_max_fanout=8,
+            historical_max_reuse_score=256,
+            hot_since_step=1,
+            min_resident_until_step=1,
+            last_hot_step=1,
+            last_observed_step=1,
+            lifecycle_state=FanoutLifecycleState.HOT,
+        )
+    }
+    scheduler._fanout_admitted_locations = {}
+    scheduler._req_status = {}
+    scheduler._gpu_lifecycle_locations = {}
+    scheduler._gpu_lifecycle_metadata = {}
+
+    scheduler._publish_gpu_eviction_metadata(
+        {
+            offload_key: OffloadEvictionMetadata(
+                lifecycle_value=FanoutLifecycleState.HOT.value,
+                reuse_score=256,
+                fanout=8,
+                residency_value=1024,
+                prefix_position=0.25,
+            )
+        },
+        {offload_key: observation},
+    )
+    assert (
+        pool._gpu_eviction_metadata[block.block_id].lifecycle_value
+        == FanoutLifecycleState.HOT.value
+    )
+
+    scheduler._fanout_step = 2
+    scheduler._publish_gpu_eviction_metadata({}, {})
+    assert (
+        pool._gpu_eviction_metadata[block.block_id].lifecycle_value
+        == FanoutLifecycleState.COOLING.value
+    )
+
+    scheduler._fanout_step = 4
+    scheduler._publish_gpu_eviction_metadata({}, {})
+    assert (
+        pool._gpu_eviction_metadata[block.block_id].lifecycle_value
+        == FanoutLifecycleState.COLD.value
+    )
+
+    pool.evict_blocks({block.block_id})
+    scheduler._fanout_step = 5
+    scheduler._publish_gpu_eviction_metadata({}, {})
+    assert offload_key not in scheduler._gpu_lifecycle_locations
+    assert block.block_id not in pool._gpu_eviction_metadata
 
 
 @pytest.mark.parametrize(

@@ -1705,4 +1705,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
-    fork_execution_stats: tuple[str, int, int, int, int] | None
+    fork_execution_stats: tuple[str, int, int, int, int, int, int] | None

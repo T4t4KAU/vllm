@@ -576,6 +576,32 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             counter_fork_attention_singleton_ctas, per_engine_labelvalues
         )
 
+        counter_fork_attention_shared_queries = self._counter_cls(
+            name="vllm:fork_attention_shared_queries",
+            documentation=(
+                "Decode queries participating in at least one physically shared "
+                "ForkAttention CTA, accumulated once per step."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_fork_attention_shared_queries = create_metric_per_engine(
+            counter_fork_attention_shared_queries, per_engine_labelvalues
+        )
+
+        histogram_fork_attention_query_cohort_size = self._histogram_cls(
+            name="vllm:fork_attention_query_cohort_size",
+            documentation=(
+                "Maximum number of decode queries aggregated by one physical "
+                "ForkAttention CTA in a model execution step."
+            ),
+            labelnames=labelnames,
+            buckets=[1, 2, 4, 8, 16, 32],
+        )
+        self.histogram_fork_attention_query_cohort_size = create_metric_per_engine(
+            histogram_fork_attention_query_cohort_size,
+            per_engine_labelvalues,
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1132,13 +1158,27 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             fork_stats = scheduler_stats.fork_execution_stats
             if fork_stats is not None:
-                _, _, _, shared_ctas, singleton_ctas = fork_stats
+                (
+                    _,
+                    _,
+                    _,
+                    shared_ctas,
+                    singleton_ctas,
+                    shared_queries,
+                    max_aggregated_queries,
+                ) = fork_stats
                 self.counter_fork_attention_observed_steps[engine_idx].inc()
                 if shared_ctas > 0:
                     self.counter_fork_attention_active_steps[engine_idx].inc()
                 self.counter_fork_attention_shared_ctas[engine_idx].inc(shared_ctas)
                 self.counter_fork_attention_singleton_ctas[engine_idx].inc(
                     singleton_ctas
+                )
+                self.counter_fork_attention_shared_queries[engine_idx].inc(
+                    shared_queries
+                )
+                self.histogram_fork_attention_query_cohort_size[engine_idx].observe(
+                    max_aggregated_queries
                 )
 
             self.counter_prefix_cache_queries[engine_idx].inc(

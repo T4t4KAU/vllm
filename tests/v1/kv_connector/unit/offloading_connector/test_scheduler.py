@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
 )
+from vllm.v1.core.block_pool import GPUBlockEvictionMetadata
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
@@ -30,6 +31,107 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.request import RequestStatus
+
+
+def test_fanout_offload_binds_gpu_block_pool(request_runner) -> None:
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        extra_config_overrides={
+            "fanout_offload": True,
+            "fanout_budget_blocks": 4,
+            "fanout_chunk_blocks": 1,
+        },
+    )
+
+    block_pool = runner.scheduler.kv_cache_manager.block_pool
+    assert runner.connector_scheduler._gpu_block_pool is block_pool
+    assert block_pool._lifecycle_eviction_enabled
+
+
+def test_fanout_gpu_lifecycle_eviction_can_be_disabled(request_runner) -> None:
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        extra_config_overrides={
+            "fanout_offload": True,
+            "fanout_gpu_lifecycle_eviction": False,
+            "fanout_budget_blocks": 4,
+            "fanout_chunk_blocks": 1,
+        },
+    )
+
+    block_pool = runner.scheduler.kv_cache_manager.block_pool
+    assert runner.connector_scheduler._gpu_block_pool is None
+    assert not block_pool._lifecycle_eviction_enabled
+
+
+def test_fanout_prefix_hint_uses_resident_lifecycle_metadata(request_runner) -> None:
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        extra_config_overrides={"fanout_offload": True},
+    )
+    runner.new_request(token_ids=[0] * 12)
+    request = runner.scheduler.requests["0"]
+    req_status = runner.connector_scheduler._req_status["0"]
+    req_status.update_offload_keys()
+    keys = req_status.group_states[0].offload_keys
+    runner.connector_scheduler._gpu_lifecycle_metadata[keys[0]] = (
+        GPUBlockEvictionMetadata(
+            lifecycle_value=2,
+            fanout=8,
+            reuse_score=256,
+            prefix_position=0.5,
+        )
+    )
+
+    assert runner.connector_scheduler.get_fanout_prefix_hint(request) == (
+        2,
+        8,
+        256,
+        1,
+    )
+
+
+def test_completed_fanout_load_gets_minimum_gpu_residency(request_runner) -> None:
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=32,
+        async_scheduling=False,
+        extra_config_overrides={
+            "fanout_offload": True,
+            "fanout_budget_blocks": 4,
+            "fanout_chunk_blocks": 1,
+            "fanout_hot_prefix_min_residency_steps": 4,
+        },
+    )
+    runner.new_request(token_ids=[0] * 8)
+    runner.manager.prepare_store.side_effect = lambda keys, context: (
+        generate_store_output(keys)
+    )
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(0,),
+    )
+
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * 12)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, context: 1
+    runner.manager.prepare_store.side_effect = lambda keys, context: (
+        generate_store_output([])
+    )
+
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(0,),
+    )
+
+    block_pool = runner.scheduler.kv_cache_manager.block_pool
+    assert len(block_pool._load_protected_until) == 1
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])

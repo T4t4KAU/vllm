@@ -38,6 +38,14 @@ def _make_scheduler_for_admission(*, fork: bool):
         scheduler.vllm_config.attention_config.backend = AttentionBackendEnum.FORK_ATTN
         scheduler.fork_fanout_admission_window = 4
         scheduler.fork_fanout_admission_max_bypasses = 8
+        scheduler.fork_fanout_join_max_deferral_steps = 1
+        scheduler.fork_fanout_join_min_pending = 2
+        scheduler.fork_fanout_join_min_prefix_blocks = 1
+        scheduler.fork_fanout_arrival_wait_steps = 2
+        scheduler.fork_fanout_arrival_min_fanout = 4
+        scheduler.fork_fanout_reload_promotion_last_step = -1
+        scheduler.fork_fanout_join_deferral_counts = {}
+        scheduler.fork_fanout_arrival_wait_counts = {}
         scheduler.fork_fanout_preemption_window = 4
         scheduler.fork_fanout_preemption_min_fanout = 2
         scheduler.fork_fanout_gpu_hotset_enabled = True
@@ -548,3 +556,63 @@ def test_fork_fanout_admission_respects_bypass_limit() -> None:
         "private",
         "shared_2",
     ]
+
+
+def test_fork_fanout_promotes_ready_reload_cohort() -> None:
+    scheduler = _make_scheduler_for_admission(fork=True)
+    shared_1, shared_2 = create_requests(
+        2,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["shared_1", "shared_2"],
+    )
+    private = create_requests(
+        2,
+        num_tokens=32,
+        same_prompt=False,
+        req_ids=["unused", "private"],
+    )[1]
+    for request in (private, shared_1, shared_2):
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.skipped_waiting.add_request(request)
+        scheduler.finished_recving_kv_req_ids.add(request.request_id)
+
+    scheduler._promote_ready_fanout_reload_cohort()
+
+    assert [request.request_id for request in scheduler.skipped_waiting] == [
+        "shared_1",
+        "shared_2",
+        "private",
+    ]
+
+
+def test_fork_fanout_join_defers_decode_for_pending_reload_once() -> None:
+    scheduler = _make_scheduler_for_admission(fork=True)
+    running, pending_1, pending_2 = create_requests(
+        3,
+        num_tokens=32,
+        same_prompt=True,
+        req_ids=["running", "pending_1", "pending_2"],
+    )
+    running.status = RequestStatus.RUNNING
+    running.num_computed_tokens = 32
+    for request in (pending_1, pending_2):
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        scheduler.skipped_waiting.add_request(request)
+
+    assert scheduler._should_defer_for_fanout_join(running)
+    assert not scheduler._should_defer_for_fanout_join(running)
+    assert scheduler.fork_fanout_join_deferral_counts["running"] == 1
+
+
+def test_fork_fanout_waits_for_expected_hot_prefix_arrivals() -> None:
+    scheduler = _make_scheduler_for_admission(fork=True)
+    request = create_requests(1, num_tokens=32, req_ids=["hot"])[0]
+    scheduler.waiting.add_request(request)
+    scheduler.connector = MagicMock()
+    scheduler.connector.get_fanout_prefix_hint.return_value = (2, 8, 1024, 2)
+
+    assert scheduler._should_wait_for_hot_fanout_arrivals(request)
+    assert scheduler._should_wait_for_hot_fanout_arrivals(request)
+    assert not scheduler._should_wait_for_hot_fanout_arrivals(request)
+    assert scheduler.fork_fanout_arrival_wait_counts["hot"] == 2

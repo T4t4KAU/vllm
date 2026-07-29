@@ -30,6 +30,16 @@ class _TransferMetricName:
     STORE_SIZE = "vllm:kv_offload_store_size"
 
 
+class _LifecycleMetricName:
+    """Metrics for lifecycle-aware GPU residency and reload behavior."""
+
+    GPU_EVICTED_BLOCKS = "vllm:kv_offload_gpu_evicted_blocks"
+    GPU_RESIDENT_BLOCKS = "vllm:kv_offload_gpu_resident_blocks"
+    RELOAD_BLOCKS = "vllm:kv_offload_reload_blocks"
+    LOAD_PROTECTED_BLOCKS = "vllm:kv_offload_load_protected_blocks"
+    COALESCED_LOAD_WAITS = "vllm:kv_offload_coalesced_load_waits"
+
+
 class _TransferType:
     """Transfer direction labels for deprecated CPU offload metrics."""
 
@@ -73,6 +83,32 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _TransferMetricName.STORE_SIZE: OffloadingHistogramMetadata(
             documentation="Histogram of KV offload store operation size, in bytes.",
             buckets=TRANSFER_SIZE_BUCKETS,
+        ),
+        _LifecycleMetricName.GPU_EVICTED_BLOCKS: OffloadingCounterMetadata(
+            documentation=(
+                "GPU prefix-cache blocks evicted by lifecycle-aware residency."
+            ),
+            labelnames=("lifecycle",),
+        ),
+        _LifecycleMetricName.GPU_RESIDENT_BLOCKS: OffloadingGaugeMetadata(
+            documentation="GPU prefix-cache blocks classified by lifecycle.",
+            labelnames=("lifecycle",),
+        ),
+        _LifecycleMetricName.RELOAD_BLOCKS: OffloadingCounterMetadata(
+            documentation=(
+                "Offload blocks reloaded to GPU, classified at load admission."
+            ),
+            labelnames=("lifecycle",),
+        ),
+        _LifecycleMetricName.LOAD_PROTECTED_BLOCKS: OffloadingCounterMetadata(
+            documentation=(
+                "GPU blocks granted minimum residency after an offload load."
+            ),
+        ),
+        _LifecycleMetricName.COALESCED_LOAD_WAITS: OffloadingCounterMetadata(
+            documentation=(
+                "Requests delayed behind an in-flight load of the same KV key."
+            ),
         ),
     }
 

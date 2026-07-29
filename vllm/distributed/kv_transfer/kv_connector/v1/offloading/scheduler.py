@@ -25,10 +25,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
+    _LifecycleMetricName,
     _TransferMetricName,
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
+from vllm.v1.core.block_pool import BlockPool, GPUBlockEvictionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -62,6 +64,16 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 DEFAULT_FANOUT_CHUNK_TOKENS = 2048
+
+
+def _lifecycle_label(value: int) -> str:
+    if value == FanoutLifecycleState.HOT.value:
+        return "hot"
+    if value == FanoutLifecycleState.COOLING.value:
+        return "cooling"
+    if value == FanoutLifecycleState.COLD.value:
+        return "cold"
+    return "unclassified"
 
 
 def _resolve_fanout_chunk_blocks(
@@ -221,6 +233,7 @@ class FanoutLifecycle:
     min_resident_until_step: int = 0
     last_hot_step: int = 0
     last_observed_step: int = 0
+    lifecycle_state: FanoutLifecycleState = FanoutLifecycleState.COLD
 
 
 @dataclass(slots=True)
@@ -235,6 +248,10 @@ class FanoutCandidateObservation:
     reuse_score: int
     is_active_tail: bool
     needs_backup: bool = True
+    physical_block_ids: set[int] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.physical_block_ids.add(self.physical_block_id)
 
     def merge(self, other: "FanoutCandidateObservation") -> None:
         self.fanout = max(self.fanout, other.fanout)
@@ -242,6 +259,7 @@ class FanoutCandidateObservation:
         self.reuse_score = max(self.reuse_score, other.reuse_score)
         self.is_active_tail = self.is_active_tail or other.is_active_tail
         self.needs_backup = self.needs_backup or other.needs_backup
+        self.physical_block_ids.update(other.physical_block_ids)
 
 
 @dataclass(slots=True)
@@ -261,6 +279,10 @@ class TransferJobStatus:
     # Store src block IDs that may be freed before the request finishes.
     # Registered in _block_id_to_pending_jobs at store creation time.
     sliding_window_block_ids: list[int] | None = None
+    # Load destination blocks receive a soft minimum-residency window once
+    # every worker has completed the transfer.
+    loaded_block_ids: list[int] | None = None
+    load_lifecycle_counts: Counter[int] | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -324,6 +346,7 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     fanout_offload: bool
+    fanout_gpu_lifecycle_eviction: bool
     fanout_chunk_blocks: int
     fanout_budget_blocks: int
     fanout_min_fanout: int
@@ -406,6 +429,9 @@ class SchedulerOffloadConfig(NamedTuple):
                 backend is not None and backend.name == "FORK_ATTN",
             )
         )
+        fanout_gpu_lifecycle_eviction = bool(
+            spec.extra_config.get("fanout_gpu_lifecycle_eviction", True)
+        )
         fanout_budget_blocks = int(spec.extra_config.get("fanout_budget_blocks", 64))
         min_offloaded_block_size = min(
             gpu_block_size * spec.block_size_factor
@@ -475,6 +501,7 @@ class SchedulerOffloadConfig(NamedTuple):
         if fanout_offload:
             logger.info(
                 "Fanout KV offload enabled: layerwise_load=%s, "
+                "gpu_lifecycle_eviction=%s, "
                 "chunk_blocks=%d, budget_blocks=%d, min_fanout=%d, "
                 "hot_prefix_min_fanout=%d, hot_prefix_max_position=%.3f, "
                 "hot_prefix_min_reuse_blocks=%d, "
@@ -486,6 +513,7 @@ class SchedulerOffloadConfig(NamedTuple):
                 "estimated_load_bytes=%d, "
                 "threshold_bytes=%d, profile=%s",
                 fanout_layerwise_load,
+                fanout_gpu_lifecycle_eviction,
                 fanout_chunk_blocks,
                 fanout_budget_blocks,
                 fanout_min_fanout,
@@ -534,6 +562,7 @@ class SchedulerOffloadConfig(NamedTuple):
             block_size_factor=spec.block_size_factor,
             offload_prompt_only=spec.offload_prompt_only,
             fanout_offload=fanout_offload,
+            fanout_gpu_lifecycle_eviction=fanout_gpu_lifecycle_eviction,
             fanout_chunk_blocks=fanout_chunk_blocks,
             fanout_budget_blocks=fanout_budget_blocks,
             fanout_min_fanout=fanout_min_fanout,
@@ -664,6 +693,7 @@ class OffloadingConnectorScheduler:
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats: OffloadingConnectorStats | None = None
+        self._gpu_block_pool: BlockPool | None = None
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -696,6 +726,7 @@ class OffloadingConnectorScheduler:
         self._blocks_being_loaded: set[OffloadKey] | None = (
             set() if spec.vllm_config.cache_config.enable_prefix_caching else None
         )
+        self._requests_waiting_on_load: set[ReqId] = set()
 
         # Job ID counter shared by loads and stores.
         self._job_counter: int = 0
@@ -731,6 +762,74 @@ class OffloadingConnectorScheduler:
         self._fanout_admitted_locations: dict[
             OffloadKey, set[tuple[ReqId, int, int]]
         ] = {}
+        # Keep lifecycle metadata after the last request releases a cached
+        # prefix. Expected hashes prevent a recycled physical block from
+        # inheriting stale value.
+        self._gpu_lifecycle_locations: dict[OffloadKey, dict[int, Any]] = {}
+        self._gpu_lifecycle_metadata: dict[OffloadKey, GPUBlockEvictionMetadata] = {}
+
+    def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
+        """Bind GPU residency metadata to the scheduler-owned block pool."""
+        if (
+            not self.config.fanout_offload
+            or not self.config.fanout_gpu_lifecycle_eviction
+        ):
+            return
+        self._gpu_block_pool = gpu_block_pool
+        gpu_block_pool.enable_lifecycle_eviction()
+
+    def get_fanout_prefix_hint(
+        self,
+        request: Request,
+    ) -> tuple[int, int, int, int] | None:
+        """Return lifecycle, fanout, reuse, and length for a resident prefix."""
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return None
+        req_status.update_offload_keys()
+        best: tuple[int, int, int, int] | None = None
+        for group_config, group_state in zip(
+            self.config.kv_group_configs,
+            req_status.group_states,
+        ):
+            for logical_idx, offload_key in enumerate(group_state.offload_keys):
+                metadata = self._gpu_lifecycle_metadata.get(offload_key)
+                if metadata is None:
+                    continue
+                prefix_blocks = (
+                    logical_idx + 1
+                ) * group_config.hash_block_size_factor
+                candidate = (
+                    metadata.lifecycle_value,
+                    metadata.fanout,
+                    metadata.reuse_score,
+                    prefix_blocks,
+                )
+                if best is None or (
+                    candidate[2],
+                    candidate[1],
+                    candidate[3],
+                    candidate[0],
+                ) > (
+                    best[2],
+                    best[1],
+                    best[3],
+                    best[0],
+                ):
+                    best = candidate
+        return best
+
+    def _increase_counter(
+        self,
+        metric_name: str,
+        value: int | float,
+        labelvalues: tuple[str, ...] = (),
+    ) -> None:
+        if not value:
+            return
+        if self._connector_stats is None:
+            self._connector_stats = OffloadingConnectorStats()
+        self._connector_stats.increase_counter(metric_name, value, labelvalues)
 
     def _record_fanout_admission(
         self,
@@ -782,6 +881,7 @@ class OffloadingConnectorScheduler:
     def _forget_fanout_request(
         self, req_id: ReqId, req_status: RequestOffloadState
     ) -> None:
+        self._requests_waiting_on_load.discard(req_id)
         for group_idx, group_state in enumerate(req_status.group_states):
             for logical_idx in group_state.fanout_admitted_block_indices:
                 if logical_idx >= len(group_state.offload_keys):
@@ -893,6 +993,7 @@ class OffloadingConnectorScheduler:
                     step + self.config.fanout_hot_prefix_min_residency_steps
                 )
             lifecycle.last_hot_step = step
+            lifecycle.lifecycle_state = FanoutLifecycleState.HOT
             return FanoutLifecycleState.HOT, lifecycle
 
         lifecycle.hot_since_step = None
@@ -901,7 +1002,9 @@ class OffloadingConnectorScheduler:
             lifecycle.last_hot_step + self.config.fanout_hot_prefix_cooldown_steps,
         )
         if lifecycle.last_hot_step > 0 and step <= cooling_until:
+            lifecycle.lifecycle_state = FanoutLifecycleState.COOLING
             return FanoutLifecycleState.COOLING, lifecycle
+        lifecycle.lifecycle_state = FanoutLifecycleState.COLD
         return FanoutLifecycleState.COLD, lifecycle
 
     def _prune_fanout_lifecycle(self) -> None:
@@ -1160,13 +1263,21 @@ class OffloadingConnectorScheduler:
                     offload_keys = offload_keys[-sliding_window_size_in_blocks:]
                 if any(key in self._blocks_being_loaded for key in offload_keys):
                     # hit blocks are being loaded, delay request
+                    req_id = req_status.req.request_id
+                    if req_id not in self._requests_waiting_on_load:
+                        self._requests_waiting_on_load.add(req_id)
+                        self._increase_counter(
+                            _LifecycleMetricName.COALESCED_LOAD_WAITS,
+                            1,
+                        )
                     logger.debug(
                         "Delaying request %s since some of its"
                         " blocks are already being loaded",
-                        req_status.req.request_id,
+                        req_id,
                     )
                     return None
 
+        self._requests_waiting_on_load.discard(req_status.req.request_id)
         logger.debug(
             "Request %s hit %s offloaded tokens after %s GPU hit tokens",
             req_status.req.request_id,
@@ -1335,6 +1446,14 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            loaded_block_ids=list(dst_block_ids),
+            load_lifecycle_counts=Counter(
+                self._fanout_lifecycle.get(
+                    key,
+                    FanoutLifecycle(),
+                ).lifecycle_state.value
+                for key in keys_to_load
+            ),
         )
 
         if self._blocks_being_loaded is not None:
@@ -1635,6 +1754,7 @@ class OffloadingConnectorScheduler:
                 prefix_position=prefix_position,
             )
         self.manager.update_eviction_metadata(eviction_metadata, replace=True)
+        self._publish_gpu_eviction_metadata(eviction_metadata, observations)
 
         self._prune_fanout_lifecycle()
         plan = planner.select(
@@ -1675,6 +1795,135 @@ class OffloadingConnectorScheduler:
                 ),
             )
         return selected
+
+    def _publish_gpu_eviction_metadata(
+        self,
+        eviction_metadata: dict[OffloadKey, OffloadEvictionMetadata],
+        observations: dict[OffloadKey, FanoutCandidateObservation],
+    ) -> None:
+        block_pool = self._gpu_block_pool
+        if block_pool is None:
+            return
+
+        def remember_location(offload_key: OffloadKey, block_id: int) -> None:
+            if block_id <= 0 or block_id >= block_pool.num_gpu_blocks:
+                return
+            block_hash = block_pool.blocks[block_id].block_hash
+            if block_hash is None:
+                return
+            self._gpu_lifecycle_locations.setdefault(offload_key, {})[block_id] = (
+                block_hash
+            )
+
+        for offload_key, observation in observations.items():
+            for block_id in observation.physical_block_ids:
+                remember_location(offload_key, block_id)
+
+        for offload_key, locations in self._fanout_admitted_locations.items():
+            if offload_key not in eviction_metadata:
+                continue
+            for req_id, group_idx, logical_idx in locations:
+                req_status = self._req_status.get(req_id)
+                if req_status is None:
+                    continue
+                group_state = req_status.group_states[group_idx]
+                physical_idx = logical_idx * self.config.block_size_factor
+                if physical_idx >= len(group_state.block_ids):
+                    continue
+                block_id = group_state.block_ids[physical_idx]
+                remember_location(offload_key, block_id)
+
+        current_metadata = {
+            offload_key: GPUBlockEvictionMetadata(
+                lifecycle_value=value.lifecycle_value,
+                reuse_score=value.reuse_score,
+                fanout=value.fanout,
+                residency_value=value.residency_value,
+                prefix_position=value.prefix_position,
+            )
+            for offload_key, value in eviction_metadata.items()
+        }
+        self._gpu_lifecycle_metadata.update(current_metadata)
+
+        gpu_metadata: dict[int, GPUBlockEvictionMetadata] = {}
+        for offload_key, locations in list(self._gpu_lifecycle_locations.items()):
+            valid_locations = {
+                block_id: expected_hash
+                for block_id, expected_hash in locations.items()
+                if block_pool.blocks[block_id].block_hash == expected_hash
+            }
+            if not valid_locations:
+                del self._gpu_lifecycle_locations[offload_key]
+                self._gpu_lifecycle_metadata.pop(offload_key, None)
+                continue
+            self._gpu_lifecycle_locations[offload_key] = valid_locations
+
+            candidate = self._gpu_lifecycle_metadata.get(offload_key)
+            if candidate is None:
+                continue
+            if offload_key not in current_metadata:
+                candidate = GPUBlockEvictionMetadata(
+                    lifecycle_value=self._age_gpu_lifecycle(offload_key).value,
+                    reuse_score=candidate.reuse_score,
+                    fanout=candidate.fanout,
+                    residency_value=candidate.residency_value,
+                    prefix_position=candidate.prefix_position,
+                )
+                self._gpu_lifecycle_metadata[offload_key] = candidate
+
+            for block_id in valid_locations:
+                previous = gpu_metadata.get(block_id)
+                if previous is None:
+                    gpu_metadata[block_id] = candidate
+                else:
+                    gpu_metadata[block_id] = GPUBlockEvictionMetadata(
+                        lifecycle_value=max(
+                            previous.lifecycle_value,
+                            candidate.lifecycle_value,
+                        ),
+                        reuse_score=max(
+                            previous.reuse_score,
+                            candidate.reuse_score,
+                        ),
+                        fanout=max(previous.fanout, candidate.fanout),
+                        residency_value=max(
+                            previous.residency_value,
+                            candidate.residency_value,
+                        ),
+                        prefix_position=min(
+                            previous.prefix_position,
+                            candidate.prefix_position,
+                        ),
+                    )
+        block_pool.update_gpu_eviction_metadata(
+            gpu_metadata,
+            current_step=self._fanout_step,
+            replace=True,
+        )
+
+    def _age_gpu_lifecycle(
+        self,
+        offload_key: OffloadKey,
+    ) -> FanoutLifecycleState:
+        lifecycle = self._fanout_lifecycle.get(offload_key)
+        if lifecycle is None:
+            return FanoutLifecycleState.COLD
+        if (
+            lifecycle.lifecycle_state is FanoutLifecycleState.HOT
+            and lifecycle.last_hot_step == self._fanout_step
+        ):
+            return FanoutLifecycleState.HOT
+
+        lifecycle.hot_since_step = None
+        cooling_until = max(
+            lifecycle.min_resident_until_step,
+            lifecycle.last_hot_step + self.config.fanout_hot_prefix_cooldown_steps,
+        )
+        if lifecycle.last_hot_step > 0 and self._fanout_step <= cooling_until:
+            lifecycle.lifecycle_state = FanoutLifecycleState.COOLING
+        else:
+            lifecycle.lifecycle_state = FanoutLifecycleState.COLD
+        return lifecycle.lifecycle_state
 
     def _build_store_jobs(
         self,
@@ -2004,6 +2253,29 @@ class OffloadingConnectorScheduler:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
                 self.manager.complete_load(job_status.keys, req_status.req_context)
+                if job_status.load_lifecycle_counts is not None:
+                    for (
+                        lifecycle_value,
+                        num_blocks,
+                    ) in job_status.load_lifecycle_counts.items():
+                        self._increase_counter(
+                            _LifecycleMetricName.RELOAD_BLOCKS,
+                            num_blocks,
+                            (_lifecycle_label(lifecycle_value),),
+                        )
+                loaded_block_ids = job_status.loaded_block_ids or []
+                if self._gpu_block_pool is not None and loaded_block_ids:
+                    self._gpu_block_pool.mark_loaded_blocks(
+                        loaded_block_ids,
+                        current_step=self._fanout_step,
+                        min_residency_steps=(
+                            self.config.fanout_hot_prefix_min_residency_steps
+                        ),
+                    )
+                    self._increase_counter(
+                        _LifecycleMetricName.LOAD_PROTECTED_BLOCKS,
+                        sum(block_id != 0 for block_id in loaded_block_ids),
+                    )
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(job_status.keys)
             if self._block_id_to_pending_jobs:
@@ -2024,6 +2296,25 @@ class OffloadingConnectorScheduler:
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
+        if self._gpu_block_pool is not None:
+            for (
+                lifecycle_value,
+                count,
+            ) in self._gpu_block_pool.drain_lifecycle_eviction_counts().items():
+                self._increase_counter(
+                    _LifecycleMetricName.GPU_EVICTED_BLOCKS,
+                    count,
+                    (_lifecycle_label(lifecycle_value),),
+                )
+            lifecycle_counts = self._gpu_block_pool.get_lifecycle_block_counts()
+            if self._connector_stats is None:
+                self._connector_stats = OffloadingConnectorStats()
+            for lifecycle_state in FanoutLifecycleState:
+                self._connector_stats.set_gauge(
+                    _LifecycleMetricName.GPU_RESIDENT_BLOCKS,
+                    lifecycle_counts.get(lifecycle_state.value, 0),
+                    (_lifecycle_label(lifecycle_state.value),),
+                )
         stats = self._connector_stats
         self._connector_stats = None
 
@@ -2121,6 +2412,8 @@ class OffloadingConnectorScheduler:
         self._fanout_lifecycle.clear()
         self._fanout_admitted_keys.clear()
         self._fanout_admitted_locations.clear()
+        self._gpu_lifecycle_locations.clear()
+        self._gpu_lifecycle_metadata.clear()
         self._fanout_step = 0
 
         # Discard jobs and save job_counter to be able to discard worker responses
@@ -2136,6 +2429,7 @@ class OffloadingConnectorScheduler:
         # The load flush IDs collected above must be delivered to workers.
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.clear()
+        self._requests_waiting_on_load.clear()
 
     def shutdown(self) -> None:
         self.manager.shutdown()
