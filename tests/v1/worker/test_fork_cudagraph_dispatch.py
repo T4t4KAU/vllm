@@ -109,7 +109,7 @@ def test_fork_cudagraph_dispatch_has_flash_and_fork_decode_graphs(
     assert forest_desc.fork_plan == ForkGraphPlan("forest", 512)
 
 
-def test_fork_forest_graph_uses_smallest_cta_bucket(
+def test_fork_forest_graph_uses_conservative_cta_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_FORK_ATTN_ENABLE_FOREST_CUDAGRAPH", True)
@@ -123,15 +123,18 @@ def test_fork_forest_graph_uses_smallest_cta_bucket(
             block_size=16,
             seq_lens=[4097] * 8,
         )
-        == 64
+        == 256
     )
+    # The available graph buckets stop at 512 CTAs. An unknown 40-request
+    # topology can require up to 1,280 CTAs, so it must use the dynamic path
+    # rather than replay an undersized graph.
     assert (
         manager.get_fork_forest_cta_bucket(
             num_reqs=40,
             block_size=16,
             seq_lens=[8193] * 40,
         )
-        == 384
+        is None
     )
 
 

@@ -85,9 +85,7 @@ def _get_fork_adaptive_prefix_chunk_blocks(
 
     hratio = num_query_heads // num_kv_heads
     prefix_queries_per_cta = max(1, 32 // hratio)
-    prefix_cohorts = (
-        num_reqs + prefix_queries_per_cta - 1
-    ) // prefix_queries_per_cta
+    prefix_cohorts = (num_reqs + prefix_queries_per_cta - 1) // prefix_queries_per_cta
     base_chunks = (prefix_blocks + base_chunk_blocks - 1) // base_chunk_blocks
     target_plan_ctas = (target_waves * num_sms + num_kv_heads - 1) // num_kv_heads
     required_prefix_ctas = max(0, target_plan_ctas - num_reqs)
@@ -119,27 +117,16 @@ def _estimate_fork_forest_ctas(
     if any(seq_len <= 0 for seq_len in seq_lens):
         return None
 
-    complete_blocks = [seq_len // block_size for seq_len in seq_lens]
-    partial_segments = [1 if seq_len % block_size else 0 for seq_len in seq_lens]
-    max_complete_blocks = max(complete_blocks)
-    if max_complete_blocks <= 0 and not any(partial_segments):
-        return None
-
-    chunk_blocks = _get_fork_prefix_chunk_blocks(
-        block_size,
-        max(1, max_complete_blocks),
-    )
+    # Sequence lengths do not encode forest branch points. A length-based
+    # estimate can therefore be smaller than the boxes produced by the runtime
+    # forest planner (for example, 64 estimated CTAs versus 86 actual CTAs).
+    # CUDA Graph replay requires a hard capacity bound, so reserve the maximum
+    # supported split count for every active request. If no captured bucket can
+    # hold that conservative bound, dispatch falls back to the dynamic path
+    # instead of selecting an undersized graph workspace and killing the
+    # engine.
     max_splits = _get_fork_forest_max_splits(block_size, max_model_len)
-    branch_slack = min(4, max_splits)
-    estimated_ctas = 0
-    for blocks, has_partial in zip(complete_blocks, partial_segments):
-        splits = 0
-        if blocks > 0:
-            splits += (blocks + chunk_blocks - 1) // chunk_blocks
-        splits += has_partial
-        splits = min(max_splits, splits + branch_slack)
-        estimated_ctas += max(1, splits)
-    return estimated_ctas
+    return len(seq_lens) * max_splits
 
 
 class AttentionState(NamedTuple):
