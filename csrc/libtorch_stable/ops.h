@@ -198,6 +198,26 @@ void merge_attn_states(
     const std::optional<int64_t> prefill_tokens_with_context,
     const std::optional<torch::stable::Tensor>& output_scale = std::nullopt);
 
+#if !defined(USE_ROCM) && defined(VLLM_ENABLE_FORK_ATTENTION)
+namespace vllm::fork_attention {
+void fork_attention(torch::stable::Tensor& out,
+                    torch::stable::Tensor& softmax_lse,
+                    torch::stable::Tensor& split_out,
+                    torch::stable::Tensor& split_lse,
+                    const torch::stable::Tensor& q,
+                    const torch::stable::Tensor& k_cache,
+                    const torch::stable::Tensor& v_cache,
+                    const torch::stable::Tensor& num_split_per_seq,
+                    const std::vector<torch::stable::Tensor>& query_tables,
+                    const std::vector<torch::stable::Tensor>& block_tables,
+                    const std::vector<torch::stable::Tensor>& num_seqs_per_ctas,
+                    const std::vector<torch::stable::Tensor>& cta_ranks,
+                    const std::vector<torch::stable::Tensor>& kv_in_ctas,
+                    const std::vector<int64_t>& mnw, int64_t max_split_per_seq,
+                    double softmax_scale);
+}  // namespace vllm::fork_attention
+#endif
+
 torch::stable::Tensor hadacore_transform(torch::stable::Tensor& x,
                                          bool inplace);
 

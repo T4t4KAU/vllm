@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 
@@ -129,4 +130,37 @@ def test_block_tables_apply_staged_writes_single_group():
     assert torch.equal(
         block_tables.block_tables[0].gpu[0, :2],
         torch.tensor([1, 2], dtype=torch.int32, device=device),
+    )
+
+
+def test_block_tables_cpu_copy_tracks_overwrite_and_append():
+    block_tables = BlockTables(
+        block_sizes=[16],
+        max_num_reqs=3,
+        max_num_batched_tokens=16,
+        max_num_blocks_per_group=[4],
+        device=torch.device("cuda"),
+        kernel_block_sizes=[16],
+        maintain_cpu_copy=True,
+    )
+    block_tables.append_block_ids(0, ([4, 5],), overwrite=True)
+    block_tables.append_block_ids(0, ([6],), overwrite=False)
+    block_tables.append_block_ids(1, ([8, 9],), overwrite=True)
+
+    np.testing.assert_array_equal(
+        block_tables.block_tables_cpu[0],
+        np.array(
+            [
+                [4, 5, 6, 0],
+                [8, 9, 0, 0],
+                [0, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        ),
+    )
+
+    block_tables.append_block_ids(0, ([11],), overwrite=True)
+    np.testing.assert_array_equal(
+        block_tables.block_tables_cpu[0][0],
+        np.array([11, 0, 0, 0], dtype=np.int32),
     )

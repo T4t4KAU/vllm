@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.config import (
@@ -23,6 +24,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     KVQuantMode,
@@ -553,6 +555,42 @@ def build_slot_mappings_by_layer(
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
     return slot_mappings_by_layer
+
+
+def uses_fork_attention_planner(group: AttentionGroup) -> bool:
+    """Whether a group can consume the runner's global CPU metadata.
+
+    Chunked local attention wraps its underlying backend and rewrites the GPU
+    metadata into virtual batches. Until the same transformation exists for
+    the CPU snapshot, its inherited ForkAttention backend must use the Flash
+    fallback.
+    """
+    return group.backend.get_name() == "FORK_ATTN" and not isinstance(
+        group.kv_cache_spec, ChunkedLocalAttentionSpec
+    )
+
+
+def set_fork_attention_cpu_metadata(
+    attn_groups: list[list[AttentionGroup]],
+    seq_lens_cpu: torch.Tensor,
+    block_tables_cpu: Sequence[np.ndarray],
+    block_table_indices: np.ndarray | None = None,
+) -> None:
+    """Provide exact CPU planning metadata to ForkAttention builders."""
+    for group_id, groups in enumerate(attn_groups):
+        if group_id >= len(block_tables_cpu):
+            break
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            setter = getattr(builder, "set_cpu_metadata", None)
+            if setter is not None:
+                setter(
+                    seq_lens_cpu,
+                    block_tables_cpu[group_id],
+                    block_table_indices,
+                )
 
 
 def build_attn_metadata(

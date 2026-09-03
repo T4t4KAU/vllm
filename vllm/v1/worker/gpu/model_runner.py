@@ -58,6 +58,8 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    set_fork_attention_cpu_metadata,
+    uses_fork_attention_planner,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -436,6 +438,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
+        maintain_cpu_block_tables = any(
+            uses_fork_attention_planner(group)
+            for groups in self.attn_groups
+            for group in groups
+        )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -446,6 +453,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            maintain_cpu_copy=maintain_cpu_block_tables,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
@@ -1026,6 +1034,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        if self.block_tables.maintain_cpu_copy:
+            set_fork_attention_cpu_metadata(
+                self.attn_groups,
+                input_batch.seq_lens_cpu_upper_bound,
+                self.block_tables.block_tables_cpu,
+                input_batch.idx_mapping_np,
+            )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
