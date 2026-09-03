@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
@@ -26,8 +27,10 @@ from vllm.v1.attention.backends.fork_attn import (
     ForkAttentionMetadataBuilder,
     _build_fork_plan,
     _flash_metadata_kwargs,
+    _ForkCUDAGraphWorkspace,
     _ForkPlanError,
     _ForkSegment,
+    _get_plan_cudagraph_requirements,
     _pack_fork_plan,
     _validate_fork_plan,
 )
@@ -48,6 +51,20 @@ def test_fork_backend_is_registered_without_full_cudagraph_support() -> None:
     assert not ForkAttentionBackend.supports_block_size(8)
     assert ForkAttentionBackend.supports_attn_type(AttentionType.DECODER)
     assert not ForkAttentionBackend.supports_attn_type(AttentionType.ENCODER)
+
+
+def test_fork_backend_enables_only_v2_single_token_cudagraphs() -> None:
+    v2_config = SimpleNamespace(use_v2_model_runner=True)
+    legacy_config = SimpleNamespace(use_v2_model_runner=False)
+
+    assert (
+        ForkAttentionMetadataBuilder.get_cudagraph_support(v2_config, None)
+        == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
+    assert (
+        ForkAttentionMetadataBuilder.get_cudagraph_support(legacy_config, None)
+        == AttentionCGSupport.NEVER
+    )
 
 
 @pytest.mark.parametrize(
@@ -332,6 +349,172 @@ def test_metadata_builder_reuses_persistent_buffers() -> None:
         ]
 
 
+def test_cudagraph_workspace_uses_one_fixed_forest_layout() -> None:
+    plan = _build_fork_plan(
+        query_start_locs=[0, 1, 2],
+        seq_lens=[33, 33],
+        block_rows=[[10, 11, 20], [10, 11, 21]],
+        num_actual_tokens=2,
+        block_size=16,
+        head_ratio=4,
+        require_shared=True,
+    )
+    assert plan is not None
+    workspace = _ForkCUDAGraphWorkspace(
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+        block_size=16,
+        max_model_len=64,
+        max_queries=8,
+        max_ctas=4,
+        max_splits=4,
+        device=torch.device("cpu"),
+    )
+
+    empty = workspace.pack(None, query_capacity=4, cta_capacity=4, split_capacity=4)
+    packed = workspace.pack(plan, query_capacity=4, cta_capacity=4, split_capacity=4)
+
+    assert empty["fork_mnw"] == packed["fork_mnw"]
+    assert len(packed["fork_query_tables"]) == 2
+    assert [tensor.shape[0] for tensor in packed["fork_query_tables"]] == [1, 4]
+    assert [tensor.data_ptr() for tensor in empty["fork_query_tables"]] == [
+        tensor.data_ptr() for tensor in packed["fork_query_tables"]
+    ]
+    assert packed["fork_num_split_per_seq"].tolist() == [2, 2, 0, 0]
+    assert sum(
+        int((num_seqs > 0).sum()) for num_seqs in packed["fork_num_seqs_per_ctas"]
+    ) == len(plan.segments)
+    cta_requirement, split_requirement = _get_plan_cudagraph_requirements(
+        plan,
+        head_ratio=4,
+        head_dim=128,
+        block_size=16,
+    )
+    assert cta_requirement <= 4
+    assert split_requirement == 2
+
+
+def test_cudagraph_workspace_rejects_insufficient_split_capacity() -> None:
+    plan = _build_fork_plan(
+        query_start_locs=[0, 1, 2],
+        seq_lens=[33, 33],
+        block_rows=[[10, 11, 20], [10, 11, 21]],
+        num_actual_tokens=2,
+        block_size=16,
+        head_ratio=4,
+        require_shared=True,
+    )
+    assert plan is not None
+    workspace = _ForkCUDAGraphWorkspace(
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+        block_size=16,
+        max_model_len=64,
+        max_queries=8,
+        max_ctas=4,
+        max_splits=4,
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(
+        fork_attn_backend._ForkWorkspaceLimitError,
+        match="split capacity",
+    ):
+        workspace.pack(
+            plan,
+            query_capacity=4,
+            cta_capacity=4,
+            split_capacity=1,
+        )
+
+
+def test_metadata_builder_reuses_prebuilt_cudagraph_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block_table = torch.tensor([[10, 11], [10, 12]], dtype=torch.int32)
+    seq_lens = torch.full((2,), 32, dtype=torch.int32)
+    metadata = _make_base_metadata(block_table, seq_lens)
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+    )
+    requirement = builder.prepare_cudagraph_plan(
+        seq_lens,
+        block_table.numpy(),
+        np.arange(2, dtype=np.int32),
+        32,
+    )
+    assert requirement is not None
+    prebuilt_plan = builder._fork_prebuilt_plan
+    assert prebuilt_plan is not None
+
+    def fail_rebuild(*args, **kwargs):
+        pytest.fail("the exact forest must not be rebuilt after dispatch")
+
+    monkeypatch.setattr(fork_attn_backend, "_build_fork_plan", fail_rebuild)
+    result = builder._build_fork_kwargs(
+        metadata,
+        torch.arange(3, dtype=torch.int32),
+        2,
+        _cpu_metadata(block_table, seq_lens),
+        prebuilt_plan,
+    )
+    assert result["fork_enabled"]
+
+
+def test_cudagraph_plan_rejects_block_ids_outside_the_kv_cache() -> None:
+    block_table = np.array([[10, 11], [10, 12]], dtype=np.int32)
+    seq_lens = np.full(2, 32, dtype=np.int32)
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+    )
+
+    with pytest.raises(_ForkPlanError, match="invalid block ID"):
+        builder.prepare_cudagraph_plan(
+            seq_lens,
+            block_table,
+            np.arange(2, dtype=np.int32),
+            num_kv_blocks=12,
+        )
+
+    assert builder._fork_prebuilt_plan is None
+
+
+def test_flash_cudagraph_fallback_does_not_rebuild_the_forest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    block_table = torch.tensor([[10, 11], [10, 12]], dtype=torch.int32)
+    seq_lens = torch.full((2,), 32, dtype=torch.int32)
+    metadata = _make_base_metadata(block_table, seq_lens)
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+    )
+    builder.set_cudagraph_plan(None, None, force_flash=True)
+
+    def fail_rebuild(*args, **kwargs):
+        pytest.fail("a Flash CUDA graph must not rebuild the forest")
+
+    monkeypatch.setattr(fork_attn_backend, "_build_fork_plan", fail_rebuild)
+    result = builder._build_fork_kwargs(
+        metadata,
+        torch.arange(3, dtype=torch.int32),
+        2,
+        _cpu_metadata(block_table, seq_lens),
+    )
+
+    assert result == {}
+
+
 def test_metadata_builder_falls_back_above_workspace_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -355,6 +538,84 @@ def test_metadata_builder_falls_back_above_workspace_limit(
         )
         == {}
     )
+
+
+def test_cudagraph_is_disabled_above_workspace_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+    )
+    monkeypatch.setattr(fork_attn_backend, "_MAX_FORK_WORKSPACE_BYTES", 1)
+
+    assert builder.get_cudagraph_max_reqs() == 0
+
+
+def test_cudagraph_workspace_matches_actual_capture_sizes() -> None:
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=64,
+        num_heads_kv=8,
+        head_dim=256,
+    )
+    builder.vllm_config.model_config.max_model_len = 4096
+    builder.vllm_config.scheduler_config.max_num_seqs = 127
+    builder.vllm_config.compilation_config.cudagraph_capture_sizes = [16]
+
+    assert builder._get_cudagraph_capture_limits() == (16, 32, 4)
+
+    workspace = builder._get_fork_cudagraph_workspace(torch.device("cpu"))
+    assert workspace.max_queries == 16
+    assert workspace.max_ctas == 32
+    assert workspace.max_splits == 4
+    assert workspace.split_out.shape == (16, 64, 4, 256)
+    assert [workspace.groups[tile].cta_capacity for tile in (32, 16)] == [8, 32]
+
+
+def test_cudagraph_workspace_uses_common_attention_group_limits() -> None:
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+    )
+    builder.set_cudagraph_workspace_limits(max_queries=4, max_splits=2)
+
+    workspace = builder._get_fork_cudagraph_workspace(torch.device("cpu"))
+    assert workspace.max_queries == 4
+    assert workspace.max_ctas == 16
+    assert workspace.max_splits == 2
+    assert workspace.split_out.shape == (4, 16, 2, 128)
+
+
+def test_cudagraph_workspace_keeps_only_capture_sizes_within_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _make_builder(
+        block_size=16,
+        num_heads_q=16,
+        num_heads_kv=4,
+        head_dim=128,
+    )
+    builder.vllm_config.compilation_config.cudagraph_capture_sizes = [2, 16]
+    size_for_two_queries = fork_attn_backend._fork_workspace_bytes(
+        2, 16, 128, 4
+    ) + fork_attn_backend._fork_cudagraph_metadata_bytes(
+        max_model_len=64,
+        block_size=16,
+        head_ratio=4,
+        cta_capacity=16,
+    )
+    monkeypatch.setattr(
+        fork_attn_backend,
+        "_MAX_FORK_WORKSPACE_BYTES",
+        size_for_two_queries,
+    )
+
+    assert builder._get_cudagraph_capture_limits() == (2, 16, 4)
 
 
 def test_fork_plan_falls_back_before_trie_above_cost_limit(
@@ -499,9 +760,22 @@ def _make_builder(
     builder.kv_cache_dtype = torch.float16
     builder.vllm_config = SimpleNamespace(
         use_v2_model_runner=True,
-        scheduler_config=SimpleNamespace(async_scheduling=False),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32, 64],
+        ),
+        scheduler_config=SimpleNamespace(
+            async_scheduling=False,
+            max_num_seqs=64,
+        ),
         speculative_config=None,
+        model_config=SimpleNamespace(
+            max_model_len=64,
+            is_mm_prefix_lm=False,
+        ),
     )
+    builder.dcp_world_size = 1
+    builder.kv_cache_spec = SimpleNamespace(sliding_window=None)
     return builder
 
 
