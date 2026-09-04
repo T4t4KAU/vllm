@@ -39,6 +39,14 @@ class BeamSearchOnlineMixin(ABC):
         temperature = params.temperature
         length_penalty = params.length_penalty
         include_stop_str_in_output = params.include_stop_str_in_output
+        kv_transfer_params = (params.extra_args or {}).get("kv_transfer_params")
+        if isinstance(kv_transfer_params, Mapping) and kv_transfer_params.get(
+            "do_remote_decode"
+        ):
+            raise ValueError(
+                "Beam search does not support output-side KV transfer "
+                "(do_remote_decode=true)."
+            )
 
         tokenizer = self.renderer.get_tokenizer()
         eos_token_id = tokenizer.eos_token_id
@@ -57,12 +65,6 @@ class BeamSearchOnlineMixin(ABC):
         tokenized_length = len(prompt_token_ids)
 
         logprobs_num = 2 * beam_width
-        sampling_params = SamplingParams(
-            logprobs=logprobs_num,
-            max_tokens=1,
-            temperature=temperature,
-            detokenize=False,
-        )
         all_beams = [
             BeamSearchSequence(
                 orig_prompt=prompt,
@@ -73,12 +75,27 @@ class BeamSearchOnlineMixin(ABC):
             )
         ]
         completed = []
+        first_internal_request = True
 
-        for _ in range(max_tokens):
+        for beam_step in range(max_tokens):
             tasks = []
             request_id_batch = f"{request_id}-{random_uuid()}"
 
             for i, beam in enumerate(all_beams):
+                extra_args = None
+                if params.extra_args is not None:
+                    extra_args = dict(params.extra_args)
+                    if not first_internal_request:
+                        # Connector-side remote blocks are one-shot inputs.
+                        extra_args.pop("kv_transfer_params", None)
+                    extra_args["agentrix_beam_step"] = beam_step
+                sampling_params = SamplingParams(
+                    logprobs=logprobs_num,
+                    max_tokens=1,
+                    temperature=temperature,
+                    detokenize=False,
+                    extra_args=extra_args,
+                )
                 prompt_item = beam.get_prompt()
                 lora_request_item = beam.lora_request
                 request_id_item = f"{request_id_batch}-beam-{i}"
@@ -94,6 +111,7 @@ class BeamSearchOnlineMixin(ABC):
                     )
                 )
                 tasks.append(task)
+                first_internal_request = False
 
             output = [x[0] for x in await asyncio.gather(*tasks)]
 

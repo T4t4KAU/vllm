@@ -73,11 +73,11 @@ There are several notable differences when using Ray:
 - Remote DP ranks will be allocated based on node resources of the Ray cluster
 
 By default, the internal DP load balancer uses the running and waiting queues
-in each engine. Agentrix can additionally use logical prefix affinity for long
-prompts:
+in each engine. Agentrix provides mutually exclusive prefix-aware and
+session-aware routing policies for long prompts:
 
 ```bash
-VLLM_FORK_ATTN_DP_PREFIX_ROUTING=1 \
+VLLM_AGENTRIX_DP_ROUTING_POLICY=prefix_aware \
 vllm serve $MODEL --data-parallel-size 4 --enable-prefix-caching
 ```
 
@@ -85,6 +85,39 @@ Prefix-aware routing keeps the native queue-based choice for short prompts.
 For eligible prompts, it prefers a rank that is likely to contain the longest
 matching prefix, subject to queue-load and estimated-work bounds. This feature
 does not move KV blocks between ranks or change KV cache memory management.
+
+Session-aware routing balances the first request in an agent session with the
+native queue-based policy, then applies prefix affinity to follow-up requests.
+It falls back to load balancing when the affine rank is overloaded or its
+matched prefix is too short relative to the optional expected history length:
+
+```bash
+VLLM_AGENTRIX_DP_ROUTING_POLICY=session_aware \
+vllm serve $MODEL --data-parallel-size 4 --enable-prefix-caching
+```
+
+Chat completions infer the zero-based turn from prior assistant messages. A
+client can override it, or provide exact metadata for completion requests,
+through `vllm_xargs`:
+
+```json
+{
+  "vllm_xargs": {
+    "agentrix_session_id": "conversation-42",
+    "agentrix_turn": 2,
+    "agentrix_history_tokens": 16384
+  }
+}
+```
+
+`agentrix_session_id` gives the router a direct, bounded-TTL affinity hint.
+When it is omitted, the router recovers affinity from the request's longest
+known prefix. A guarded rebalance updates the hint to the newly selected rank.
+
+`VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO` and
+`VLLM_AGENTRIX_DP_SESSION_HIT_RATIO` configure the two follow-up guards. The
+legacy `VLLM_FORK_ATTN_DP_PREFIX_ROUTING=1` setting remains an alias for the
+`prefix_aware` policy when the new policy variable is unset.
 
 The router currently requires internal load balancing, one API frontend
 process, prefix caching, and non-elastic DP. Its main tuning variables are

@@ -1101,3 +1101,5 @@ class BeamSearchParams(
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
     structured_outputs: StructuredOutputsParams | None = None
+    extra_args: dict[str, Any] | None = None
+    """Arbitrary additional args forwarded to each beam sampling request."""

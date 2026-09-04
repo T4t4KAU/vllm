@@ -13,6 +13,7 @@ from openai.types.chat.chat_completion_audio import (
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
 from pydantic import Field, PrivateAttr, model_serializer, model_validator
 
+from vllm import envs
 from vllm.config import ModelConfig
 from vllm.config.utils import replace
 from vllm.entrypoints.chat_utils import (
@@ -567,6 +568,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         "min_p": 0.0,
     }
 
+    def _get_extra_args(self) -> dict[str, Any] | None:
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if (
+            envs.VLLM_AGENTRIX_DP_ROUTING_POLICY == "session_aware"
+            and "agentrix_turn" not in extra_args
+        ):
+            extra_args["agentrix_turn"] = sum(
+                message.get("role") == "assistant" for message in self.messages
+            )
+        if self.kv_transfer_params:
+            # Pass in kv_transfer_params via extra_args
+            extra_args["kv_transfer_params"] = self.kv_transfer_params
+        return extra_args or None
+
     def to_beam_search_params(
         self, max_tokens: int, default_sampling_params: dict
     ) -> BeamSearchParams:
@@ -583,6 +598,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             temperature=temperature,
             length_penalty=self.length_penalty,
             include_stop_str_in_output=self.include_stop_str_in_output,
+            extra_args=self._get_extra_args(),
         )
 
     def to_sampling_params(
@@ -661,10 +677,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
-        if self.kv_transfer_params:
-            # Pass in kv_transfer_params via extra_args
-            extra_args["kv_transfer_params"] = self.kv_transfer_params
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -693,7 +705,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             bad_words=self.bad_words,
             thinking_token_budget=self.thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
-            extra_args=extra_args or None,
+            extra_args=self._get_extra_args(),
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
         )

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
 from threading import Thread
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar, cast
 
 import msgspec.msgpack
 import zmq
@@ -48,7 +48,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
-from vllm.v1.engine.prefix_router import PrefixAwareDPRouter
+from vllm.v1.engine.prefix_router import PrefixAwareDPRouter, RoutingPolicy
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -1424,19 +1424,25 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ) // client_count
 
         self.prefix_router: PrefixAwareDPRouter | None = None
-        if envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING:
+        routing_policy = envs.VLLM_AGENTRIX_DP_ROUTING_POLICY
+        if routing_policy not in ("native", "prefix_aware", "session_aware"):
+            raise ValueError(
+                "VLLM_AGENTRIX_DP_ROUTING_POLICY must be native, "
+                f"prefix_aware, or session_aware; got {routing_policy!r}"
+            )
+        if routing_policy != "native":
             if client_count != 1:
                 logger.warning(
-                    "Ignoring prefix-aware DP routing with multiple API frontend "
+                    "Ignoring Agentrix DP routing with multiple API frontend "
                     "processes because their routing state is not shared."
                 )
             elif vllm_config.parallel_config.enable_elastic_ep:
                 logger.warning(
-                    "Ignoring prefix-aware DP routing with elastic expert parallelism."
+                    "Ignoring Agentrix DP routing with elastic expert parallelism."
                 )
             elif not self.prefix_caching_enabled:
                 logger.warning(
-                    "Ignoring prefix-aware DP routing because prefix caching is "
+                    "Ignoring Agentrix DP routing because prefix caching is "
                     "disabled by one or more engine cores."
                 )
             else:
@@ -1452,10 +1458,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     ),
                     work_slack_tokens=(envs.VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS),
                     decode_token_weight=(envs.VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT),
+                    routing_policy=cast(RoutingPolicy, routing_policy),
+                    session_overload_ratio=(
+                        envs.VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO
+                    ),
+                    session_hit_ratio=envs.VLLM_AGENTRIX_DP_SESSION_HIT_RATIO,
                 )
                 logger.info(
-                    "Enabled prefix-aware DP routing: block_size=%d, "
+                    "Enabled Agentrix DP routing: policy=%s, block_size=%d, "
                     "load_slack=%d, warm_ttl=%.1fs, min_prefix_blocks=%d",
+                    routing_policy,
                     self.scheduler_block_size,
                     envs.VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK,
                     envs.VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL,

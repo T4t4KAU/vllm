@@ -123,6 +123,9 @@ if TYPE_CHECKING:
     VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_CHECKPOINTS: int = 262144
     VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS: int = 8192
     VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT: int = 16
+    VLLM_AGENTRIX_DP_ROUTING_POLICY: str = "native"
+    VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO: float = 2.0
+    VLLM_AGENTRIX_DP_SESSION_HIT_RATIO: float = 0.5
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1155,6 +1158,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT": lambda: int(
         os.getenv("VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT", "16")
+    ),
+    "VLLM_AGENTRIX_DP_ROUTING_POLICY": lambda: (
+        os.getenv(
+            "VLLM_AGENTRIX_DP_ROUTING_POLICY",
+            (
+                "prefix_aware"
+                if bool(int(os.getenv("VLLM_FORK_ATTN_DP_PREFIX_ROUTING", "0")))
+                else "native"
+            ),
+        )
+        .strip()
+        .lower()
+    ),
+    "VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO": lambda: float(
+        os.getenv("VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO", "2")
+    ),
+    "VLLM_AGENTRIX_DP_SESSION_HIT_RATIO": lambda: float(
+        os.getenv("VLLM_AGENTRIX_DP_SESSION_HIT_RATIO", "0.5")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

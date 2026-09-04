@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import math
 import time
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from vllm.v1.engine import EngineCoreEventType, FinishReason
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
 
 PrefixKey = tuple[int, int]
+RoutingPolicy = Literal["prefix_aware", "session_aware"]
 
 
 @dataclass(slots=True)
@@ -29,16 +31,18 @@ class _RequestPrefix:
     rank: int
     prefix: _Prefix
     work_units: int
+    session_id: str | None = None
     resident: bool = False
     uncomputed_token_ids: list[int] = field(default_factory=list)
 
 
 class PrefixAwareDPRouter:
-    """Logical prefix-affinity hints for vLLM's internal DP balancer.
+    """Agentrix routing policies for vLLM's internal DP balancer.
 
     Physical KV ownership remains entirely inside each engine. The router only
     remembers where eligible requests ran and keeps finished prefixes warm for
-    a bounded period. Load limits always take precedence over affinity.
+    a bounded period. Session-aware routing balances first turns and applies
+    prefix affinity to follow-up turns. Load limits always take precedence.
     """
 
     def __init__(
@@ -55,6 +59,9 @@ class PrefixAwareDPRouter:
         checkpoint_stride_blocks: int = 4,
         work_slack_tokens: int = 8192,
         decode_token_weight: int = 16,
+        routing_policy: RoutingPolicy = "prefix_aware",
+        session_overload_ratio: float = 2.0,
+        session_hit_ratio: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if num_ranks <= 1:
@@ -79,6 +86,12 @@ class PrefixAwareDPRouter:
             raise ValueError("work_slack_tokens must be non-negative")
         if decode_token_weight <= 0:
             raise ValueError("decode_token_weight must be positive")
+        if routing_policy not in ("prefix_aware", "session_aware"):
+            raise ValueError(f"unsupported DP routing policy: {routing_policy!r}")
+        if not math.isfinite(session_overload_ratio) or session_overload_ratio < 1:
+            raise ValueError("session_overload_ratio must be finite and at least 1")
+        if not math.isfinite(session_hit_ratio) or not 0 <= session_hit_ratio <= 1:
+            raise ValueError("session_hit_ratio must be finite and in [0, 1]")
 
         self.num_ranks = num_ranks
         self.block_size = block_size
@@ -91,6 +104,9 @@ class PrefixAwareDPRouter:
         self.checkpoint_stride_blocks = checkpoint_stride_blocks
         self.work_slack_tokens = work_slack_tokens
         self.decode_token_weight = decode_token_weight
+        self.routing_policy = routing_policy
+        self.session_overload_ratio = session_overload_ratio
+        self.session_hit_ratio = session_hit_ratio
         self._clock = clock
 
         self._requests: dict[str, _RequestPrefix] = {}
@@ -100,12 +116,21 @@ class PrefixAwareDPRouter:
         self._resident = [Counter[PrefixKey]() for _ in range(num_ranks)]
         self._warm_requests: deque[tuple[float, int, list[PrefixKey]]] = deque()
         self._num_warm_checkpoints = 0
+        self._session_routes: OrderedDict[str, tuple[float, int]] = OrderedDict()
 
         self.route_count = 0
         self.affinity_route_count = 0
         self.rank_route_counts = [0] * num_ranks
         self.routing_time_ns = 0
         self.last_affinity_blocks = 0
+        self.first_turn_balance_count = 0
+        self.followup_affinity_count = 0
+        self.followup_rebalance_count = 0
+        self.session_overload_rebalance_count = 0
+        self.session_cache_miss_rebalance_count = 0
+        self.session_id_route_count = 0
+        self.session_prefix_fallback_count = 0
+        self.unknown_turn_route_count = 0
 
     @staticmethod
     def _namespace(request: EngineCoreRequest) -> int | None:
@@ -228,6 +253,22 @@ class PrefixAwareDPRouter:
         now = self._clock()
         while self._warm_requests and self._warm_requests[0][0] <= now:
             self._drop_oldest_warm()
+        while self._session_routes:
+            _, (expires_at, _) = next(iter(self._session_routes.items()))
+            if expires_at > now:
+                break
+            self._session_routes.popitem(last=False)
+
+    def _remember_session(self, session_id: str, rank: int) -> None:
+        if self.max_warm_requests == 0 or self.warm_ttl_s == 0:
+            return
+        self._session_routes.pop(session_id, None)
+        self._session_routes[session_id] = (
+            self._clock() + self.warm_ttl_s,
+            rank,
+        )
+        while len(self._session_routes) > self.max_warm_requests:
+            self._session_routes.popitem(last=False)
 
     def _candidate_work(
         self,
@@ -243,6 +284,96 @@ class PrefixAwareDPRouter:
             + private_prompt_tokens
             + max_tokens * self.decode_token_weight
         )
+
+    @staticmethod
+    def _request_xarg(request: EngineCoreRequest, name: str) -> object | None:
+        sampling_params = request.sampling_params
+        extra_args = getattr(sampling_params, "extra_args", None)
+        if not isinstance(extra_args, dict):
+            return None
+        return extra_args.get(name)
+
+    @classmethod
+    def _request_nonnegative_int(
+        cls, request: EngineCoreRequest, name: str
+    ) -> int | None:
+        value = cls._request_xarg(request, name)
+        if isinstance(value, bool):
+            return None
+        if not isinstance(value, (int, str, bytes, bytearray)):
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 0 else None
+
+    @classmethod
+    def _request_session_id(cls, request: EngineCoreRequest) -> str | None:
+        value = cls._request_xarg(request, "agentrix_session_id")
+        if value is None or isinstance(value, bool):
+            return None
+        session_id = str(value).strip()
+        return session_id or None
+
+    def _session_affinity_allowed(
+        self,
+        request: EngineCoreRequest,
+        rank: int,
+        affinity_blocks: int,
+        load_scores: Sequence[int],
+        candidate_work: Sequence[int],
+    ) -> tuple[bool, Literal["hit", "miss", "overload"]]:
+        if affinity_blocks < self.min_prefix_blocks:
+            return False, "miss"
+
+        expected_history_tokens = self._request_nonnegative_int(
+            request, "agentrix_history_tokens"
+        )
+        if expected_history_tokens is not None and (
+            affinity_blocks * self.block_size
+            < expected_history_tokens * self.session_hit_ratio
+        ):
+            return False, "miss"
+
+        load_eligible = self._session_load_eligible_ranks(load_scores)
+        load_overloaded = rank not in load_eligible
+        work_overloaded = (
+            candidate_work[rank]
+            > min(candidate_work[candidate] for candidate in load_eligible)
+            + self.work_slack_tokens
+        )
+        if load_overloaded or work_overloaded:
+            return False, "overload"
+        return True, "hit"
+
+    def _session_load_eligible_ranks(self, load_scores: Sequence[int]) -> list[int]:
+        mean_load = sum(load_scores) / self.num_ranks
+        load_limit = self.session_overload_ratio * max(mean_load, 1.0)
+        min_load = min(load_scores)
+        return [
+            rank
+            for rank, load in enumerate(load_scores)
+            if load <= load_limit and load <= min_load + self.load_slack
+        ]
+
+    def _finish_route(
+        self,
+        request: EngineCoreRequest,
+        chosen_rank: int,
+        chosen_depth: int,
+        affinity_blocks: int,
+        started_ns: int,
+    ) -> int:
+        self._pending_work[request.request_id] = (
+            self._candidate_work(request, chosen_depth, chosen_rank)
+            - self._rank_work[chosen_rank]
+        )
+        self.route_count += 1
+        self.rank_route_counts[chosen_rank] += 1
+        self.last_affinity_blocks = affinity_blocks
+        self.routing_time_ns += time.perf_counter_ns() - started_ns
+        return chosen_rank
 
     def choose_rank(
         self,
@@ -267,6 +398,96 @@ class PrefixAwareDPRouter:
         self._pending_prefixes[request.request_id] = prefix
 
         load_scores = [waiting * 4 + running for waiting, running in engine_counts]
+        rank_matches = [
+            self._deepest_match(prefix.keys, self._resident[rank])
+            for rank in range(self.num_ranks)
+        ]
+        candidate_work = [
+            self._candidate_work(request, rank_matches[rank][0], rank)
+            for rank in range(self.num_ranks)
+        ]
+
+        session_turn = self._request_nonnegative_int(request, "agentrix_turn")
+        beam_step = self._request_nonnegative_int(request, "agentrix_beam_step")
+        if (
+            self.routing_policy == "session_aware"
+            and session_turn == 0
+            and (beam_step is None or beam_step == 0)
+        ):
+            self.first_turn_balance_count += 1
+            return self._finish_route(
+                request,
+                baseline_rank,
+                rank_matches[baseline_rank][0],
+                rank_matches[baseline_rank][0],
+                started_ns,
+            )
+
+        if self.routing_policy == "session_aware" and session_turn is not None:
+            session_id = self._request_session_id(request)
+            session_route = (
+                self._session_routes.get(session_id)
+                if session_id is not None and (beam_step is None or beam_step == 0)
+                else None
+            )
+            if session_route is not None:
+                assert session_id is not None
+                best_rank = session_route[1]
+                self.session_id_route_count += 1
+                self._remember_session(session_id, best_rank)
+            else:
+                best_rank = max(
+                    range(self.num_ranks),
+                    key=lambda rank: (
+                        rank_matches[rank],
+                        -candidate_work[rank],
+                        -load_scores[rank],
+                        -((rank - start_index) % self.num_ranks),
+                    ),
+                )
+                self.session_prefix_fallback_count += 1
+            affinity_blocks = rank_matches[best_rank][0]
+            allowed, reason = self._session_affinity_allowed(
+                request,
+                best_rank,
+                affinity_blocks,
+                load_scores,
+                candidate_work,
+            )
+            if allowed:
+                chosen_rank = best_rank
+            elif reason == "overload":
+                load_eligible = self._session_load_eligible_ranks(load_scores)
+                chosen_rank = min(
+                    load_eligible,
+                    key=lambda rank: (
+                        candidate_work[rank],
+                        load_scores[rank],
+                        (rank - start_index) % self.num_ranks,
+                    ),
+                )
+            else:
+                chosen_rank = baseline_rank
+            if allowed:
+                self.affinity_route_count += 1
+                self.followup_affinity_count += 1
+            else:
+                self.followup_rebalance_count += 1
+                if reason == "overload":
+                    self.session_overload_rebalance_count += 1
+                else:
+                    self.session_cache_miss_rebalance_count += 1
+            return self._finish_route(
+                request,
+                chosen_rank,
+                rank_matches[chosen_rank][0],
+                affinity_blocks,
+                started_ns,
+            )
+
+        if self.routing_policy == "session_aware":
+            self.unknown_turn_route_count += 1
+
         min_load = min(load_scores)
         load_eligible = [
             rank
@@ -274,16 +495,7 @@ class PrefixAwareDPRouter:
             if load <= min_load + self.load_slack
         ]
 
-        rank_matches: dict[int, tuple[int, int]] = {}
-        candidate_work: dict[int, int] = {}
-        for rank in load_eligible:
-            resident_depth, resident_fanout = self._deepest_match(
-                prefix.keys, self._resident[rank]
-            )
-            rank_matches[rank] = (resident_depth, resident_fanout)
-            candidate_work[rank] = self._candidate_work(request, resident_depth, rank)
-
-        min_work = min(candidate_work.values())
+        min_work = min(candidate_work[rank] for rank in load_eligible)
         work_eligible = [
             rank
             for rank in load_eligible
@@ -304,16 +516,13 @@ class PrefixAwareDPRouter:
             chosen_rank = best_rank
             self.affinity_route_count += 1
 
-        chosen_depth = rank_matches.get(chosen_rank, (0, 0))[0]
-        self._pending_work[request.request_id] = (
-            self._candidate_work(request, chosen_depth, chosen_rank)
-            - self._rank_work[chosen_rank]
+        return self._finish_route(
+            request,
+            chosen_rank,
+            rank_matches[chosen_rank][0],
+            affinity_blocks,
+            started_ns,
         )
-        self.route_count += 1
-        self.rank_route_counts[chosen_rank] += 1
-        self.last_affinity_blocks = affinity_blocks
-        self.routing_time_ns += time.perf_counter_ns() - started_ns
-        return chosen_rank
 
     def add_request(self, request: EngineCoreRequest, rank: int) -> None:
         prefix = self._pending_prefixes.pop(request.request_id, None)
@@ -327,8 +536,18 @@ class PrefixAwareDPRouter:
             request.request_id,
             self._candidate_work(request, 0, rank) - self._rank_work[rank],
         )
-        self._requests[request.request_id] = _RequestPrefix(rank, prefix, work_units)
+        beam_step = self._request_nonnegative_int(request, "agentrix_beam_step")
+        session_id = self._request_session_id(request)
+        if beam_step is not None and beam_step > 0:
+            if session_id is not None:
+                self._session_routes.pop(session_id, None)
+            session_id = None
+        self._requests[request.request_id] = _RequestPrefix(
+            rank, prefix, work_units, session_id=session_id
+        )
         self._rank_work[rank] += work_units
+        if self.routing_policy == "session_aware" and session_id is not None:
+            self._remember_session(session_id, rank)
 
     def _append_computed_tokens(
         self, record: _RequestPrefix, token_ids: Sequence[int]
@@ -479,6 +698,8 @@ class PrefixAwareDPRouter:
         if can_keep_warm:
             self._warm_requests.append((self._clock() + self.warm_ttl_s, rank, keys))
             self._num_warm_checkpoints += len(keys)
+            if self.routing_policy == "session_aware" and record.session_id is not None:
+                self._remember_session(record.session_id, rank)
             while (
                 len(self._warm_requests) > self.max_warm_requests
                 or self._num_warm_checkpoints > self.max_warm_checkpoints
@@ -492,6 +713,7 @@ class PrefixAwareDPRouter:
         self._resident = [Counter() for _ in range(self.num_ranks)]
         self._warm_requests.clear()
         self._num_warm_checkpoints = 0
+        self._session_routes.clear()
         for record in self._requests.values():
             record.resident = False
 
