@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections import defaultdict
 from unittest.mock import Mock
 
 import pytest
@@ -936,6 +937,8 @@ def test_preempt_during_execution():
         num_blocks=11,
         enable_prefix_caching=False,
     )
+    scheduler.log_stats = False
+    scheduler.preempted_req_ids_dict = defaultdict(set)
     requests = create_requests(num_requests=2, num_tokens=80, block_size=16)
 
     # Schedule the first request.
@@ -978,12 +981,15 @@ def test_preempt_during_execution():
         prompt_logprobs_dict={},
         pooler_output=[],
     )
-    scheduler.update_from_output(scheduler_output1, model_runner_output1)
+    engine_outputs = scheduler.update_from_output(
+        scheduler_output1, model_runner_output1
+    )
 
     # The second request (that is preempted) should be updated with the
     # sampled token id.
     assert len(requests[1].output_token_ids) == 1
     assert requests[1].output_token_ids[0] == 42
+    assert engine_outputs[0].preempted_requests == {requests[1].request_id}
 
 
 def test_scheduler_reset_prefix_cache():

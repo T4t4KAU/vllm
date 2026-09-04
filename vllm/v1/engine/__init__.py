@@ -83,6 +83,8 @@ class EngineCoreReadyResponse:
     # KV cache capacity (None for encoder-only/attention-free models).
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
+    scheduler_block_size: int | None = None
+    prefix_caching_enabled: bool | None = None
 
 
 class EngineCoreRequest(
@@ -235,6 +237,7 @@ class EngineCoreOutputs(
 
     utility_output: UtilityOutput | None = None
     finished_requests: set[str] | None = None
+    preempted_requests: set[str] | None = None
 
     # In DP case, used to signal that the current wave of requests
     # has finished and the engines are paused.

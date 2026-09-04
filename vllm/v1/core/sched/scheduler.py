@@ -101,6 +101,9 @@ class Scheduler(SchedulerInterface):
         self.finished_req_ids_dict: dict[int, set[str]] | None = (
             defaultdict(set) if include_finished_set else None
         )
+        self.preempted_req_ids_dict: dict[int, set[str]] | None = (
+            defaultdict(set) if include_finished_set else None
+        )
         # Track requests scheduled in prior step (MRV1-only).
         self.prev_step_scheduled_req_ids: set[str] = set()
 
@@ -1154,6 +1157,8 @@ class Scheduler(SchedulerInterface):
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
+        if self.preempted_req_ids_dict is not None:
+            self.preempted_req_ids_dict[request.client_index].add(request.request_id)
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -1821,6 +1826,17 @@ class Scheduler(SchedulerInterface):
             client_index: EngineCoreOutputs(outputs=outs)
             for client_index, outs in outputs.items()
         }
+
+        preempted_req_ids = self.preempted_req_ids_dict
+        if preempted_req_ids:
+            for client_index, request_ids in preempted_req_ids.items():
+                if (eco := engine_core_outputs.get(client_index)) is not None:
+                    eco.preempted_requests = request_ids
+                else:
+                    engine_core_outputs[client_index] = EngineCoreOutputs(
+                        preempted_requests=request_ids
+                    )
+            preempted_req_ids.clear()
 
         finished_req_ids = self.finished_req_ids_dict
         if finished_req_ids:

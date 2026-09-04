@@ -146,6 +146,7 @@ class EngineCore:
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        self.scheduler_block_size = scheduler_block_size
 
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
@@ -1536,6 +1537,10 @@ class EngineCoreProc(EngineCore):
                 ),
                 kv_cache_max_concurrency=(
                     self.vllm_config.cache_config.kv_cache_max_concurrency
+                ),
+                scheduler_block_size=self.scheduler_block_size,
+                prefix_caching_enabled=(
+                    self.vllm_config.cache_config.enable_prefix_caching
                 ),
             )
             ready_payload = msgspec.msgpack.encode(ready_response)

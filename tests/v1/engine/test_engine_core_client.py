@@ -242,7 +242,11 @@ def test_apply_ready_response_syncs_block_size():
 
     client = object.__new__(MPClient)
     client.vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=16, num_gpu_blocks=0),
+        cache_config=SimpleNamespace(
+            block_size=16,
+            num_gpu_blocks=0,
+            enable_prefix_caching=True,
+        ),
         model_config=SimpleNamespace(max_model_len=8192),
     )
     client.stats_update_address = None
@@ -252,15 +256,37 @@ def test_apply_ready_response_syncs_block_size():
             max_model_len=8192,
             num_gpu_blocks=100,
             block_size=1056,
+            scheduler_block_size=2112,
             dp_stats_address=None,
             dtype="bfloat16",
             vllm_version="test",
             world_size=1,
             data_parallel_size=1,
+            prefix_caching_enabled=True,
         )
     )
     client._apply_ready_response(payload)
     assert client.vllm_config.cache_config.block_size == 1056
+    assert client.scheduler_block_size == 2112
+    assert client.prefix_caching_enabled
+
+    payload = msgspec.msgpack.encode(
+        EngineCoreReadyResponse(
+            max_model_len=8192,
+            num_gpu_blocks=100,
+            block_size=1056,
+            scheduler_block_size=2112,
+            dp_stats_address=None,
+            dtype="bfloat16",
+            vllm_version="test",
+            world_size=1,
+            data_parallel_size=2,
+            prefix_caching_enabled=False,
+        )
+    )
+    client._apply_ready_response(payload)
+    assert not client.prefix_caching_enabled
+    assert not client.vllm_config.cache_config.enable_prefix_caching
 
 
 def loop_until_done(client: EngineCoreClient, outputs: dict):

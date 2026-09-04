@@ -48,6 +48,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.prefix_router import PrefixAwareDPRouter
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -732,6 +733,18 @@ class MPClient(EngineCoreClient):
         # worker for hybrid Mamba models.
         cache_config = vllm_config.cache_config
         cache_config.block_size = response.block_size
+        scheduler_block_size = response.scheduler_block_size or response.block_size
+        current_scheduler_block_size = getattr(self, "scheduler_block_size", None)
+        if current_scheduler_block_size is not None:
+            assert current_scheduler_block_size == scheduler_block_size
+        self.scheduler_block_size = scheduler_block_size
+        engine_prefix_caching_enabled = response.prefix_caching_enabled
+        if engine_prefix_caching_enabled is None:
+            engine_prefix_caching_enabled = cache_config.enable_prefix_caching
+        self.prefix_caching_enabled = getattr(
+            self, "prefix_caching_enabled", cache_config.enable_prefix_caching
+        ) and bool(engine_prefix_caching_enabled)
+        cache_config.enable_prefix_caching = self.prefix_caching_enabled
         # Keep these as per-engine cache_config_info values; do not sum across DP.
         cache_config.kv_cache_size_tokens = (
             getattr(cache_config, "kv_cache_size_tokens", None)
@@ -1410,8 +1423,49 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines) * self.client_index
         ) // client_count
 
+        self.prefix_router: PrefixAwareDPRouter | None = None
+        if envs.VLLM_FORK_ATTN_DP_PREFIX_ROUTING:
+            if client_count != 1:
+                logger.warning(
+                    "Ignoring prefix-aware DP routing with multiple API frontend "
+                    "processes because their routing state is not shared."
+                )
+            elif vllm_config.parallel_config.enable_elastic_ep:
+                logger.warning(
+                    "Ignoring prefix-aware DP routing with elastic expert parallelism."
+                )
+            elif not self.prefix_caching_enabled:
+                logger.warning(
+                    "Ignoring prefix-aware DP routing because prefix caching is "
+                    "disabled by one or more engine cores."
+                )
+            else:
+                self.prefix_router = PrefixAwareDPRouter(
+                    num_ranks=len(self.core_engines),
+                    block_size=self.scheduler_block_size,
+                    load_slack=envs.VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK,
+                    warm_ttl_s=envs.VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL,
+                    min_prefix_blocks=envs.VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS,
+                    max_warm_requests=(envs.VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_REQUESTS),
+                    max_warm_checkpoints=(
+                        envs.VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_CHECKPOINTS
+                    ),
+                    work_slack_tokens=(envs.VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS),
+                    decode_token_weight=(envs.VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT),
+                )
+                logger.info(
+                    "Enabled prefix-aware DP routing: block_size=%d, "
+                    "load_slack=%d, warm_ttl=%.1fs, min_prefix_blocks=%d",
+                    self.scheduler_block_size,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL,
+                    envs.VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS,
+                )
+
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
+        prefix_router = getattr(self, "prefix_router", None)
+        route_prefix = prefix_router is not None and prefix_router.should_route(request)
         if (eng_index := request.data_parallel_rank) is None and (
             eng_index := get_late_interaction_engine_index(
                 request.pooling_params, len(self.core_engines)
@@ -1431,6 +1485,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 if score < min_score:
                     min_score = score
                     eng_index = idx
+            if route_prefix:
+                assert prefix_router is not None
+                eng_index = prefix_router.choose_rank(
+                    request,
+                    current_counts,
+                    baseline_rank=eng_index,
+                    start_index=self.eng_start_index,
+                )
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
@@ -1442,6 +1504,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self.eng_start_index = (self.eng_start_index + 1) % num_engines
 
         chosen_engine = self.core_engines[eng_index]
+        if route_prefix:
+            assert prefix_router is not None
+            prefix_router.add_request(request, eng_index)
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         return chosen_engine
@@ -1461,9 +1526,38 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        prefix_router = getattr(self, "prefix_router", None)
+        if prefix_router is not None:
+            prefix_router.observe_outputs(
+                outputs.outputs,
+                outputs.finished_requests,
+                getattr(outputs, "preempted_requests", None),
+            )
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 self.reqs_in_flight.pop(req_id, None)
+
+    async def reset_prefix_cache_async(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        reset = await super().reset_prefix_cache_async(
+            reset_running_requests, reset_connector
+        )
+        if reset and self.prefix_router is not None:
+            self.prefix_router.invalidate_residency()
+        return reset
+
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        await super().pause_scheduler_async(mode, clear_cache)
+        if clear_cache and self.prefix_router is not None:
+            self.prefix_router.invalidate_residency()
+
+    async def sleep_async(self, level: int = 1, mode: PauseMode = "abort") -> None:
+        await super().sleep_async(level, mode)
+        if level >= 1 and self.prefix_router is not None:
+            self.prefix_router.invalidate_residency()
 
     @staticmethod
     async def eep_process_engine_core_notification(

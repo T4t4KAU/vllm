@@ -72,7 +72,27 @@ There are several notable differences when using Ray:
 - When a single DP group requires multiple nodes, *e.g.* in case a single model replica needs to run on at least two nodes, make sure to set `VLLM_RAY_DP_PACK_STRATEGY="span"` in which case `--data-parallel-size-local` is ignored and will be automatically determined
 - Remote DP ranks will be allocated based on node resources of the Ray cluster
 
-Currently, the internal DP load balancing is done within the API server process(es) and is based on the running and waiting queues in each of the engines. This could be made more sophisticated in future by incorporating KV cache aware logic.
+By default, the internal DP load balancer uses the running and waiting queues
+in each engine. Agentrix can additionally use logical prefix affinity for long
+prompts:
+
+```bash
+VLLM_FORK_ATTN_DP_PREFIX_ROUTING=1 \
+vllm serve $MODEL --data-parallel-size 4 --enable-prefix-caching
+```
+
+Prefix-aware routing keeps the native queue-based choice for short prompts.
+For eligible prompts, it prefers a rank that is likely to contain the longest
+matching prefix, subject to queue-load and estimated-work bounds. This feature
+does not move KV blocks between ranks or change KV cache memory management.
+
+The router currently requires internal load balancing, one API frontend
+process, prefix caching, and non-elastic DP. Its main tuning variables are
+`VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS`,
+`VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK`, and
+`VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL`. Warm routing hints are also bounded by
+`VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_REQUESTS` and
+`VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_CHECKPOINTS`.
 
 When deploying large DP sizes using this method, the API server process can become a bottleneck. In this case, the orthogonal `--api-server-count` command line option can be used to scale this out (for example `--api-server-count=4`). This is transparent to users - a single HTTP endpoint / port is still exposed. Note that this API server scale-out is "internal" and still confined to the "head" node.
 

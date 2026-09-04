@@ -115,6 +115,14 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
+    VLLM_FORK_ATTN_DP_PREFIX_ROUTING: bool = False
+    VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK: int = 32
+    VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL: float = 30.0
+    VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS: int = 4
+    VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_REQUESTS: int = 1024
+    VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_CHECKPOINTS: int = 262144
+    VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS: int = 8192
+    VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT: int = 16
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1123,6 +1131,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))
+    ),
+    "VLLM_FORK_ATTN_DP_PREFIX_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_FORK_ATTN_DP_PREFIX_ROUTING", "0"))
+    ),
+    "VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_PREFIX_LOAD_SLACK", "32")
+    ),
+    "VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL": lambda: float(
+        os.getenv("VLLM_FORK_ATTN_DP_PREFIX_WARM_TTL", "30")
+    ),
+    "VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_PREFIX_MIN_BLOCKS", "4")
+    ),
+    "VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_REQUESTS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_REQUESTS", "1024")
+    ),
+    "VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_CHECKPOINTS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_PREFIX_MAX_WARM_CHECKPOINTS", "262144")
+    ),
+    "VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS", "8192")
+    ),
+    "VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT": lambda: int(
+        os.getenv("VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT", "16")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
