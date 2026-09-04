@@ -24,6 +24,7 @@ from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
@@ -212,6 +213,16 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         return self._lmcache_engine.get_finished(finished_req_ids)
 
+    def build_connector_worker_meta(self):
+        """Build optional worker metadata exposed by the LMCache adapter."""
+        method = getattr(self._lmcache_engine, "build_connector_worker_meta", None)
+        return method() if callable(method) else None
+
+    def shutdown(self):
+        """Shut down LMCache services and background workers."""
+        method = getattr(self._lmcache_engine, "shutdown", None)
+        return method() if callable(method) else None
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Get the set of block IDs that failed to load.
@@ -256,6 +267,12 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        """Bind the scheduler-side LMCache adapter to the GPU block pool."""
+        method = getattr(self._lmcache_engine, "bind_gpu_block_pool", None)
+        if callable(method):
+            method(gpu_block_pool)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -308,6 +325,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
+        method = getattr(self._lmcache_engine, "update_connector_output", None)
+        if callable(method):
+            method(connector_output)
+
         # Get the KV events
         kv_cache_events = connector_output.kv_cache_events
         if not kv_cache_events or not isinstance(kv_cache_events, LMCacheKVEvents):
@@ -321,6 +342,16 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 kv_cache_events.get_number_of_workers()
             )
         return
+
+    def has_pending_push_work(self) -> bool:
+        """Return whether LMCache has background work to drive."""
+        method = getattr(self._lmcache_engine, "has_pending_push_work", None)
+        return bool(method()) if callable(method) else False
+
+    def get_proactive_backup_stats(self):
+        """Return optional scheduler-side proactive backup counters."""
+        method = getattr(self._lmcache_engine, "get_proactive_backup_stats", None)
+        return method() if callable(method) else None
 
     def request_finished(
         self,

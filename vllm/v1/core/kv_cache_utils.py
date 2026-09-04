@@ -318,6 +318,25 @@ class FreeKVCacheBlockQueue:
         block.prev_free_block = block.next_free_block = None
         self.num_free_blocks -= 1
 
+    def restore(
+        self,
+        block: KVCacheBlock,
+        prev_block: KVCacheBlock,
+        next_block: KVCacheBlock,
+    ) -> bool:
+        """Restore a removed block if its former neighbors remain adjacent."""
+        if (
+            prev_block.next_free_block is not next_block
+            or next_block.prev_free_block is not prev_block
+        ):
+            return False
+        prev_block.next_free_block = block
+        block.prev_free_block = prev_block
+        block.next_free_block = next_block
+        next_block.prev_free_block = block
+        self.num_free_blocks += 1
+        return True
+
     def append(self, block: KVCacheBlock) -> None:
         """Put a block back into the free list and increase
         num_free_blocks by 1.

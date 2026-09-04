@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from array import array
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -27,6 +28,9 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_observer import KVCacheObserver
 
 logger = init_logger(__name__)
 
@@ -195,6 +199,22 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.observer: KVCacheObserver | None = None
+        self._eviction_validation_marks: bytearray | None = None
+        self._eviction_blocks: list[KVCacheBlock] | None = None
+        self._block_generations = array("I", [0]) * num_gpu_blocks
+        self._pin_restore_positions: dict[
+            int,
+            tuple[KVCacheBlock, int, KVCacheBlock, int],
+        ] = {}
+
+    def set_observer(self, observer: "KVCacheObserver | None") -> None:
+        """Attach an optional non-blocking lifecycle observer."""
+        self.observer = observer
+
+    def get_observer(self) -> "KVCacheObserver | None":
+        """Return the attached lifecycle observer, if any."""
+        return self.observer
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -484,6 +504,8 @@ class BlockPool:
     def _remove_cached_block_hashes(
         self,
         block: KVCacheBlock,
+        *,
+        evicted: bool = False,
     ) -> list[BlockHashWithGroupId]:
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
@@ -500,6 +522,13 @@ class BlockPool:
             ):
                 removed_hashes.append(block_hash)
         block.reset_hash()
+        self._pin_restore_positions.pop(block.block_id, None)
+        if self.observer is not None:
+            self.observer.on_cache_removed(
+                block.block_id,
+                len(removed_hashes),
+                evicted=evicted,
+            )
         return removed_hashes
 
     def _emit_block_removed_events(
@@ -538,6 +567,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if self.observer is not None:
+            self.observer.on_cache_inserted(block.block_id)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -561,15 +592,90 @@ class BlockPool:
                 self._maybe_evict_cached_block(block)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                self._block_generations[block.block_id] = (
+                    self._block_generations[block.block_id] + 1
+                ) & 0xFFFFFFFF
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+                if self.observer is not None:
+                    self.observer.on_allocated(block.block_id, block.ref_cnt)
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
+                self._block_generations[block.block_id] = (
+                    self._block_generations[block.block_id] + 1
+                ) & 0xFFFFFFFF
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+                if self.observer is not None:
+                    self.observer.on_allocated(block.block_id, block.ref_cnt)
         return ret
+
+    def prioritize_eviction_blocks(self, block_ids: Sequence[int]) -> bool:
+        """Move validated cached blocks to the front of the free queue.
+
+        The operation is atomic: an invalid, active, or uncached block leaves
+        the queue unchanged.
+
+        Args:
+            block_ids: Physical cached blocks in desired eviction order.
+
+        Returns:
+            True when all blocks were reprioritized, otherwise False.
+        """
+        if not block_ids:
+            return True
+
+        marks = self._eviction_validation_marks
+        blocks = self._eviction_blocks
+        if marks is None:
+            marks = bytearray(self.num_gpu_blocks)
+            blocks = []
+            self._eviction_validation_marks = marks
+            self._eviction_blocks = blocks
+        assert blocks is not None
+        validated_count = 0
+        for block_index, block_id in enumerate(block_ids):
+            if not 0 <= block_id < len(self.blocks):
+                self._clear_eviction_marks(block_ids, validated_count)
+                return False
+            block = self.blocks[block_id]
+            if (
+                marks[block_id]
+                or block.is_null
+                or block.ref_cnt != 0
+                or block.block_hash is None
+                or block.prev_free_block is None
+                or block.next_free_block is None
+            ):
+                self._clear_eviction_marks(block_ids, validated_count)
+                return False
+            marks[block_id] = 1
+            validated_count += 1
+            if block_index == len(blocks):
+                blocks.append(block)
+            else:
+                blocks[block_index] = block
+
+        if validated_count < len(blocks):
+            del blocks[validated_count:]
+
+        for block_id, block in zip(block_ids, blocks, strict=True):
+            marks[block_id] = 0
+            self.free_block_queue.remove(block)
+        self.free_block_queue.prepend_n(blocks)
+        return True
+
+    def _clear_eviction_marks(
+        self,
+        block_ids: Sequence[int],
+        validated_count: int,
+    ) -> None:
+        marks = self._eviction_validation_marks
+        assert marks is not None
+        for block_index in range(validated_count):
+            marks[block_ids[block_index]] = 0
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -586,7 +692,7 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
-        evicted_hashes = self._remove_cached_block_hashes(block)
+        evicted_hashes = self._remove_cached_block_hashes(block, evicted=True)
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
@@ -595,44 +701,124 @@ class BlockPool:
         return True
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
-        """Touch a block increases its reference count by 1, and may remove
-        the block from the free queue. This is used when a block is hit by
-        another request with the same prefix.
+        """Acquire blocks adopted by a request after a prefix-cache hit.
 
         Args:
             blocks: A list of blocks to touch.
         """
+        self._acquire_blocks(blocks, cache_hit=True)
+
+    def pin(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Temporarily acquire blocks for an internal operation."""
+        self._acquire_blocks(blocks, cache_hit=False)
+
+    def _acquire_blocks(
+        self,
+        blocks: Sequence[KVCacheBlock],
+        *,
+        cache_hit: bool,
+    ) -> None:
+        observer_callback = None
+        if self.observer is not None:
+            observer_callback = (
+                self.observer.on_cache_hit if cache_hit else self.observer.on_pinned
+            )
         for block in blocks:
+            if cache_hit:
+                self._pin_restore_positions.pop(block.block_id, None)
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
+                if not cache_hit and block.block_hash is not None:
+                    prev_block = block.prev_free_block
+                    next_block = block.next_free_block
+                    assert prev_block is not None and next_block is not None
+                    prev_generation = (
+                        self._block_generations[prev_block.block_id]
+                        if prev_block.block_id >= 0
+                        else 0
+                    )
+                    next_generation = (
+                        self._block_generations[next_block.block_id]
+                        if next_block.block_id >= 0
+                        else 0
+                    )
+                    self._pin_restore_positions[block.block_id] = (
+                        prev_block,
+                        prev_generation,
+                        next_block,
+                        next_generation,
+                    )
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
+            if observer_callback is not None:
+                observer_callback(block.block_id, block.ref_cnt)
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
-        """Free a list of blocks. The blocks should be ordered by their
-        eviction priority, where the first block will be evicted first.
+        """Release request-owned blocks in eviction-priority order.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
+        self._release_blocks(ordered_blocks, request_release=True)
+
+    def unpin(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
+        """Release references acquired by :meth:`pin`."""
+        self._release_blocks(ordered_blocks, request_release=False)
+
+    def _release_blocks(
+        self,
+        ordered_blocks: Iterable[KVCacheBlock],
+        *,
+        request_release: bool,
+    ) -> None:
+        observer_callback = None
+        if self.observer is not None:
+            observer_callback = (
+                self.observer.on_released
+                if request_release
+                else self.observer.on_unpinned
+            )
         # Identify blocks with hash (LRU cache) and without it (will never match in APC)
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
+            if observer_callback is not None:
+                observer_callback(block.block_id, block.ref_cnt)
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None:
+                    self._pin_restore_positions.pop(block.block_id, None)
                     blocks_without_hash.append(block)
+                elif not request_release and self._restore_pinned_block(block):
+                    continue
                 else:
+                    self._pin_restore_positions.pop(block.block_id, None)
                     blocks_with_hash.append(block)
 
         # Blocks without hash always get evicted first - prepend them last to the tail
         self.free_block_queue.prepend_n(blocks_without_hash)
         self.free_block_queue.append_n(blocks_with_hash)
+
+    def _restore_pinned_block(self, block: KVCacheBlock) -> bool:
+        position = self._pin_restore_positions.pop(block.block_id, None)
+        if position is None:
+            return False
+        prev_block, prev_generation, next_block, next_generation = position
+        if (
+            prev_block.block_id >= 0
+            and self._block_generations[prev_block.block_id] != prev_generation
+        ):
+            return False
+        if (
+            next_block.block_id >= 0
+            and self._block_generations[next_block.block_id] != next_generation
+        ):
+            return False
+        return self.free_block_queue.restore(block, prev_block, next_block)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -678,6 +864,9 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+
+        if self.observer is not None:
+            self.observer.reset()
 
         if self.metrics_collector:
             self.metrics_collector.reset()

@@ -272,7 +272,7 @@ class SimpleCPUOffloadScheduler:
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
             ]
-            self.cpu_block_pool.touch(pin_blocks)
+            self.cpu_block_pool.pin(pin_blocks)
             self._pending_cpu_hits[request.request_id] = (
                 cpu_hit_blocks,
                 hit_length,
@@ -389,14 +389,14 @@ class SimpleCPUOffloadScheduler:
                 cpu_block_ids.append(cpu_blk.block_id)
                 cpu_blocks_to_touch.append(cpu_blk)
 
-        # Touch CPU blocks to prevent eviction during async load.
-        self.cpu_block_pool.touch(cpu_blocks_to_touch)
+        # Pin CPU blocks to prevent eviction during async load.
+        self.cpu_block_pool.pin(cpu_blocks_to_touch)
         # Release the temporary pin held since get_num_new_matched_tokens().
         self._free_pending_cpu_hit(pending)
 
-        # Touch GPU blocks to prevent freeing during async load
+        # Pin GPU blocks to prevent freeing during async load.
         assert self._gpu_block_pool is not None
-        self._gpu_block_pool.touch(
+        self._gpu_block_pool.pin(
             [self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
         )
 
@@ -529,8 +529,8 @@ class SimpleCPUOffloadScheduler:
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
-            # Touch GPU blocks to prevent eviction during async copy.
-            gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
+            # Pin GPU blocks to prevent eviction during async copy.
+            gpu_pool.pin([gpu_pool.blocks[bid] for bid in gpu_ids])
         else:
             cpu_ids = []
 
@@ -662,8 +662,8 @@ class SimpleCPUOffloadScheduler:
                 merged_cpu_block_ids.extend(cpu_block_ids)
                 in_flight.update(gpu_block_ids)
 
-                # Touch GPU blocks to prevent freeing during async copy
-                gpu_block_pool.touch(
+                # Pin GPU blocks to prevent freeing during async copy.
+                gpu_block_pool.pin(
                     [gpu_block_pool.blocks[bid] for bid in gpu_block_ids]
                 )
 
@@ -755,7 +755,7 @@ class SimpleCPUOffloadScheduler:
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
-        self._gpu_block_pool.free_blocks(
+        self._gpu_block_pool.unpin(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
         )
 
@@ -766,7 +766,7 @@ class SimpleCPUOffloadScheduler:
             cpu_block.reset_hash()
         self.cpu_block_pool.free_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
-        self._gpu_block_pool.free_blocks(
+        self._gpu_block_pool.unpin(
             self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
         )
 
@@ -824,14 +824,14 @@ class SimpleCPUOffloadScheduler:
             blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
         ]
         if blocks_to_free:
-            self.cpu_block_pool.free_blocks(blocks_to_free)
+            self.cpu_block_pool.unpin(blocks_to_free)
 
     def _cleanup_load_request(self, req_id: str) -> None:
         """Release all load resources for a request.
 
         Shared between request_finished() and update_connector_output() paths.
         Removes the request from _reqs_to_load, cleans up event mappings,
-        and frees CPU/GPU touch refs.
+        and releases CPU/GPU pins.
         """
         state = self._reqs_to_load.pop(req_id, None)
         if state is None:
@@ -848,14 +848,14 @@ class SimpleCPUOffloadScheduler:
                     self._load_event_to_reqs.pop(state.load_event, None)
 
         if state.transfer_meta is not None:
-            # Free CPU touch refs
-            self.cpu_block_pool.free_blocks(
+            # Release CPU pins.
+            self.cpu_block_pool.unpin(
                 self.cpu_block_pool.blocks[bid]
                 for bid in state.transfer_meta.cpu_block_ids
             )
-            # Free GPU touch refs
+            # Release GPU pins.
             assert self._gpu_block_pool is not None
-            self._gpu_block_pool.free_blocks(
+            self._gpu_block_pool.unpin(
                 self._gpu_block_pool.blocks[bid]
                 for bid in state.transfer_meta.gpu_block_ids
             )

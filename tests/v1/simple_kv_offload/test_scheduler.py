@@ -834,8 +834,7 @@ def test_touched_blocks_survive_eviction() -> None:
         cached_blk = cpu_pool.cached_block_hash_to_block.get_one_block(bhash_with_group)
         assert cached_blk is not None
         cpu_pool.touch([cached_blk])
-        # Undo touch to return ref_cnt to 0
-        # (so it's a free candidate but at MRU position)
+        # Release the simulated cache hit so it becomes an MRU candidate.
         cpu_pool.free_blocks([cached_blk])
 
     # Now store 2 more blocks; req_b (LRU front) should be evicted, not req_a

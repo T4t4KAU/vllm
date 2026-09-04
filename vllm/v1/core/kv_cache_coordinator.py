@@ -184,6 +184,49 @@ class KVCacheCoordinator(ABC):
                 )
         return num_blocks_to_allocate
 
+    def get_evictable_new_computed_block_ids(
+        self,
+        request_id: str,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        total_computed_tokens: int,
+    ) -> set[int]:
+        """Return cache-hit blocks that this allocation will acquire.
+
+        Cached hits with zero references currently contribute to the free-block
+        capacity, but will leave the free queue when the request acquires them.
+        Blocks skipped by a local-attention window do not consume that capacity
+        and must not be included.
+
+        Args:
+            request_id: The request being allocated.
+            new_computed_blocks: Newly matched prefix-cache blocks by group.
+            total_computed_tokens: Local and external computed-token count.
+
+        Returns:
+            Physical IDs of zero-reference cache hits that will be acquired.
+        """
+        block_ids: set[int] = set()
+        for manager, blocks in zip(
+            self.single_type_managers,
+            new_computed_blocks,
+            strict=True,
+        ):
+            num_req_blocks = len(manager.req_to_blocks.get(request_id, ()))
+            num_skipped_blocks = (
+                manager.get_num_skipped_tokens(total_computed_tokens)
+                // manager.block_size
+            )
+            num_skipped_new_blocks = max(
+                0,
+                num_skipped_blocks - num_req_blocks,
+            )
+            block_ids.update(
+                block.block_id
+                for block in blocks[num_skipped_new_blocks:]
+                if block.ref_cnt == 0 and not block.is_null
+            )
+        return block_ids
+
     def allocate_new_computed_blocks(
         self,
         request_id: str,

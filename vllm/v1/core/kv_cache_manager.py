@@ -12,6 +12,15 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_placement import (
+    KVPlacementPlan,
+    KVPlacementStats,
+    create_kv_placement_planner,
+)
+from vllm.v1.core.kv_residency import (
+    KVResidencyStats,
+    create_kv_residency_index,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -159,6 +168,9 @@ class KVCacheManager:
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.kv_residency_index = create_kv_residency_index(self.block_pool)
+        self.block_pool.set_observer(self.kv_residency_index)
+        self.kv_placement_planner = create_kv_placement_planner()
         self.kv_cache_config = kv_cache_config
 
         # Watermark: minimum number of KV cache blocks to keep free when
@@ -202,6 +214,49 @@ class KVCacheManager:
         stats = self.prefix_cache_stats
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
+
+    def get_residency_stats(self) -> KVResidencyStats | None:
+        """Return an O(1) shadow-residency snapshot when tracking is enabled."""
+        if self.kv_residency_index is None:
+            return None
+        return self.kv_residency_index.snapshot()
+
+    def get_placement_stats(self) -> KVPlacementStats | None:
+        """Return cumulative placement statistics when enabled."""
+        if self.kv_placement_planner is None:
+            return None
+        return self.kv_placement_planner.snapshot()
+
+    def get_last_placement_plan(self) -> KVPlacementPlan | None:
+        """Return the most recent placement plan."""
+        if self.kv_placement_planner is None:
+            return None
+        return self.kv_placement_planner.last_plan
+
+    def _plan_evictions(
+        self,
+        num_blocks_to_allocate: int,
+        excluded_block_ids: set[int],
+    ) -> bool:
+        index = self.kv_residency_index
+        planner = self.kv_placement_planner
+        if index is None or planner is None:
+            return True
+        if planner.active:
+            return planner.plan_and_apply_for_allocation(
+                index,
+                num_blocks_to_allocate,
+                self.block_pool,
+                excluded_block_ids=excluded_block_ids,
+            )
+        plan = planner.plan_for_allocation(
+            index,
+            num_blocks_to_allocate,
+            excluded_block_ids=excluded_block_ids,
+        )
+        if plan is None:
+            return True
+        return planner.apply(plan, index, self.block_pool)
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
@@ -425,6 +480,15 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        if self.kv_placement_planner is not None:
+            excluded_block_ids = self.coordinator.get_evictable_new_computed_block_ids(
+                request.request_id,
+                new_computed_block_list,
+                num_local_computed_tokens + num_external_computed_tokens,
+            )
+            if not self._plan_evictions(num_blocks_to_allocate, excluded_block_ids):
+                return None
+
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -643,4 +707,6 @@ class KVCacheManager:
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
+        if self.kv_residency_index is not None:
+            self.kv_residency_index.on_step()
         self.coordinator.new_step_starts()

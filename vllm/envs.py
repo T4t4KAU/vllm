@@ -126,6 +126,19 @@ if TYPE_CHECKING:
     VLLM_AGENTRIX_DP_ROUTING_POLICY: str = "native"
     VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO: float = 2.0
     VLLM_AGENTRIX_DP_SESSION_HIT_RATIO: float = 0.5
+    VLLM_AGENTRIX_KV_RESIDENCY_SHADOW: bool = False
+    VLLM_AGENTRIX_KV_WARM_SECONDS: float = 10.0
+    VLLM_AGENTRIX_KV_COOLING_SECONDS: float = 100.0
+    VLLM_AGENTRIX_KV_SHARED_REUSE_THRESHOLD: int = 2
+    VLLM_AGENTRIX_KV_AGING_BUDGET: int = 256
+    VLLM_AGENTRIX_KV_PLACEMENT_SHADOW: bool = False
+    VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE: bool = False
+    VLLM_AGENTRIX_KV_PLACEMENT_SCAN_BUDGET: int = 64
+    VLLM_AGENTRIX_KV_PROACTIVE_BACKUP: bool = False
+    VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK: float = 0.8
+    VLLM_AGENTRIX_KV_BACKUP_SCAN_BUDGET: int = 32
+    VLLM_AGENTRIX_KV_BACKUP_BATCH_BLOCKS: int = 64
+    VLLM_AGENTRIX_KV_BACKUP_MAX_INFLIGHT_BLOCKS: int = 256
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1176,6 +1189,45 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_AGENTRIX_DP_SESSION_HIT_RATIO": lambda: float(
         os.getenv("VLLM_AGENTRIX_DP_SESSION_HIT_RATIO", "0.5")
+    ),
+    "VLLM_AGENTRIX_KV_RESIDENCY_SHADOW": lambda: bool(
+        int(os.getenv("VLLM_AGENTRIX_KV_RESIDENCY_SHADOW", "0"))
+    ),
+    "VLLM_AGENTRIX_KV_WARM_SECONDS": lambda: float(
+        os.getenv("VLLM_AGENTRIX_KV_WARM_SECONDS", "10")
+    ),
+    "VLLM_AGENTRIX_KV_COOLING_SECONDS": lambda: float(
+        os.getenv("VLLM_AGENTRIX_KV_COOLING_SECONDS", "100")
+    ),
+    "VLLM_AGENTRIX_KV_SHARED_REUSE_THRESHOLD": lambda: int(
+        os.getenv("VLLM_AGENTRIX_KV_SHARED_REUSE_THRESHOLD", "2")
+    ),
+    "VLLM_AGENTRIX_KV_AGING_BUDGET": lambda: int(
+        os.getenv("VLLM_AGENTRIX_KV_AGING_BUDGET", "256")
+    ),
+    "VLLM_AGENTRIX_KV_PLACEMENT_SHADOW": lambda: bool(
+        int(os.getenv("VLLM_AGENTRIX_KV_PLACEMENT_SHADOW", "0"))
+    ),
+    "VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE": lambda: bool(
+        int(os.getenv("VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE", "0"))
+    ),
+    "VLLM_AGENTRIX_KV_PLACEMENT_SCAN_BUDGET": lambda: int(
+        os.getenv("VLLM_AGENTRIX_KV_PLACEMENT_SCAN_BUDGET", "64")
+    ),
+    "VLLM_AGENTRIX_KV_PROACTIVE_BACKUP": lambda: bool(
+        int(os.getenv("VLLM_AGENTRIX_KV_PROACTIVE_BACKUP", "0"))
+    ),
+    "VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK": lambda: float(
+        os.getenv("VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK", "0.8")
+    ),
+    "VLLM_AGENTRIX_KV_BACKUP_SCAN_BUDGET": lambda: int(
+        os.getenv("VLLM_AGENTRIX_KV_BACKUP_SCAN_BUDGET", "32")
+    ),
+    "VLLM_AGENTRIX_KV_BACKUP_BATCH_BLOCKS": lambda: int(
+        os.getenv("VLLM_AGENTRIX_KV_BACKUP_BATCH_BLOCKS", "64")
+    ),
+    "VLLM_AGENTRIX_KV_BACKUP_MAX_INFLIGHT_BLOCKS": lambda: int(
+        os.getenv("VLLM_AGENTRIX_KV_BACKUP_MAX_INFLIGHT_BLOCKS", "256")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (

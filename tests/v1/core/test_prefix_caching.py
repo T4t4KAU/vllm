@@ -3943,3 +3943,124 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     assert retained(64) == {3, 7, 11, 14, 15}
     # interval 0 -> only the latest replay boundary (block 14).
     assert retained(0) == {14}
+
+
+def test_active_placement_excludes_cache_hits_before_allocation(monkeypatch):
+    monkeypatch.setenv("VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 4),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    original = make_request(
+        "original",
+        [1] * block_size + [2] * block_size,
+        block_size,
+        sha256,
+    )
+    computed, num_computed = manager.get_computed_blocks(original)
+    assert num_computed == 0
+    assert manager.allocate_slots(original, 8, 0, computed) is not None
+    manager.free(original)
+
+    reuse = make_request(
+        "reuse",
+        [1] * block_size + [3] * (2 * block_size),
+        block_size,
+        sha256,
+    )
+    computed, num_computed = manager.get_computed_blocks(reuse)
+    assert num_computed == block_size
+
+    allocated = manager.allocate_slots(
+        reuse,
+        num_new_tokens=2 * block_size,
+        num_new_computed_tokens=num_computed,
+        new_computed_blocks=computed,
+    )
+
+    assert allocated is not None
+    assert allocated.get_block_ids() == ([2, 3],)
+    assert manager.block_pool.blocks[1].block_hash is not None
+    assert manager.block_pool.blocks[1].ref_cnt == 1
+
+
+def test_active_placement_excludes_only_window_resident_cache_hits(monkeypatch):
+    monkeypatch.setenv("VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE", "1")
+    block_size = 4
+    config = KVCacheConfig(
+        num_blocks=6,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=2 * block_size,
+                ),
+            )
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    candidate_hits = tuple(manager.block_pool.blocks[1:5])
+
+    excluded = manager.coordinator.get_evictable_new_computed_block_ids(
+        "request",
+        (candidate_hits,),
+        total_computed_tokens=4 * block_size,
+    )
+
+    # The first two cache hits are outside the active two-block window. They
+    # remain eviction candidates and must not reduce the required victim count.
+    assert excluded == {3, 4}
+
+
+def test_active_placement_rejects_eviction_of_only_shared_prefixes(monkeypatch):
+    monkeypatch.setenv("VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE", "1")
+    monkeypatch.setenv("VLLM_AGENTRIX_KV_SHARED_REUSE_THRESHOLD", "1")
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 5),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    shared_tokens = [1] * block_size + [2] * block_size
+    original = make_request("original", shared_tokens, block_size, sha256)
+    computed, _ = manager.get_computed_blocks(original)
+    assert manager.allocate_slots(original, 8, 0, computed) is not None
+    manager.free(original)
+
+    reuse = make_request("reuse", shared_tokens + [3], block_size, sha256)
+    computed, num_computed = manager.get_computed_blocks(reuse)
+    assert num_computed == 2 * block_size
+    assert (
+        manager.allocate_slots(
+            reuse,
+            num_new_tokens=1,
+            num_new_computed_tokens=num_computed,
+            new_computed_blocks=computed,
+        )
+        is not None
+    )
+    manager.free(reuse)
+
+    pressure = make_request("pressure", [9] * (4 * block_size), block_size, sha256)
+    computed, _ = manager.get_computed_blocks(pressure)
+
+    assert manager.allocate_slots(pressure, 4 * block_size, 0, computed) is None
+    assert manager.block_pool.blocks[1].block_hash is not None
+    assert manager.block_pool.blocks[2].block_hash is not None
+    plan = manager.get_last_placement_plan()
+    assert plan is not None
+    assert plan.protected_shortfall_blocks == 2
