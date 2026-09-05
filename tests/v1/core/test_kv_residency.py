@@ -259,6 +259,23 @@ def test_backup_residency_is_counted_once_across_tiers() -> None:
     assert index.snapshot().backed_up_blocks == 0
 
 
+def test_restore_records_only_the_current_cached_generation() -> None:
+    index = _index()
+    generation = index.on_allocated(1, 1)
+    index.on_cache_inserted(1)
+
+    assert index.record_restore(1, generation, KVResidencyTier.CPU)
+    assert index.get_entry(1).residency & KVResidencyTier.CPU
+    assert index.snapshot().backed_up_blocks == 1
+    assert index.record_restore(1, generation, KVResidencyTier.CPU)
+    assert index.snapshot().backed_up_blocks == 1
+
+    index.on_cache_removed(1, 1)
+    index.on_cache_inserted(1)
+    assert not index.record_restore(1, generation, KVResidencyTier.CPU)
+    assert not index.get_entry(1).residency & KVResidencyTier.CPU
+
+
 def test_concurrent_backup_acks_are_matched_by_tier_and_operation() -> None:
     index = _index()
     generation = index.on_allocated(1, 1)

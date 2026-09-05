@@ -638,6 +638,24 @@ class KVResidencyIndex:
                 self._backed_up_count += 1
         return True
 
+    def record_restore(
+        self,
+        block_id: int,
+        generation: int,
+        tier: KVResidencyTier,
+    ) -> bool:
+        """Record the durable source of a successfully restored generation."""
+        tier_value = self._validate_backup_tier(tier)
+        entry = self.entries[block_id]
+        if not self._matches_cached_generation(entry, generation):
+            self.stale_updates += 1
+            return False
+        had_backup = bool(entry.residency & _LOWER_TIERS)
+        entry.residency |= tier_value
+        if not had_backup:
+            self._backed_up_count += 1
+        return True
+
     def drop_backup(
         self,
         block_id: int,
