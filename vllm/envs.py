@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_FORK_ATTN_DP_WORK_SLACK_TOKENS: int = 8192
     VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT: int = 16
     VLLM_AGENTRIX_DP_ROUTING_POLICY: str = "native"
+    VLLM_AGENTRIX_DP_KV_EVENTS: bool = False
     VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO: float = 2.0
     VLLM_AGENTRIX_DP_SESSION_HIT_RATIO: float = 0.5
     VLLM_AGENTRIX_KV_RESIDENCY_SHADOW: bool = False
@@ -1172,6 +1173,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT": lambda: int(
         os.getenv("VLLM_FORK_ATTN_DP_DECODE_TOKEN_WEIGHT", "16")
+    ),
+    "VLLM_AGENTRIX_DP_KV_EVENTS": lambda: bool(
+        int(os.getenv("VLLM_AGENTRIX_DP_KV_EVENTS", "0"))
     ),
     "VLLM_AGENTRIX_DP_ROUTING_POLICY": lambda: (
         os.getenv(

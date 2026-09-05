@@ -13,6 +13,7 @@ from vllm.v1.engine import EngineCoreEventType, FinishReason
 
 if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest
+    from vllm.v1.engine.kv_routing import GPUCacheRoutingIndex
 
 PrefixKey = tuple[int, int]
 RoutingPolicy = Literal["prefix_aware", "session_aware"]
@@ -62,6 +63,7 @@ class PrefixAwareDPRouter:
         routing_policy: RoutingPolicy = "prefix_aware",
         session_overload_ratio: float = 2.0,
         session_hit_ratio: float = 0.5,
+        use_kv_events: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if num_ranks <= 1:
@@ -108,6 +110,13 @@ class PrefixAwareDPRouter:
         self.session_overload_ratio = session_overload_ratio
         self.session_hit_ratio = session_hit_ratio
         self._clock = clock
+        self._cache_index: GPUCacheRoutingIndex | None = None
+        if use_kv_events:
+            from vllm.v1.engine.kv_routing import GPUCacheRoutingIndex
+
+            self._cache_index = GPUCacheRoutingIndex(
+                num_ranks, block_size, max(1, max_warm_checkpoints // num_ranks)
+            )
 
         self._requests: dict[str, _RequestPrefix] = {}
         self._pending_prefixes: dict[str, _Prefix] = {}
@@ -131,6 +140,7 @@ class PrefixAwareDPRouter:
         self.session_id_route_count = 0
         self.session_prefix_fallback_count = 0
         self.unknown_turn_route_count = 0
+        self.cache_event_route_count = 0
 
     @staticmethod
     def _namespace(request: EngineCoreRequest) -> int | None:
@@ -402,6 +412,15 @@ class PrefixAwareDPRouter:
             self._deepest_match(prefix.keys, self._resident[rank])
             for rank in range(self.num_ranks)
         ]
+        physical_matches: Sequence[int | None] = ()
+        if self._cache_index is not None and self._cache_index.supports(request):
+            physical_matches = self._cache_index.lookup(request.prompt_token_ids or ())
+            for rank, cached_blocks in enumerate(physical_matches):
+                if cached_blocks is not None:
+                    rank_matches[rank] = (cached_blocks, rank_matches[rank][1])
+            self.cache_event_route_count += int(
+                any(match is not None for match in physical_matches)
+            )
         candidate_work = [
             self._candidate_work(request, rank_matches[rank][0], rank)
             for rank in range(self.num_ranks)
@@ -433,6 +452,14 @@ class PrefixAwareDPRouter:
             if session_route is not None:
                 assert session_id is not None
                 best_rank = session_route[1]
+                # A live session mapping may outlast GPU residency. Prefer a
+                # verified longer GPU prefix before applying the load guards.
+                for rank, cached_blocks in enumerate(physical_matches):
+                    if (
+                        cached_blocks is not None
+                        and cached_blocks > rank_matches[best_rank][0]
+                    ):
+                        best_rank = rank
                 self.session_id_route_count += 1
                 self._remember_session(session_id, best_rank)
             else:
@@ -714,8 +741,15 @@ class PrefixAwareDPRouter:
         self._warm_requests.clear()
         self._num_warm_checkpoints = 0
         self._session_routes.clear()
+        if self._cache_index is not None:
+            self._cache_index.clear()
         for record in self._requests.values():
             record.resident = False
+
+    def observe_cache_events(self, rank: int, payload: bytes | None) -> None:
+        """Update GPU location hints from one engine's ordered event batch."""
+        if self._cache_index is not None and payload is not None:
+            self._cache_index.update(rank, payload)
 
     @property
     def average_route_us(self) -> float:

@@ -1463,6 +1463,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                         envs.VLLM_AGENTRIX_DP_SESSION_OVERLOAD_RATIO
                     ),
                     session_hit_ratio=envs.VLLM_AGENTRIX_DP_SESSION_HIT_RATIO,
+                    use_kv_events=envs.VLLM_AGENTRIX_DP_KV_EVENTS,
                 )
                 logger.info(
                     "Enabled Agentrix DP routing: policy=%s, block_size=%d, "
@@ -1540,6 +1541,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     ):
         prefix_router = getattr(self, "prefix_router", None)
         if prefix_router is not None:
+            if (
+                payload := getattr(outputs, "kv_cache_event_payload", None)
+            ) is not None:
+                prefix_router.observe_cache_events(outputs.engine_index, payload)
             prefix_router.observe_outputs(
                 outputs.outputs,
                 outputs.finished_requests,

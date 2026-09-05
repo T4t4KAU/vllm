@@ -7,6 +7,9 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import msgspec
+
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -52,7 +55,11 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    MLAAttentionSpec,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -119,6 +126,23 @@ class Scheduler(SchedulerInterface):
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
         )
+        routing_spec = (
+            kv_cache_config.kv_cache_groups[0].kv_cache_spec
+            if len(kv_cache_config.kv_cache_groups) == 1
+            else None
+        )
+        self.kv_routing_events = (
+            envs.VLLM_AGENTRIX_DP_KV_EVENTS
+            and envs.VLLM_AGENTRIX_DP_ROUTING_POLICY != "native"
+            # Dense DP engine cores rewrite their parallel size to one.
+            # This flag preserves the actual internal-balancer contract.
+            and include_finished_set
+            # Other subclasses may recycle gaps or reserve non-prefix blocks.
+            and type(routing_spec) in (FullAttentionSpec, MLAAttentionSpec)
+        )
+        self.enable_kv_cache_events |= self.kv_routing_events
+        if self.kv_routing_events:
+            logger.info("Enabled DP GPU cache event feedback")
         # Diffusion models may not sample any tokens for a denoising step.
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
@@ -1805,6 +1829,9 @@ class Scheduler(SchedulerInterface):
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
+        routing_payload = (
+            msgspec.msgpack.encode(events or []) if self.kv_routing_events else None
+        )
 
         # collect KV cache events from connector
         if self.connector is not None:
@@ -1863,6 +1890,11 @@ class Scheduler(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        if routing_payload is not None:
+            if 0 not in engine_core_outputs:
+                engine_core_outputs[0] = EngineCoreOutputs()
+            engine_core_outputs[0].kv_cache_event_payload = routing_payload
 
         return engine_core_outputs
 
