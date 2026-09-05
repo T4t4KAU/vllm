@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     VLLM_AGENTRIX_KV_PLACEMENT_ACTIVE: bool = False
     VLLM_AGENTRIX_KV_PLACEMENT_SCAN_BUDGET: int = 64
     VLLM_AGENTRIX_KV_PROACTIVE_BACKUP: bool = False
+    VLLM_AGENTRIX_KV_PROACTIVE_ASYNC: bool = False
     VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK: float = 0.8
     VLLM_AGENTRIX_KV_BACKUP_SCAN_BUDGET: int = 32
     VLLM_AGENTRIX_KV_BACKUP_BATCH_BLOCKS: int = 64
@@ -1216,6 +1217,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_AGENTRIX_KV_PROACTIVE_BACKUP": lambda: bool(
         int(os.getenv("VLLM_AGENTRIX_KV_PROACTIVE_BACKUP", "0"))
+    ),
+    "VLLM_AGENTRIX_KV_PROACTIVE_ASYNC": lambda: bool(
+        int(os.getenv("VLLM_AGENTRIX_KV_PROACTIVE_ASYNC", "0"))
     ),
     "VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK": lambda: float(
         os.getenv("VLLM_AGENTRIX_KV_BACKUP_HIGH_WATERMARK", "0.8")

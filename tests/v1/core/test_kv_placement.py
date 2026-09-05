@@ -186,6 +186,23 @@ def test_active_plan_applies_tier_priority_and_protects_shared_prefix() -> None:
     assert stats.unbacked_discarded_blocks == 1
 
 
+def test_active_plan_never_reclaims_shared_prefixes() -> None:
+    pool = BlockPool(num_gpu_blocks=3, enable_caching=True, hash_block_size=1)
+    index = _index(num_blocks=3)
+    pool.set_observer(index)
+    blocks = [_cache_pool_block(pool, block_id) for block_id in range(1, 3)]
+    for block in blocks:
+        for _ in range(2):
+            pool.touch([block])
+            pool.free_blocks([block])
+
+    planner = KVPlacementPlanner(scan_budget=2, active=True)
+
+    assert not planner.plan_and_apply_for_allocation(index, 1, pool)
+    assert all(block.block_hash is not None for block in blocks)
+    assert index.snapshot().shared_cache_evictions == 0
+
+
 def test_active_plan_excludes_current_cache_hits() -> None:
     index = _index(num_blocks=5)
     _cache_and_release(index, 1)
