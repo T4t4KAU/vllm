@@ -730,12 +730,12 @@ class KVResidencyIndex:
             block_id = self.entries[block_id].next
         return block_ids
 
-    def placement_metadata(self, block_id: int) -> tuple[int, bool, int, bool]:
-        """Return generation, lower-copy, reuse, and in-flight state."""
+    def placement_metadata(self, block_id: int) -> tuple[int, int, int, bool]:
+        """Return generation, lower tiers, reuse, and in-flight state."""
         entry = self.entries[block_id]
         return (
             entry.generation,
-            bool(entry.residency & _LOWER_TIERS),
+            entry.residency & _LOWER_TIERS,
             entry.reuse_count,
             block_id in self._inflight,
         )

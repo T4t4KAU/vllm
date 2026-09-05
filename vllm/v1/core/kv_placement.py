@@ -11,6 +11,7 @@ from vllm import envs
 from vllm.v1.core.kv_residency import (
     KVBlockState,
     KVResidencyIndex,
+    KVResidencyTier,
 )
 
 if TYPE_CHECKING:
@@ -138,6 +139,7 @@ _PROTECTED_STATES = (
 )
 _CANDIDATE_PRIORITY = attrgetter("priority")
 _EMPTY_BLOCK_IDS: frozenset[int] = frozenset()
+_CPU_TIER = int(KVResidencyTier.CPU)
 
 
 class KVPlacementPlanner:
@@ -313,25 +315,30 @@ class KVPlacementPlanner:
                 if block_id in excluded_ids:
                     excluded_blocks += 1
                     continue
-                generation, has_lower_copy, reuse_count, backing_up = (
+                generation, lower_tiers, reuse_count, backing_up = (
                     index.placement_metadata(block_id)
                 )
                 if backing_up:
                     deferred_blocks += 1
                     continue
 
-                if has_lower_copy:
+                if lower_tiers:
                     action = KVPlacementAction.RELEASE_GPU
-                    priority = 0
+                    priority = 0 if lower_tiers & _CPU_TIER else 1
                 elif state == KVBlockState.COLD and reuse_count == 0:
                     action = KVPlacementAction.DISCARD
-                    priority = 1
+                    priority = 2
                 elif self.active:
                     action = KVPlacementAction.DISCARD_UNBACKED
-                    priority = 2
+                    priority = 5 if reuse_count else 2
                 else:
                     action = KVPlacementAction.BACKUP_TO_CPU
-                    priority = 2
+                    priority = 5 if reuse_count else 2
+                if not lower_tiers:
+                    if state == KVBlockState.COOLING:
+                        priority += 1
+                    elif state == KVBlockState.WARM:
+                        priority += 2
 
                 if candidate_count == len(candidates):
                     candidates.append(_KVPlacementCandidate())

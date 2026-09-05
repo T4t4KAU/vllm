@@ -14,7 +14,11 @@ from vllm.v1.core.kv_placement import (
     KVPlacementPlanner,
     create_kv_placement_planner,
 )
-from vllm.v1.core.kv_residency import KVResidencyIndex, KVResidencyTier
+from vllm.v1.core.kv_residency import (
+    KVBlockState,
+    KVResidencyIndex,
+    KVResidencyTier,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -184,6 +188,52 @@ def test_active_plan_applies_tier_priority_and_protects_shared_prefix() -> None:
     assert stats.applied_plans == 1
     assert stats.applied_blocks == 2
     assert stats.unbacked_discarded_blocks == 1
+
+
+def test_active_plan_prefers_cpu_over_remote_backup() -> None:
+    index = _index(num_blocks=4)
+    remote_generation = _cache_and_release(index, 1)
+    cpu_generation = _cache_and_release(index, 2)
+    assert index.start_backup(1, remote_generation, KVResidencyTier.REMOTE, 1)
+    assert index.finish_backup(
+        1,
+        remote_generation,
+        KVResidencyTier.REMOTE,
+        1,
+        success=True,
+    )
+    assert index.start_backup(2, cpu_generation, KVResidencyTier.CPU, 2)
+    assert index.finish_backup(
+        2,
+        cpu_generation,
+        KVResidencyTier.CPU,
+        2,
+        success=True,
+    )
+    index.advance(now_ns=101_000_000_000)
+    index.advance(now_ns=101_000_000_000)
+
+    plan = KVPlacementPlanner(scan_budget=3, active=True).plan(index, 2)
+
+    assert [decision.block_id for decision in plan.decisions] == [2, 1]
+    assert all(
+        decision.action == KVPlacementAction.RELEASE_GPU for decision in plan.decisions
+    )
+
+
+def test_active_plan_prefers_unreused_warm_block_over_reused_cold_block() -> None:
+    index = _index(num_blocks=4)
+    _cache_and_release(index, 1)
+    index.on_cache_hit(1, 1)
+    index.on_released(1, 0)
+    index.advance(now_ns=101_000_000_000)
+    index.advance(now_ns=101_000_000_000)
+    _cache_and_release(index, 2)
+
+    plan = KVPlacementPlanner(scan_budget=3, active=True).plan(index, 1)
+
+    assert plan.decisions[0].block_id == 2
+    assert plan.decisions[0].state == KVBlockState.WARM
 
 
 def test_active_plan_never_reclaims_shared_prefixes() -> None:
