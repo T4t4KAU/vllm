@@ -4,7 +4,7 @@
 
 from collections import defaultdict
 from collections.abc import Iterator
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import AttentionSpec
 
-_PREFIX_CHUNK_TOKENS = 2048
+_PREFIX_CHUNK_TOKENS = 1024
 _MAX_SPLITS_PER_QUERY = 32
 _MAX_FORK_WORKSPACE_BYTES = 256 * 1024 * 1024
 _MAX_FORK_CUDAGRAPH_CTAS = 512
@@ -330,11 +330,16 @@ def _cudagraph_group_capacities(capacity: int) -> dict[int, int]:
     return {32: max(1, capacity // 4), 16: capacity}
 
 
-def _fork_cudagraph_cta_capacity(num_queries: int) -> int | None:
+def _fork_cudagraph_cta_capacity(num_queries: int, max_splits: int = 4) -> int | None:
     if num_queries <= 1:
         return None
     capacity = max(16, next_power_of_2(2 * num_queries))
-    return capacity if capacity <= _MAX_FORK_CUDAGRAPH_CTAS else None
+    if capacity > _MAX_FORK_CUDAGRAPH_CTAS:
+        return None
+    # Reserve long-prefix splits for full M32 cohorts (eight queries at ratio
+    # four), which own one quarter of the rows. Fragmented forests can fall back.
+    prefix_capacity = next_power_of_2(4 * max_splits * cdiv(num_queries, 8))
+    return max(capacity, min(prefix_capacity, _MAX_FORK_CUDAGRAPH_CTAS))
 
 
 def _iter_cudagraph_segments(
@@ -427,7 +432,9 @@ class _ForkCUDAGraphWorkspace:
         head_ratio = num_heads_q // num_heads_kv
         max_group_capacities = _cudagraph_group_capacities(max_ctas)
         for tile_m in (32, 16):
-            graph_kv_tokens = max_model_len if tile_m == 32 else 1
+            # M16 also handles long prefixes shared by small query cohorts.
+            # A fixed N16 tile serializes those loads in graph replay.
+            graph_kv_tokens = max_model_len
             tile = _get_mnw(
                 tile_m // self.kernel_head_ratio,
                 head_ratio,
@@ -638,7 +645,7 @@ def _get_mnw(
 
 def _prefix_chunk_blocks(block_size: int, max_complete_blocks: int) -> int:
     requested = max(1, cdiv(_PREFIX_CHUNK_TOKENS, block_size))
-    bounded = max(1, cdiv(max_complete_blocks, 8))
+    bounded = max(1, cdiv(max_complete_blocks, 10))
     return max(requested, bounded)
 
 
@@ -650,7 +657,11 @@ def _add_trie_path(
     root.query_ids.append(query_id)
     node = root
     for block_id in block_ids:
-        node = node.children.setdefault(block_id, _PrefixTrieNode())
+        child = node.children.get(block_id)
+        if child is None:
+            child = _PrefixTrieNode()
+            node.children[block_id] = child
+        node = child
         node.query_ids.append(query_id)
     node.terminal_query_ids.append(query_id)
 
@@ -953,6 +964,101 @@ def _build_fork_plan(
     )
 
 
+class _ForkPlanCache:
+    """Reuse a decode forest only after checking every active physical block.
+
+    Complete-block boundaries determine topology. Within those boundaries only
+    the private partial segments change. Owned block snapshots also detect
+    in-place remapping, eviction and request reordering without scheduler hints.
+    """
+
+    def __init__(self) -> None:
+        self.key: tuple[Any, ...] | None = None
+        self.rows: list[np.ndarray] = []
+        self.plan: _ForkPlan | None = None
+
+    def build(
+        self,
+        *,
+        query_start_locs: list[int],
+        seq_lens: list[int],
+        block_rows: list[list[int]] | np.ndarray,
+        block_row_indices: np.ndarray | None = None,
+        num_actual_tokens: int,
+        block_size: int,
+        head_ratio: int,
+        require_shared: bool,
+    ) -> _ForkPlan | None:
+        num_reqs = len(seq_lens)
+        key = None
+        rows: list[np.ndarray] = []
+        if (
+            isinstance(block_rows, np.ndarray)
+            and block_rows.ndim == 2
+            and block_size > 0
+            and num_actual_tokens == num_reqs
+            and query_start_locs == list(range(num_reqs + 1))
+            and all(length > 0 for length in seq_lens)
+            and (block_row_indices is None or len(block_row_indices) >= num_reqs)
+        ):
+            counts = tuple(cdiv(length, block_size) for length in seq_lens)
+            indices = (
+                range(num_reqs)
+                if block_row_indices is None
+                else block_row_indices[:num_reqs]
+            )
+            if (
+                sum(counts) <= _MAX_FORK_PLAN_BLOCK_VISITS
+                and max(counts, default=0) <= block_rows.shape[1]
+                and all(0 <= i < len(block_rows) for i in indices)
+                and (block_row_indices is not None or len(block_rows) == num_reqs)
+            ):
+                key = (
+                    block_size,
+                    head_ratio,
+                    require_shared,
+                    counts,
+                    tuple(length // block_size for length in seq_lens),
+                )
+                rows = [block_rows[i, :n] for i, n in zip(indices, counts)]
+
+        if (
+            key is not None
+            and key == self.key
+            and self.plan is not None
+            and all(np.array_equal(row, old) for row, old in zip(rows, self.rows))
+        ):
+            segments = tuple(
+                replace(
+                    segment,
+                    num_kv_tokens=seq_lens[segment.query_ids[0]] % block_size,
+                )
+                if segment.num_kv_tokens % block_size
+                else segment
+                for segment in self.plan.segments
+            )
+            return replace(self.plan, segments=segments)
+
+        self.key = None
+        self.rows = []
+        self.plan = None
+        plan = _build_fork_plan(
+            query_start_locs=query_start_locs,
+            seq_lens=seq_lens,
+            block_rows=block_rows,
+            block_row_indices=block_row_indices,
+            num_actual_tokens=num_actual_tokens,
+            block_size=block_size,
+            head_ratio=head_ratio,
+            require_shared=require_shared,
+        )
+        if key is not None and plan is not None:
+            self.rows = [row.copy() for row in rows]
+            self.plan = plan
+            self.key = key
+        return plan
+
+
 def _pack_fork_plan(
     plan: _ForkPlan,
     *,
@@ -1113,7 +1219,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             reverse=True,
         )
         for max_queries in candidate_sizes:
-            max_ctas = _fork_cudagraph_cta_capacity(max_queries)
+            max_ctas = _fork_cudagraph_cta_capacity(max_queries, max_splits)
             if max_ctas is None:
                 continue
             workspace_bytes = _fork_workspace_bytes(
@@ -1152,7 +1258,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             return
 
         local_queries, _, local_splits = self._get_cudagraph_capture_limits()
-        max_ctas = _fork_cudagraph_cta_capacity(max_queries)
+        max_ctas = _fork_cudagraph_cta_capacity(max_queries, max_splits)
         if max_ctas is None or max_queries > local_queries or max_splits > local_splits:
             raise _ForkWorkspaceLimitError(
                 "ForkAttention CUDA graph workspace limits exceed builder capacity"
@@ -1191,6 +1297,13 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def clear_prebuilt_plan(self) -> None:
         self._fork_prebuilt_plan = None
 
+    def _get_fork_plan_cache(self) -> _ForkPlanCache:
+        cache = getattr(self, "_fork_plan_cache", None)
+        if cache is None:
+            cache = _ForkPlanCache()
+            self._fork_plan_cache = cache
+        return cache
+
     def prepare_cudagraph_plan(
         self,
         seq_lens: torch.Tensor | np.ndarray,
@@ -1216,7 +1329,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             seq_lens_list = [int(value) for value in seq_lens[:num_reqs].tolist()]
         else:
             seq_lens_list = [int(value) for value in seq_lens[:num_reqs]]
-        plan = _build_fork_plan(
+        plan = self._get_fork_plan_cache().build(
             query_start_locs=list(range(num_reqs + 1)),
             seq_lens=seq_lens_list,
             block_rows=block_table,
@@ -1330,7 +1443,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                     raise _ForkPlanError("block-table row mapping is too short")
                 block_rows = block_table_cpu
 
-            plan = _build_fork_plan(
+            plan = self._get_fork_plan_cache().build(
                 query_start_locs=query_start_locs,
                 seq_lens=seq_lens,
                 block_rows=block_rows,

@@ -54,6 +54,35 @@ def test_flash_cudagraph_does_not_match_a_fork_plan() -> None:
     assert not _is_compatible(captured, 32, 32, 1, 0, ForkGraphPlan(32, 4))
 
 
+@pytest.mark.parametrize("num_reqs", [8, 16])
+def test_long_prefix_fits_the_captured_fork_graph(num_reqs):
+    from vllm.v1.attention.backends.fork_attn import (
+        _build_fork_plan,
+        _get_plan_cudagraph_requirements,
+    )
+
+    plan = _build_fork_plan(
+        query_start_locs=list(range(num_reqs + 1)),
+        seq_lens=[16385] * num_reqs,
+        block_rows=[list(range(1024)) + [1024 + i] for i in range(num_reqs)],
+        num_actual_tokens=num_reqs,
+        block_size=16,
+        head_ratio=4,
+        require_shared=True,
+    )
+    assert plan is not None
+    ctas, splits = _get_plan_cudagraph_requirements(
+        plan,
+        head_ratio=4,
+        head_dim=128,
+        block_size=16,
+    )
+    captured = _get_fork_graph_capture_plan(num_reqs, 64, 16)
+    assert captured is not None
+    assert ctas <= captured.capacity
+    assert splits <= captured.max_splits
+
+
 def _mock_dp_reduce(
     monkeypatch: pytest.MonkeyPatch,
     remote_column: list[int],

@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.fork_attn import (
     _build_fork_plan,
     _flash_metadata_kwargs,
     _ForkCUDAGraphWorkspace,
+    _ForkPlanCache,
     _ForkPlanError,
     _ForkSegment,
     _get_plan_cudagraph_requirements,
@@ -188,6 +189,93 @@ def test_fork_plan_rejects_invalid_active_block_id() -> None:
             head_ratio=4,
             require_shared=True,
         )
+
+
+def test_fork_plan_cache_updates_partial_blocks_without_rebuilding(monkeypatch):
+    cache = _ForkPlanCache()
+    kwargs = dict(
+        query_start_locs=[0, 1, 2],
+        seq_lens=[33, 35],
+        block_rows=np.array([[10, 11, 20], [10, 12, 21]], dtype=np.int32),
+        num_actual_tokens=2,
+        block_size=16,
+        head_ratio=4,
+        require_shared=True,
+    )
+    first = cache.build(**kwargs)
+    kwargs["seq_lens"] = [47, 34]
+    expected = _build_fork_plan(**kwargs)
+
+    def fail_rebuild(**kwargs):
+        pytest.fail("unchanged physical blocks must reuse the decode forest")
+
+    monkeypatch.setattr(fork_attn_backend, "_build_fork_plan", fail_rebuild)
+    assert cache.build(**kwargs) == expected
+    assert [s.num_kv_tokens for s in first.segments][-2:] == [1, 3]
+
+
+@pytest.mark.parametrize(
+    "change", ["boundary", "remap", "reorder", "remove", "replace", "invalid"]
+)
+def test_fork_plan_cache_invalidates_changed_active_blocks(change):
+    cache = _ForkPlanCache()
+    rows = np.array([[10, 11, 20, 30], [10, 12, 21, 31]], dtype=np.int32)
+    kwargs = dict(
+        query_start_locs=[0, 1, 2],
+        seq_lens=[47, 47],
+        block_rows=rows,
+        block_row_indices=np.array([0, 1], dtype=np.int32),
+        num_actual_tokens=2,
+        block_size=16,
+        head_ratio=4,
+        require_shared=True,
+    )
+    assert cache.build(**kwargs) is not None
+    if change == "boundary":
+        kwargs["seq_lens"] = [49, 48]
+    elif change == "remap":
+        rows[:, 0] = 40
+    elif change == "reorder":
+        kwargs["block_row_indices"][:] = [1, 0]
+    elif change == "remove":
+        kwargs.update(query_start_locs=[0, 1], seq_lens=[47], num_actual_tokens=1)
+        kwargs["block_row_indices"] = np.array([1], dtype=np.int32)
+    elif change == "replace":
+        rows[1] = [100, 101, 102, 103]
+    else:
+        rows[0, 0] = -1
+        with pytest.raises(_ForkPlanError, match="non-negative"):
+            cache.build(**kwargs)
+        assert cache.plan is None
+        return
+    assert cache.build(**kwargs) == _build_fork_plan(**kwargs)
+
+
+def test_fork_plan_cache_matches_fresh_plans_during_decode():
+    rng = np.random.default_rng(42)
+    cache = _ForkPlanCache()
+    rows = np.arange(8 * 64, dtype=np.int32).reshape(8, 64)
+    rows[:, :16] = rows[0, :16]
+    rows[:4, 16:24] = rows[0, 16:24]
+    lengths = rng.integers(400, 450, size=8)
+    for step in range(64):
+        indices = np.arange(8, dtype=np.int32)
+        if step % 7 == 0:
+            rng.shuffle(indices)
+        if step % 11 == 0:
+            rows[0, 30] += 1000
+        lengths += rng.integers(0, 3, size=8)
+        kwargs = dict(
+            query_start_locs=list(range(9)),
+            seq_lens=lengths.tolist(),
+            block_rows=rows,
+            block_row_indices=indices,
+            num_actual_tokens=8,
+            block_size=16,
+            head_ratio=4,
+            require_shared=True,
+        )
+        assert cache.build(**kwargs) == _build_fork_plan(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -565,14 +653,14 @@ def test_cudagraph_workspace_matches_actual_capture_sizes() -> None:
     builder.vllm_config.scheduler_config.max_num_seqs = 127
     builder.vllm_config.compilation_config.cudagraph_capture_sizes = [16]
 
-    assert builder._get_cudagraph_capture_limits() == (16, 32, 4)
+    assert builder._get_cudagraph_capture_limits() == (16, 64, 8)
 
     workspace = builder._get_fork_cudagraph_workspace(torch.device("cpu"))
     assert workspace.max_queries == 16
-    assert workspace.max_ctas == 32
-    assert workspace.max_splits == 4
-    assert workspace.split_out.shape == (16, 64, 4, 256)
-    assert [workspace.groups[tile].cta_capacity for tile in (32, 16)] == [8, 32]
+    assert workspace.max_ctas == 64
+    assert workspace.max_splits == 8
+    assert workspace.split_out.shape == (16, 64, 8, 256)
+    assert [workspace.groups[tile].cta_capacity for tile in (32, 16)] == [16, 64]
 
 
 def test_cudagraph_workspace_uses_common_attention_group_limits() -> None:
@@ -955,6 +1043,106 @@ def test_fork_backend_forward_matches_flash_attention(
         return_softmax_lse=True,
     )
     torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() and current_platform.has_device_capability(80)),
+    reason="ForkAttention requires CUDA SM80+",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cached_fork_graph_matches_flash_during_decode(dtype):
+    torch.manual_seed(18)
+    batch, block_size, heads, kv_heads, dim = 3, 16, 32, 8, 128
+    rows = np.array(
+        [list(range(8)) + list(range(8 + i * 4, 12 + i * 4)) for i in range(batch)],
+        dtype=np.int32,
+    )
+    cache = _ForkPlanCache()
+    workspace = _ForkCUDAGraphWorkspace(
+        num_heads_q=heads,
+        num_heads_kv=kv_heads,
+        head_dim=dim,
+        block_size=block_size,
+        max_model_len=192,
+        max_queries=batch,
+        max_ctas=64,
+        max_splits=16,
+        device=torch.device("cuda"),
+        pin_memory=True,
+    )
+    q = torch.randn(batch, 1, heads, dim, dtype=dtype, device="cuda")
+    kv = torch.randn(20, 2, block_size, kv_heads, dim, dtype=dtype, device="cuda")
+    k, v = kv.unbind(1)
+    out = torch.empty_like(q)
+    reference = torch.empty_like(q.view(batch, heads, dim))
+    starts = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    graph = None
+    for step, length in enumerate([157, 158, 159, 160, 161, 173]):
+        if step == 4:
+            rows[0, 7] = 19
+        lengths = [length, length - 1, length - 2]
+        plan = cache.build(
+            query_start_locs=list(range(batch + 1)),
+            seq_lens=lengths,
+            block_rows=rows,
+            num_actual_tokens=batch,
+            block_size=block_size,
+            head_ratio=4,
+            require_shared=True,
+        )
+        assert plan is not None
+        packed = workspace.pack(
+            plan, query_capacity=batch, cta_capacity=64, split_capacity=16
+        )
+
+        def run(packed=packed):
+            ops.fork_attention(
+                out,
+                packed["fork_softmax_lse"],
+                packed["fork_split_out"],
+                packed["fork_split_lse"],
+                q,
+                k,
+                v,
+                packed["fork_num_split_per_seq"],
+                packed["fork_query_tables"],
+                packed["fork_block_tables"],
+                packed["fork_num_seqs_per_ctas"],
+                packed["fork_cta_ranks"],
+                packed["fork_kv_in_ctas"],
+                packed["fork_mnw"],
+                16,
+                dim**-0.5,
+            )
+
+        if graph is None:
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                run()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+        graph.replay()
+        flash_attn_varlen_func(
+            q=q.view_as(reference),
+            k=k,
+            v=v,
+            out=reference,
+            cu_seqlens_q=starts,
+            max_seqlen_q=1,
+            seqused_k=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+            max_seqlen_k=length,
+            softmax_scale=dim**-0.5,
+            causal=True,
+            block_table=torch.tensor(rows, device="cuda"),
+            num_splits=0,
+        )
+        torch.testing.assert_close(
+            out.view_as(reference), reference, atol=2e-2, rtol=2e-2
+        )
+        torch.accelerator.synchronize()
 
 
 @pytest.mark.skipif(

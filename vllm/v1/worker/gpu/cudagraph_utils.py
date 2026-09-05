@@ -67,8 +67,12 @@ def _get_fork_graph_capture_plan(
 ) -> ForkGraphPlan | None:
     if num_reqs <= 1 or num_reqs > fork_graph_max_reqs or fork_graph_max_splits <= 0:
         return None
-    capacity = max(16, 1 << (2 * num_reqs - 1).bit_length())
-    return ForkGraphPlan(capacity, fork_graph_max_splits) if capacity <= 512 else None
+    from vllm.v1.attention.backends.fork_attn import _fork_cudagraph_cta_capacity
+
+    capacity = _fork_cudagraph_cta_capacity(num_reqs, fork_graph_max_splits)
+    return (
+        ForkGraphPlan(capacity, fork_graph_max_splits) if capacity is not None else None
+    )
 
 
 @dataclass(frozen=True)
