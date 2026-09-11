@@ -80,9 +80,16 @@ from vllm.v1.worker.gpu.async_utils import (
 )
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
+    configure_fork_attention_cudagraph,
+    get_fork_attention_cudagraph_max_reqs,
+    get_fork_attention_cudagraph_max_splits,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    prepare_fork_attention_cudagraph_plan,
+    set_fork_attention_cpu_metadata,
+    set_fork_attention_cudagraph_workspace_limits,
+    uses_fork_attention_planner,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -92,6 +99,7 @@ from vllm.v1.worker.gpu.buffer_utils import (
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
+    ForkGraphPlan,
     ModelCudaGraphManager,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
@@ -549,6 +557,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_total_logits=get_max_chunk_logits(self.vocab_size),
         )
 
+        maintain_cpu_block_tables = any(
+            uses_fork_attention_planner(group)
+            for groups in self.attn_groups
+            for group in groups
+        )
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
             max_num_reqs=self.max_num_reqs,
@@ -559,6 +572,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            maintain_cpu_copy=maintain_cpu_block_tables,
         )
         self.pcp_manager = pcp.maybe_build_pcp_manager(
             self.vllm_config,
@@ -582,6 +596,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
         )
+        fork_graph_max_reqs = get_fork_attention_cudagraph_max_reqs(self.attn_groups)
+        fork_graph_max_splits = get_fork_attention_cudagraph_max_splits(
+            self.attn_groups
+        )
+        set_fork_attention_cudagraph_workspace_limits(
+            self.attn_groups,
+            fork_graph_max_reqs,
+            fork_graph_max_splits,
+        )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
@@ -589,6 +612,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            fork_graph_max_reqs=fork_graph_max_reqs,
+            fork_graph_max_splits=fork_graph_max_splits,
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1311,6 +1336,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
+        if self.block_tables.maintain_cpu_copy:
+            set_fork_attention_cpu_metadata(
+                self.attn_groups,
+                input_batch.seq_lens_cpu_upper_bound,
+                self.block_tables.block_tables_cpu,
+                input_batch.idx_mapping_np,
+            )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
         slot_mappings = self.block_tables.compute_slot_mappings(
@@ -1453,6 +1485,37 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        fork_graph_plan = None
+        can_plan_fork_graph = (
+            not dummy_run
+            and not is_profile
+            and not skip_compiled
+            and uniform_tok_count == 1
+            and num_reqs >= self.vllm_config.attention_config.fork_min_queries
+            and self.block_tables.maintain_cpu_copy
+            and not self.model_config.is_mm_prefix_lm
+        )
+        if can_plan_fork_graph:
+            assert batch_req_state is not None
+            idx_mapping_np = batch_req_state.idx_mapping_np
+            seq_lens_np = (
+                self.req_states.num_computed_tokens_np[idx_mapping_np]
+                + batch_req_state.num_scheduled_tokens
+            )
+            requirements = prepare_fork_attention_cudagraph_plan(
+                self.attn_groups,
+                seq_lens_np,
+                self.block_tables.block_tables_cpu,
+                idx_mapping_np,
+                [
+                    self.kv_cache_config.num_blocks * blocks_per_kv_block
+                    for blocks_per_kv_block in self.block_tables.blocks_per_kv_block
+                ],
+            )
+            if requirements is not None:
+                required_ctas, required_splits = requirements
+                fork_graph_plan = ForkGraphPlan(required_ctas, required_splits)
+
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1463,7 +1526,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
+            fork_plan=fork_graph_plan,
         )
+
+        if hasattr(self, "attn_groups"):
+            configure_fork_attention_cudagraph(
+                self.attn_groups,
+                batch_desc.fork_plan.capacity
+                if batch_desc.fork_plan is not None
+                else None,
+                batch_desc.fork_plan.max_splits
+                if batch_desc.fork_plan is not None
+                else None,
+                discard_prebuilt_plan=(
+                    not can_plan_fork_graph
+                    or batch_desc.cg_mode == CUDAGraphMode.FULL
+                    and batch_desc.fork_plan is None
+                ),
+                force_flash=(
+                    batch_desc.cg_mode == CUDAGraphMode.FULL
+                    and batch_desc.fork_plan is None
+                ),
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.

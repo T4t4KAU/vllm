@@ -220,7 +220,10 @@ from vllm.v1.worker.cp_utils import (
 )
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
-from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker.gpu.attn_utils import (
+    _reshape_attention_kv_cache,
+    set_fork_attention_cpu_metadata,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -2513,6 +2516,20 @@ class GPUModelRunner(
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
         )
+
+        # The legacy runner already owns CPU block tables. Reuse them for
+        # ForkAttention planning instead of copying the device tables back.
+        # Micro-batched metadata needs request-local slicing that ForkAttention
+        # does not yet implement, so it conservatively falls back there.
+        if not for_cudagraph_capture and ubatch_slices is None:
+            set_fork_attention_cpu_metadata(
+                self.attn_groups,
+                seq_lens_cpu_upper_bound,
+                tuple(
+                    block_table.get_numpy_array()
+                    for block_table in self.input_batch.block_table.block_tables
+                ),
+            )
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(

@@ -4,7 +4,7 @@
 from dataclasses import field
 from typing import Any, Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -23,6 +23,14 @@ class AttentionConfig:
 
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
+
+    fork_min_shared_tokens: int = Field(default=16384, ge=0)
+    """Minimum complete physical prefix shared by a Fork query group.
+    Zero disables the prefix-length threshold for operator experiments."""
+
+    fork_min_queries: int = Field(default=8, ge=2)
+    """Minimum simultaneously decoded queries sharing the qualifying prefix
+    before ForkAttention constructs a forest. Applies only to FORK_ATTN."""
 
     minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "triton"
     """Sparse decode kernel used by the MiniMax M3 MSA backend."""

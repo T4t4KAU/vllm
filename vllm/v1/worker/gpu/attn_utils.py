@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, cast
 
+import numpy as np
 import torch
 
 from vllm.config import (
@@ -23,6 +24,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    ChunkedLocalAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     KVQuantMode,
@@ -586,6 +588,176 @@ def build_slot_mappings_by_layer(
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
     return slot_mappings_by_layer
+
+
+def uses_fork_attention_planner(group: AttentionGroup) -> bool:
+    """Whether a group can consume the runner's global CPU metadata.
+
+    Chunked local attention wraps its underlying backend and rewrites the GPU
+    metadata into virtual batches. Until the same transformation exists for
+    the CPU snapshot, its inherited ForkAttention backend must use the Flash
+    fallback.
+    """
+    return group.backend.get_name() == "FORK_ATTN" and not isinstance(
+        group.kv_cache_spec, ChunkedLocalAttentionSpec
+    )
+
+
+def set_fork_attention_cpu_metadata(
+    attn_groups: list[list[AttentionGroup]],
+    seq_lens_cpu: torch.Tensor,
+    block_tables_cpu: Sequence[np.ndarray],
+    block_table_indices: np.ndarray | None = None,
+) -> None:
+    """Provide exact CPU planning metadata to ForkAttention builders."""
+    for group_id, groups in enumerate(attn_groups):
+        if group_id >= len(block_tables_cpu):
+            break
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            setter = getattr(builder, "set_cpu_metadata", None)
+            if setter is not None:
+                setter(
+                    seq_lens_cpu,
+                    block_tables_cpu[group_id],
+                    block_table_indices,
+                )
+
+
+def get_fork_attention_cudagraph_max_reqs(
+    attn_groups: list[list[AttentionGroup]],
+) -> int:
+    """Return the common safe query capacity of all ForkAttention groups."""
+    limits: list[int] = []
+    for groups in attn_groups:
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            getter = getattr(builder, "get_cudagraph_max_reqs", None)
+            if getter is not None:
+                limits.append(getter())
+    return min(limits, default=0)
+
+
+def get_fork_attention_cudagraph_max_splits(
+    attn_groups: list[list[AttentionGroup]],
+) -> int:
+    """Return the common safe split capacity of all ForkAttention groups."""
+    limits: list[int] = []
+    for groups in attn_groups:
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            getter = getattr(builder, "get_cudagraph_max_splits", None)
+            if getter is not None:
+                limits.append(getter())
+    return min(limits, default=0)
+
+
+def set_fork_attention_cudagraph_workspace_limits(
+    attn_groups: list[list[AttentionGroup]],
+    max_queries: int,
+    max_splits: int,
+) -> None:
+    """Use one common workspace shape across all ForkAttention groups."""
+    for groups in attn_groups:
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            setter = getattr(builder, "set_cudagraph_workspace_limits", None)
+            if setter is not None:
+                setter(max_queries, max_splits)
+
+
+def clear_fork_attention_prebuilt_plans(
+    attn_groups: list[list[AttentionGroup]],
+) -> None:
+    for groups in attn_groups:
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            clearer = getattr(builder, "clear_prebuilt_plan", None)
+            if clearer is not None:
+                clearer()
+
+
+def prepare_fork_attention_cudagraph_plan(
+    attn_groups: list[list[AttentionGroup]],
+    seq_lens: torch.Tensor | np.ndarray,
+    block_tables_cpu: Sequence[np.ndarray],
+    block_table_indices: np.ndarray,
+    num_kernel_blocks_per_group: Sequence[int],
+) -> tuple[int, int] | None:
+    """Prebuild exact forests and return their largest CTA and split needs.
+
+    A missing plan in any ForkAttention group disables the Fork graph for the
+    whole model. Each builder retains its accepted or rejected decision so eager
+    execution can reuse it. Block counts are in kernel pages, after splitting.
+    """
+    clear_fork_attention_prebuilt_plans(attn_groups)
+    cta_requirements: list[int] = []
+    split_requirements: list[int] = []
+    found_fork_group = False
+    all_groups_eligible = True
+    for group_id, groups in enumerate(attn_groups):
+        if group_id >= len(block_tables_cpu) or group_id >= len(
+            num_kernel_blocks_per_group
+        ):
+            clear_fork_attention_prebuilt_plans(attn_groups)
+            return None
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            found_fork_group = True
+            builder = group.get_metadata_builder(0)
+            prepare = getattr(builder, "prepare_cudagraph_plan", None)
+            if prepare is None:
+                clear_fork_attention_prebuilt_plans(attn_groups)
+                return None
+            requirement = prepare(
+                seq_lens,
+                block_tables_cpu[group_id],
+                block_table_indices,
+                num_kernel_blocks_per_group[group_id],
+            )
+            if requirement is None:
+                all_groups_eligible = False
+                continue
+            cta_requirement, split_requirement = requirement
+            cta_requirements.append(cta_requirement)
+            split_requirements.append(split_requirement)
+    if not found_fork_group or not all_groups_eligible:
+        return None
+    return max(cta_requirements), max(split_requirements)
+
+
+def configure_fork_attention_cudagraph(
+    attn_groups: list[list[AttentionGroup]],
+    capacity: int | None,
+    max_splits: int | None,
+    *,
+    discard_prebuilt_plan: bool,
+    force_flash: bool,
+) -> None:
+    """Select one fixed forest graph shape on all Fork builders."""
+    for groups in attn_groups:
+        for group in groups:
+            if not uses_fork_attention_planner(group):
+                continue
+            builder = group.get_metadata_builder(0)
+            setter = getattr(builder, "set_cudagraph_plan", None)
+            if setter is not None:
+                setter(capacity, max_splits, force_flash=force_flash)
+            if discard_prebuilt_plan:
+                clearer = getattr(builder, "clear_prebuilt_plan", None)
+                if clearer is not None:
+                    clearer()
 
 
 def build_attn_metadata(

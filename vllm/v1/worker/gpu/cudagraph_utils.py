@@ -30,7 +30,10 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.attn_utils import (
+    build_slot_mappings_by_layer,
+    configure_fork_attention_cudagraph,
+)
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -46,6 +49,33 @@ class AttentionState(NamedTuple):
 
 
 @dataclass(frozen=True)
+class ForkGraphPlan:
+    """Static shape requirements for the sole ForkAttention graph variant."""
+
+    capacity: int
+    max_splits: int
+
+
+def _get_fork_graph_capture_plan(
+    num_reqs: int,
+    fork_graph_max_reqs: int,
+    fork_graph_max_splits: int,
+    fork_min_queries: int = 2,
+) -> ForkGraphPlan | None:
+    if (
+        num_reqs < fork_min_queries
+        or num_reqs > fork_graph_max_reqs
+        or fork_graph_max_splits <= 0
+    ):
+        return None
+    from vllm.v1.attention.backends.fork_attn import _fork_cudagraph_cta_capacity
+
+    capacity = _fork_cudagraph_cta_capacity(num_reqs, fork_graph_max_splits)
+    assert capacity is not None
+    return ForkGraphPlan(capacity, fork_graph_max_splits)
+
+
+@dataclass(frozen=True)
 class BatchExecutionDescriptor:
     """Describes the shape of the batch and CG mode to run; this is used to make shape
     matches between the capture and runtime."""
@@ -58,6 +88,7 @@ class BatchExecutionDescriptor:
     # uniform_token_count unset, so this is what keeps a prefill batch out of one.
     max_query_len: int | None = None
     num_active_loras: int = 0
+    fork_plan: ForkGraphPlan | None = None
 
 
 class CreateForwardFn(Protocol):
@@ -78,12 +109,20 @@ def _is_compatible(
     num_tokens: int,
     uniform_token_count: int | None,
     num_active_loras: int,
-    max_query_len: int | None,
+    max_query_len: int | None = None,
+    fork_plan: ForkGraphPlan | None = None,
 ) -> bool:
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
-    # desc.max_query_len=None means the graph does not constrain query length; a
-    # caller that does not track max_query_len must not match one that does
+    fork_plan_matches = (
+        desc.fork_plan is None
+        if fork_plan is None
+        else (
+            desc.fork_plan is not None
+            and desc.fork_plan.capacity >= fork_plan.capacity
+            and desc.fork_plan.max_splits >= fork_plan.max_splits
+        )
+    )
     return (
         (
             desc.uniform_token_count is None
@@ -96,6 +135,7 @@ def _is_compatible(
         and (desc.num_reqs is None or desc.num_reqs >= num_reqs)
         and desc.num_tokens >= num_tokens
         and desc.num_active_loras == num_active_loras
+        and fork_plan_matches
     )
 
 
@@ -108,6 +148,8 @@ class CudaGraphManager:
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        fork_graph_max_reqs: int = 0,
+        fork_graph_max_splits: int = 0,
     ):
         self.vllm_config = vllm_config
         self.device = device
@@ -117,6 +159,8 @@ class CudaGraphManager:
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
         self.varlen_decode = varlen_decode
+        self.fork_graph_max_reqs = fork_graph_max_reqs
+        self.fork_graph_max_splits = fork_graph_max_splits
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -258,6 +302,26 @@ class CudaGraphManager:
 
                     # avoid duplicate graphs
                     if desc not in descs_by_mode[decode_mode]:
+                        if decode_query_len == 1 and self.fork_graph_max_reqs > 0:
+                            fork_plan = _get_fork_graph_capture_plan(
+                                rounded_num_reqs,
+                                self.fork_graph_max_reqs,
+                                self.fork_graph_max_splits,
+                                self.vllm_config.attention_config.fork_min_queries,
+                            )
+                            if fork_plan is not None:
+                                fork_desc = BatchExecutionDescriptor(
+                                    cg_mode=decode_mode,
+                                    num_tokens=rounded_num_tokens,
+                                    num_reqs=rounded_num_reqs,
+                                    uniform_token_count=decode_query_len,
+                                    num_active_loras=num_active_loras,
+                                    fork_plan=fork_plan,
+                                )
+                                descs_by_mode[decode_mode].append(fork_desc)
+                                descs_by_token_lora[
+                                    (rounded_num_tokens, num_active_loras)
+                                ].append(fork_desc)
                         descs_by_mode[decode_mode].append(desc)
                         descs_by_token_lora[
                             (rounded_num_tokens, num_active_loras)
@@ -386,6 +450,7 @@ class CudaGraphManager:
         uniform_token_count: int | None,
         num_active_loras: int,
         max_query_len: int | None = None,
+        fork_plan: ForkGraphPlan | None = None,
     ) -> BatchExecutionDescriptor:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
@@ -400,8 +465,22 @@ class CudaGraphManager:
                     uniform_token_count,
                     effective_loras,
                     max_query_len,
+                    fork_plan,
                 ):
                     return desc
+            # A FlashAttention full graph is the safe fallback when an exact
+            # forest exceeds the captured ForkAttention CTA bucket.
+            if fork_plan is not None:
+                for desc in self._candidates[key]:
+                    if _is_compatible(
+                        desc,
+                        num_reqs,
+                        num_tokens,
+                        uniform_token_count,
+                        effective_loras,
+                        max_query_len,
+                    ):
+                        return desc
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
@@ -449,6 +528,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         decode_query_len: int,
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
+        fork_graph_max_reqs: int = 0,
+        fork_graph_max_splits: int = 0,
     ):
         super().__init__(
             vllm_config,
@@ -457,6 +538,8 @@ class ModelCudaGraphManager(CudaGraphManager):
             decode_query_len,
             lora_capture_cases=lora_capture_cases,
             varlen_decode=varlen_decode,
+            fork_graph_max_reqs=fork_graph_max_reqs,
+            fork_graph_max_splits=fork_graph_max_splits,
         )
         self.hidden_states: torch.Tensor | None = None
         self.aux_hidden_states: list[torch.Tensor] = []
@@ -488,6 +571,15 @@ class ModelCudaGraphManager(CudaGraphManager):
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+            configure_fork_attention_cudagraph(
+                attn_groups,
+                desc.fork_plan.capacity if desc.fork_plan is not None else None,
+                desc.fork_plan.max_splits if desc.fork_plan is not None else None,
+                discard_prebuilt_plan=True,
+                force_flash=(
+                    desc.cg_mode == CUDAGraphMode.FULL and desc.fork_plan is None
+                ),
+            )
 
             # Set LoRA state before capture so kernels see correct adapters.
             if lora_capture_hook is not None:

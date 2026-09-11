@@ -1176,6 +1176,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     message(STATUS "Building hadacore")
   endif()
 
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    # Experimental ForkAttention decode kernel.
+    cuda_archs_loose_intersection(
+      FORK_ARCHS
+      "8.0;8.6;8.7;8.9;9.0;10.0;10.1;10.3;11.0;12.0;12.1"
+      "${CUDA_ARCHS}")
+    if(FORK_ARCHS)
+      set(FORK_ATTN_SRCS
+        "csrc/libtorch_stable/attention/fork/fork_attention.cu"
+        "csrc/libtorch_stable/attention/fork/fork_fwd_hdim64.cu"
+        "csrc/libtorch_stable/attention/fork/fork_fwd_hdim128.cu"
+        "csrc/libtorch_stable/attention/fork/fork_fwd_hdim256.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${FORK_ATTN_SRCS}"
+        CUDA_ARCHS "${FORK_ARCHS}")
+      list(APPEND VLLM_STABLE_EXT_SRC "${FORK_ATTN_SRCS}")
+      message(STATUS "Building experimental ForkAttention for archs: ${FORK_ARCHS}")
+    endif()
+  endif()
+
   # if CUDA endif
   endif()
 
@@ -1235,6 +1255,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(KIMI_K3_ATTN_RES_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_KIMI_K3_ATTN_RES=1)
+    endif()
+    if(FORK_ARCHS)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_FORK_ATTENTION=1)
     endif()
     # Needed by CUTLASS kernels
     target_compile_definitions(_C_stable_libtorch PRIVATE

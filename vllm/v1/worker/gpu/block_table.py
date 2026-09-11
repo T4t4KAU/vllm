@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -26,6 +27,7 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
+        maintain_cpu_copy: bool = False,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
@@ -36,6 +38,7 @@ class BlockTables:
         self.cp_size = cp_size
         self.cp_rank = cp_rank
         self.cp_interleave = cp_interleave
+        self.maintain_cpu_copy = maintain_cpu_copy
 
         self.num_kv_cache_groups = len(self.block_sizes)
         assert len(max_num_blocks_per_group) == self.num_kv_cache_groups
@@ -46,12 +49,16 @@ class BlockTables:
 
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
+        self.block_tables_cpu: list[np.ndarray] = []
         for i in range(self.num_kv_cache_groups):
             max_num_blocks = max_num_blocks_per_group[i] * self.blocks_per_kv_block[i]
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks), dtype=torch.int32, device=device
             )
             self.block_tables.append(block_table)
+            if maintain_cpu_copy:
+                shape = (self.max_num_reqs, max_num_blocks)
+                self.block_tables_cpu.append(np.zeros(shape, dtype=np.int32))
 
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs),
@@ -111,12 +118,18 @@ class BlockTables:
         overwrite: bool,
     ) -> None:
         for i in range(self.num_kv_cache_groups):
-            start = self.num_blocks.np[i, req_index] if not overwrite else 0
+            old_num_blocks = int(self.num_blocks.np[i, req_index])
+            start = old_num_blocks if not overwrite else 0
             block_ids = new_block_ids[i]
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]
             self.block_tables[i].stage_write(req_index, start, block_ids)
+            if self.maintain_cpu_copy:
+                if overwrite and old_num_blocks:
+                    self.block_tables_cpu[i][req_index, :old_num_blocks].fill(0)
+                end = start + len(block_ids)
+                self.block_tables_cpu[i][req_index, start:end] = block_ids
             self.num_blocks.np[i, req_index] = start + len(block_ids)
 
     def apply_staged_writes(self) -> None:

@@ -3,14 +3,23 @@
 
 import torch
 
+from vllm.model_executor.layers.attention.chunked_local_attention import (
+    create_chunked_local_attention_backend,
+)
+from vllm.v1.attention.backends.fork_attn import ForkAttentionBackend
 from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheTensor,
     KVQuantMode,
     MambaSpec,
 )
-from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
+from vllm.v1.worker.gpu.attn_utils import (
+    _reshape_kv_cache,
+    set_fork_attention_cpu_metadata,
+    uses_fork_attention_planner,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -40,6 +49,54 @@ class FakeHNDFlashAttentionBackend(FakeFlashAttentionBackend):
     ) -> tuple[int, ...]:
         assert not include_num_layers_dimension
         return (0, 1, 3, 2, 4)
+
+
+class RecordingMetadataBuilder:
+    def __init__(self) -> None:
+        self.cpu_metadata: tuple[object, ...] | None = None
+
+    def set_cpu_metadata(self, *cpu_metadata: object) -> None:
+        self.cpu_metadata = cpu_metadata
+
+
+def test_chunked_local_attention_does_not_receive_global_fork_metadata() -> None:
+    full_spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    chunked_spec = ChunkedLocalAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.float16,
+        attention_chunk_size=32,
+    )
+    chunked_backend = create_chunked_local_attention_backend(
+        ForkAttentionBackend, attention_chunk_size=32
+    )
+    full_group = AttentionGroup(ForkAttentionBackend, ["full"], full_spec, 0)
+    chunked_group = AttentionGroup(chunked_backend, ["chunked"], chunked_spec, 0)
+    full_builder = RecordingMetadataBuilder()
+    chunked_builder = RecordingMetadataBuilder()
+    full_group.metadata_builders = [full_builder]  # type: ignore[list-item]
+    chunked_group.metadata_builders = [chunked_builder]  # type: ignore[list-item]
+
+    # The wrapper inherits the underlying name, which is insufficient to decide
+    # whether its builder can consume the untransformed global CPU metadata.
+    assert chunked_backend.get_name() == "FORK_ATTN"
+    assert uses_fork_attention_planner(full_group)
+    assert not uses_fork_attention_planner(chunked_group)
+
+    seq_lens = torch.tensor([48], dtype=torch.int32)
+    block_table = torch.tensor([[10, 11, 12]], dtype=torch.int32).numpy()
+    set_fork_attention_cpu_metadata(
+        [[full_group, chunked_group]], seq_lens, [block_table]
+    )
+
+    assert full_builder.cpu_metadata is not None
+    assert chunked_builder.cpu_metadata is None
 
 
 def test_reshape_padded_flash_attention_kv_cache_strides_by_page():
