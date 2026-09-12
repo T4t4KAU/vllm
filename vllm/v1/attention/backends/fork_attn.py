@@ -49,6 +49,14 @@ _MIN_FORK_CUDAGRAPH_CTAS = 2
 
 
 @dataclass
+class _ForkMixedBatch:
+    num_fork_queries: int
+    fork_tokens: slice | torch.Tensor
+    flash_tokens: slice | torch.Tensor
+    flash_metadata: FlashAttentionMetadata
+
+
+@dataclass
 class ForkAttentionMetadata(FlashAttentionMetadata):
     fork_enabled: bool = False
     fork_num_split_per_seq: torch.Tensor | None = None
@@ -63,6 +71,7 @@ class ForkAttentionMetadata(FlashAttentionMetadata):
     fork_softmax_lse: torch.Tensor | None = None
     fork_split_out: torch.Tensor | None = None
     fork_split_lse: torch.Tensor | None = None
+    fork_mixed_batch: _ForkMixedBatch | None = None
 
 
 @dataclass(frozen=True)
@@ -1590,7 +1599,6 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         prebuilt_result: _ForkPlanningResult | None = None,
     ) -> dict[str, Any]:
         graph_capacity = getattr(self, "_fork_cudagraph_capacity", None)
-        graph_max_splits = getattr(self, "_fork_cudagraph_max_splits", None)
         if getattr(self, "_fork_cudagraph_force_flash", False):
             return {}
         if not self._can_build_fork(metadata, num_reqs):
@@ -1599,6 +1607,15 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                     "captured ForkAttention graph received incompatible metadata"
                 )
             return {}
+
+        if metadata.max_query_len != 1:
+            if graph_capacity is not None:
+                raise _ForkPlanError(
+                    "captured ForkAttention graph received a mixed batch"
+                )
+            return self._build_mixed_fork_kwargs(
+                metadata, query_start_loc_cpu, num_reqs, cpu_metadata
+            )
 
         plan: _ForkPlan | None
         if prebuilt_result is not None:
@@ -1652,6 +1669,13 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                     "captured ForkAttention graph received an empty runtime plan"
                 )
             return {}
+        return self._pack_fork_kwargs(metadata, plan)
+
+    def _pack_fork_kwargs(
+        self, metadata: FlashAttentionMetadata, plan: _ForkPlan
+    ) -> dict[str, Any]:
+        graph_capacity = getattr(self, "_fork_cudagraph_capacity", None)
+        graph_max_splits = getattr(self, "_fork_cudagraph_max_splits", None)
         if graph_capacity is not None:
             assert graph_max_splits is not None
             workspace = self._get_fork_cudagraph_workspace(metadata.block_table.device)
@@ -1684,6 +1708,137 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             )
         except _ForkWorkspaceLimitError:
             return {}
+
+    def _build_mixed_fork_kwargs(
+        self,
+        metadata: FlashAttentionMetadata,
+        query_start_loc_cpu: torch.Tensor,
+        num_reqs: int,
+        cpu_metadata: tuple[torch.Tensor, np.ndarray, np.ndarray | None] | None,
+    ) -> dict[str, Any]:
+        if cpu_metadata is None:
+            return {}
+        starts = query_start_loc_cpu[: num_reqs + 1].numpy()
+        if (
+            len(starts) != num_reqs + 1
+            or starts[0] != 0
+            or starts[-1] != metadata.num_actual_tokens
+            or np.any(starts[1:] < starts[:-1])
+        ):
+            raise _ForkPlanError("query start locations must cover the query tensor")
+        query_lens = np.diff(starts)
+        policy = self.vllm_config.attention_config
+        candidates = np.flatnonzero(query_lens == 1)
+        if len(candidates) < policy.fork_min_queries:
+            return {}
+
+        seq_lens_cpu, block_rows, row_mapping = cpu_metadata
+        if seq_lens_cpu.device.type != "cpu":
+            raise _ForkPlanError("ForkAttention CPU sequence lengths must be on CPU")
+        seq_lens = seq_lens_cpu[:num_reqs].numpy()
+        if len(seq_lens) != num_reqs or (
+            row_mapping is not None and len(row_mapping) < num_reqs
+        ):
+            raise _ForkPlanError("request metadata has inconsistent row counts")
+        prefix_blocks = max(1, cdiv(policy.fork_min_shared_tokens, self.block_size))
+        cohorts: defaultdict[bytes, list[int]] = defaultdict(list)
+        for req_id in candidates:
+            if seq_lens[req_id] // self.block_size < prefix_blocks:
+                continue
+            row_id = req_id if row_mapping is None else int(row_mapping[req_id])
+            if row_id < 0 or row_id >= len(block_rows):
+                raise _ForkPlanError("block-table row mapping is out of range")
+            if block_rows.shape[1] < prefix_blocks:
+                raise _ForkPlanError("block table cannot cover the shared prefix")
+            prefix = block_rows[row_id, :prefix_blocks]
+            if np.any(prefix < 0):
+                raise _ForkPlanError("active block IDs must be non-negative")
+            cohorts[prefix.tobytes()].append(int(req_id))
+        fork_reqs = np.array(
+            sorted(
+                req_id
+                for group in cohorts.values()
+                if len(group) >= policy.fork_min_queries
+                for req_id in group
+            ),
+            dtype=np.intp,
+        )
+        if len(fork_reqs) == 0:
+            return {}
+        fork_rows = fork_reqs if row_mapping is None else row_mapping[fork_reqs]
+        cache = getattr(self, "_fork_plan_cache", None)
+        if cache is None:
+            cache = self._fork_plan_cache = _ForkPlanCache()
+        plan = cache.build(
+            seq_lens=seq_lens[fork_reqs].tolist(),
+            block_rows=block_rows,
+            block_row_indices=fork_rows,
+            block_size=self.block_size,
+            head_ratio=self.num_heads_q // self.num_heads_kv,
+            min_shared_tokens=policy.fork_min_shared_tokens,
+            min_queries=policy.fork_min_queries,
+        )
+        if plan is None:
+            return {}
+        if metadata.block_table.shape[1] < max(
+            cdiv(int(seq_lens[i]), self.block_size) for i in fork_reqs
+        ):
+            raise _ForkPlanError("block table cannot cover the active sequences")
+        kwargs = self._pack_fork_kwargs(
+            replace(metadata, num_actual_tokens=len(fork_reqs), max_query_len=1),
+            plan,
+        )
+        if not kwargs:
+            return {}
+
+        flash_mask = query_lens > 0
+        flash_mask[fork_reqs] = False
+        flash_reqs = np.flatnonzero(flash_mask)
+        if len(flash_reqs) == 0:
+            return kwargs
+        device = metadata.block_table.device
+
+        def select_rows(rows: np.ndarray) -> slice | torch.Tensor:
+            if rows[-1] - rows[0] + 1 == len(rows):
+                return slice(int(rows[0]), int(rows[-1]) + 1)
+            return torch.tensor(rows, dtype=torch.long, device=device)
+
+        def select_tokens(rows: np.ndarray) -> slice | torch.Tensor:
+            if rows[-1] - rows[0] + 1 == len(rows):
+                return slice(int(starts[rows[0]]), int(starts[rows[-1] + 1]))
+            indices = np.concatenate(
+                [np.arange(starts[i], starts[i + 1], dtype=np.int64) for i in rows]
+            )
+            return torch.tensor(indices, device=device)
+
+        flash_rows = select_rows(flash_reqs)
+        flash_tokens = select_tokens(flash_reqs)
+        flash_starts = np.zeros(len(flash_reqs) + 1, dtype=np.int32)
+        np.cumsum(query_lens[flash_reqs], out=flash_starts[1:])
+        # The full batch's cascade and FA3 AOT schedule cannot describe a subset.
+        # Keep the original metadata intact for layers that cannot run Fork.
+        flash_metadata = replace(
+            metadata,
+            num_actual_tokens=int(flash_starts[-1]),
+            max_query_len=int(query_lens[flash_reqs].max()),
+            query_start_loc=torch.tensor(flash_starts, device=device),
+            max_seq_len=int(seq_lens[flash_reqs].max()),
+            seq_lens=metadata.seq_lens[flash_rows],
+            block_table=metadata.block_table[flash_rows],
+            slot_mapping=metadata.slot_mapping[flash_tokens],
+            use_cascade=False,
+            common_prefix_len=0,
+            cu_prefix_query_lens=None,
+            prefix_kv_lens=None,
+            suffix_kv_lens=None,
+            scheduler_metadata=None,
+            prefix_scheduler_metadata=None,
+            max_num_splits=0,
+        )
+        kwargs["fork_mixed_batch"] = _ForkMixedBatch(
+            len(fork_reqs), select_tokens(fork_reqs), flash_tokens, flash_metadata
+        )
+        return kwargs
 
     def _get_fork_cudagraph_workspace(
         self, device: torch.device
@@ -1755,8 +1910,6 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             num_reqs < self.vllm_config.attention_config.fork_min_queries
             or metadata.num_actual_tokens <= 1
         ):
-            return False
-        if metadata.max_query_len != 1:
             return False
         if metadata.causal is not True:
             return False
@@ -1880,6 +2033,49 @@ class ForkAttentionImpl(FlashAttentionImpl):
             )
 
         metadata = cast(ForkAttentionMetadata, attn_metadata)
+        mixed = metadata.fork_mixed_batch
+        if mixed is None:
+            self._forward_fork(
+                query, kv_cache, metadata, output, metadata.num_actual_tokens
+            )
+            return output
+
+        fork_query = query[mixed.fork_tokens]
+        fork_output = (
+            output[mixed.fork_tokens]
+            if isinstance(mixed.fork_tokens, slice)
+            else output.new_empty((mixed.num_fork_queries, *output.shape[1:]))
+        )
+        self._forward_fork(
+            fork_query, kv_cache, metadata, fork_output, mixed.num_fork_queries
+        )
+        if isinstance(mixed.fork_tokens, torch.Tensor):
+            output.index_copy_(0, mixed.fork_tokens, fork_output)
+
+        flash_query = query[mixed.flash_tokens]
+        flash_output = (
+            output[mixed.flash_tokens]
+            if isinstance(mixed.flash_tokens, slice)
+            else output.new_empty(
+                (mixed.flash_metadata.num_actual_tokens, *output.shape[1:])
+            )
+        )
+        # The attention layer has already written K/V for the entire batch.
+        super().forward(
+            layer, flash_query, key, value, kv_cache, mixed.flash_metadata, flash_output
+        )
+        if isinstance(mixed.flash_tokens, torch.Tensor):
+            output.index_copy_(0, mixed.flash_tokens, flash_output)
+        return output
+
+    def _forward_fork(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        metadata: ForkAttentionMetadata,
+        output: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
         required = (
             metadata.fork_num_split_per_seq,
             metadata.fork_query_tables,
@@ -1904,7 +2100,6 @@ class ForkAttentionImpl(FlashAttentionImpl):
         ):
             raise RuntimeError("ForkAttention metadata contains an invalid block ID")
 
-        num_tokens = metadata.num_actual_tokens
         fork_num_split_per_seq = cast(torch.Tensor, metadata.fork_num_split_per_seq)
         if fork_num_split_per_seq.shape[0] < num_tokens:
             raise RuntimeError(
@@ -1945,7 +2140,6 @@ class ForkAttentionImpl(FlashAttentionImpl):
             metadata.fork_max_split_per_seq,
             self.scale,
         )
-        return output
 
     def _can_run_fork(
         self,

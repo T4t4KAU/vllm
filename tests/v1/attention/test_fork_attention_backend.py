@@ -991,11 +991,15 @@ def test_fork_backend_falls_back_for_unsupported_tensor_dtype(
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("cache_layout", ["NHD", "HND"])
+@pytest.mark.parametrize(
+    "batch_kind", ["decode", "mixed_contiguous", "mixed_interleaved"]
+)
 def test_fork_backend_forward_matches_flash_attention(
     monkeypatch: pytest.MonkeyPatch,
     head_dim: int,
     dtype: torch.dtype,
     cache_layout: str,
+    batch_kind: str,
 ) -> None:
     torch.manual_seed(7)
     device = torch.device("cuda")
@@ -1013,28 +1017,71 @@ def test_fork_backend_forward_matches_flash_attention(
         block_rows.append(
             prefix_blocks + list(range(suffix_start, suffix_start + suffix_blocks))
         )
+    query_lens = [1] * batch_size
+    if batch_kind != "decode":
+        # One unrelated decode stays on Flash even beside a qualifying cohort.
+        block_rows[6] = list(range(4, 4 + len(block_rows[6])))
+        query_lens = (
+            [1, 1, 1, 1, 1, 1, 1, 3]
+            if batch_kind == "mixed_contiguous"
+            else [3, 1, 1, 2, 1, 1, 1, 1]
+        )
+    starts = torch.tensor([0] + list(np.cumsum(query_lens)), dtype=torch.int32)
+    num_tokens = int(starts[-1])
     block_table = torch.tensor(block_rows, dtype=torch.int32, device=device)
     seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
     base_metadata = _make_base_metadata(block_table, seq_lens)
+    base_metadata = replace(
+        base_metadata,
+        num_actual_tokens=num_tokens,
+        max_query_len=max(query_lens),
+        query_start_loc=starts.to(device),
+        slot_mapping=torch.arange(num_tokens, dtype=torch.int64, device=device),
+    )
     builder = _make_builder(
         block_size=block_size,
         num_heads_q=num_heads_q,
         num_heads_kv=num_heads_kv,
         head_dim=head_dim,
     )
+    builder.vllm_config.attention_config.fork_min_queries = 4
+    builder.vllm_config.attention_config.fork_min_shared_tokens = 128
+    # The runner's physical CPU row order can differ from the scheduled order.
+    row_mapping = np.arange(batch_size)[::-1].copy()
+    cpu_metadata = (
+        seq_lens.cpu(),
+        np.array(block_rows, dtype=np.int32)[row_mapping],
+        row_mapping,
+    )
     fork_metadata = ForkAttentionMetadata(
         **_flash_metadata_kwargs(base_metadata),
         **builder._build_fork_kwargs(
             base_metadata,
-            torch.arange(batch_size + 1, dtype=torch.int32),
+            starts,
             batch_size,
-            _cpu_metadata(block_table, seq_lens),
+            cpu_metadata,
         ),
     )
     assert fork_metadata.fork_enabled
+    mixed = fork_metadata.fork_mixed_batch
+    if batch_kind == "decode":
+        assert mixed is None
+    else:
+        assert mixed is not None
+        expected = [
+            int(starts[i]) for i in range(batch_size) if query_lens[i] == 1 and i != 6
+        ]
+        assert (
+            torch.arange(num_tokens, device=device)[mixed.fork_tokens].tolist()
+            == expected
+        )
+        assert mixed.num_fork_queries == len(expected)
+        assert isinstance(mixed.fork_tokens, slice) == (
+            batch_kind == "mixed_contiguous"
+        )
 
     query = torch.randn(
-        batch_size,
+        num_tokens + 3,
         num_heads_q,
         head_dim,
         dtype=dtype,
@@ -1052,7 +1099,7 @@ def test_fork_backend_forward_matches_flash_attention(
     kv_cache = torch.cat((key_cache, value_cache), dim=-1).transpose(1, 2)
     if cache_layout == "HND":
         kv_cache = kv_cache.contiguous()
-    output = torch.empty_like(query)
+    output = torch.full_like(query, -123)
     layer = SimpleNamespace(
         _q_scale=torch.ones(1, device=device),
         _k_scale=torch.ones(1, device=device),
@@ -1091,14 +1138,14 @@ def test_fork_backend_forward_matches_flash_attention(
     )
     assert fork_called
 
-    reference = torch.empty_like(query)
-    reference, _ = flash_attn_varlen_func(
-        q=query,
+    reference = torch.full_like(query, -123)
+    flash_attn_varlen_func(
+        q=query[:num_tokens],
         k=key_cache,
         v=value_cache,
-        out=reference,
-        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
-        max_seqlen_q=1,
+        out=reference[:num_tokens],
+        cu_seqlens_q=base_metadata.query_start_loc,
+        max_seqlen_q=max(query_lens),
         seqused_k=seq_lens,
         max_seqlen_k=seq_len,
         softmax_scale=1.0 / math.sqrt(head_dim),

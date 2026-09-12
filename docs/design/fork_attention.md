@@ -28,12 +28,13 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve <model> \
     --no-async-scheduling
 ```
 
-The Fork kernel handles causal, single-token decode batches with shared physical
+The Fork kernel handles causal, single-token decode queries with shared physical
 prefix blocks. It accepts FP16/BF16, head sizes 64/128/256, and block sizes that
 are multiples of 16 on NVIDIA GPUs with compute capability 8.0 or newer. The
 SM120 path uses Triton for head size 128 and a query/KV head ratio of four; other
-supported shapes use the CUDA operator. Prefill and batches that do not produce
-a Fork plan use the inherited FlashAttention implementation.
+supported shapes use the CUDA operator. In a mixed batch, qualifying decode
+groups use Fork while prefills and the other requests use the inherited
+FlashAttention implementation. Batches without a qualifying group use Flash.
 
 The default admission policy requires at least eight simultaneous decode queries
 sharing at least 16,384 tokens of an identical physical prefix. Both conditions
@@ -62,6 +63,15 @@ and physical KV at each decode step.
   invalidate the snapshot before reuse. The fixed metadata transfer is retained.
   Each immutable plan shares its graph segment mapping between capacity planning
   and packing; replacing the plan starts a fresh mapping cache.
+- **Mixed batches:** select single-token queries by their scheduled query lengths
+  and admit each cohort by its complete physical prefix. Plan only the admitted
+  queries; remap CPU block-table rows and output token positions independently.
+  Contiguous token ranges use tensor views, while interleaved requests gather
+  queries and scatter outputs back to their original positions. Flash receives
+  metadata for the remaining requests, with its own query offsets and sequence
+  lengths. The full batch's cascade and AOT schedule are excluded from that
+  subset. The original metadata remains available for layers that use Flash.
+  Both paths read the same KV cache after the upstream layer's single KV update.
 - **Planning:** reuse CPU block tables, forest snapshots, metadata buffers, and
   split-output workspaces. Prepare the exact plan before graph dispatch. Reuse
   complete shared edges across private-tail block boundaries once each query
@@ -85,6 +95,9 @@ and physical KV at each decode step.
   select a common Flash graph when the batch shapes permit it. Capture sizes
   below `fork_min_queries` are excluded. Configurations whose maximum context
   cannot contain the required complete prefix allocate no Fork graph workspace.
+  Mixed batches use the upstream piecewise graphs with dynamic attention
+  execution. Pure decode continues to use the captured Fork or Flash variants;
+  full Flash graph dispatch never consumes mixed Fork metadata.
 - **Operator addressing:** Triton widens physical page IDs before calculating KV
   offsets. The CUDA operator requires contiguous split counts, matching its
   device-side indexing.
@@ -118,11 +131,13 @@ registration were built as a separate extension; the remaining native extensions
 and generated dependencies came from the official v0.28.0 wheel.
 
 - The suites above plus `tests/v1/cudagraph/test_cudagraph_manager.py` passed:
-  **144 tests**. Backend numerical cases include both NHD/HND cache layouts,
+  **168 tests**. Backend numerical cases include both NHD/HND cache layouts,
   FP16/BF16, and head sizes 64/128/256. Regression cases cover Triton KV offsets
   beyond 4 GiB, strided split-count rejection, and long-prefix graph capacities.
   Incremental decode cases cover hierarchical cohorts, completed private chunks,
   cached rejections, physical-page changes, row remapping, and sequence rollback.
+  Mixed-batch numerical cases cover contiguous and interleaved requests,
+  unrelated decodes, physical CPU row permutations, and untouched output padding.
 - A single RTX 5090 Qwen3-VL-8B FP16 comparison checked the default admission
   policy in graph and eager execution against official v0.28.0 FlashAttention.
   Synthetic cases with a 4K prefix and eight branches, or a 16K prefix and two
@@ -153,5 +168,17 @@ and generated dependencies came from the official v0.28.0 wheel.
   FlashAttention. Repacking checks cover shrinking rows, capacity changes,
   capture resets, and recovery after a partially written failed pack.
   These synthetic measurements are not AgentX dataset scores.
+- Mixed prefill/decode was compared with the preceding Fork implementation on
+  one RTX 5090 using Qwen3-VL-8B FP16 and three runs per synthetic workload.
+  Every fourth decode step included either a 256-token tool continuation or
+  an unrelated 2,048-token prefill. Median mean mixed-step latency changed from
+  108.22 to 68.99 ms (16K/8, tool), 385.28 to 176.90 ms (16K/64, unrelated
+  prefill), and 984.12 to 183.45 ms (64K/64, tool). Two independent four-query
+  groups remained on Flash; mean latency over all measured steps changed from
+  43.21 to 43.65 ms. All 42,360 generated token positions per implementation
+  matched official FlashAttention. Separate eager and profiling runs matched
+  another 14,520 and 13,920 positions, respectively. Nsight verified mixed
+  Fork/Flash execution, one KV write per layer per step, and Flash-only execution
+  for rejected groups. These synthetic measurements are not AgentX scores.
 - Ruff, Python 3.12 mypy, C++/CUDA formatting, Markdown formatting, and the
   repository's import, SPDX, and CUDA API checks passed.
