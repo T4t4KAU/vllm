@@ -29,6 +29,9 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import (
+    EngineCoreEvent,
+    EngineCoreEventType,
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
@@ -41,6 +44,7 @@ from vllm.v1.engine.core_client import (
     MPClient,
     SyncMPClient,
 )
+from vllm.v1.engine.prefix_router import PrefixAwareDPRouter, RoutingPolicy
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.pool.late_interaction import (
@@ -306,6 +310,150 @@ def test_dplb_finished_requests_release_inflight():
 
     assert client.engine_inflight[engine] == 0
     assert req.request_id not in client.reqs_in_flight
+
+
+def _affinity_client(policy: RoutingPolicy, **kwargs) -> DPLBAsyncMPClient:
+    client = _make_dplb_client(num_engines=2)
+    client.prefix_router = PrefixAwareDPRouter(
+        num_ranks=2,
+        block_size=16,
+        load_slack=4,
+        warm_ttl_s=5,
+        min_prefix_blocks=4,
+        routing_policy=policy,
+        **kwargs,
+    )
+    return client
+
+
+def _affinity_request(tokens: list[int] | None = None) -> EngineCoreRequest:
+    req = make_request(SamplingParams(max_tokens=16), tokens or list(range(256)))
+    req.session_id = "session"
+    return req
+
+
+def _warm_affinity(client: DPLBAsyncMPClient, req: EngineCoreRequest) -> None:
+    req.data_parallel_rank = 0
+    client.get_core_engine_for_request(req)
+    asyncio.run(
+        DPLBAsyncMPClient.process_engine_outputs(
+            client,
+            EngineCoreOutputs(
+                outputs=[EngineCoreOutput(req.request_id, [7])],
+                finished_requests={req.request_id},
+            ),
+        )
+    )
+    client.lb_engines = [[0, 0, 0.0], [0, 0, 0.0]]
+    client.eng_start_index = 1
+
+
+@pytest.mark.parametrize("policy", ["prefix_aware", "session_aware", "session_sticky"])
+def test_dplb_affinity_reuses_completed_prefix_and_releases_work(policy):
+    client = _affinity_client(policy)
+    _warm_affinity(client, _affinity_request())
+    req = _affinity_request(list(range(256)) + [8, 9])
+    assert client.get_core_engine_for_request(req) == client.core_engines[0]
+    assert client.engine_inflight[client.core_engines[0]] == 1
+    asyncio.run(
+        DPLBAsyncMPClient.process_engine_outputs(
+            client,
+            EngineCoreOutputs(
+                finished_requests={req.request_id},
+            ),
+        )
+    )
+    assert not client.reqs_in_flight
+    assert client.prefix_router is not None
+    assert client.prefix_router._rank_work == [0, 0]
+
+
+@pytest.mark.parametrize("policy", ["prefix_aware", "session_aware", "session_sticky"])
+@pytest.mark.parametrize("reason", ["explicit", "salt", "expired", "reset"])
+def test_dplb_affinity_respects_override_namespace_and_lifetime(policy, reason):
+    now = [0.0]
+    client = _affinity_client(policy, clock=lambda: now[0])
+    _warm_affinity(client, _affinity_request())
+    req = _affinity_request()
+    if reason == "explicit":
+        req.data_parallel_rank = 1
+    elif reason == "salt":
+        req.cache_salt = "another-cache-namespace"
+    elif reason == "expired":
+        now[0] = 6
+    else:
+        assert client.prefix_router is not None
+        client.prefix_router.invalidate_residency()
+    assert client.get_core_engine_for_request(req) == client.core_engines[1]
+
+
+@pytest.mark.parametrize("policy", ["prefix_aware", "session_aware", "session_sticky"])
+def test_dplb_affinity_preserves_pressure_and_sticky_policy(policy):
+    client = _affinity_client(policy)
+    _warm_affinity(client, _affinity_request())
+    # The native KV pressure penalty makes this owner's score 8 versus 0.
+    client.lb_engines = [[2, 0, 1.0], [0, 0, 0.0]]
+    expected = 0 if policy == "session_sticky" else 1
+    assert (
+        client.get_core_engine_for_request(_affinity_request())
+        == client.core_engines[expected]
+    )
+
+
+@pytest.mark.parametrize("policy", ["prefix_aware", "session_aware", "session_sticky"])
+def test_dplb_affinity_cold_burst_preserves_native_inflight_floor(policy):
+    client = _affinity_client(policy)
+    for i in range(8):
+        req = _affinity_request([i] * 256)
+        req.session_id = str(i)
+        client.get_core_engine_for_request(req)
+        client.lb_engines = [[0, 0, 0.0], [0, 0, 0.0]]
+    assert sorted(client.engine_inflight.values()) == [4, 4]
+
+
+@pytest.mark.parametrize("transition", ["queued", "preempted", "reset"])
+def test_dplb_affinity_does_not_promote_uncomputed_or_reset_prefix(transition):
+    client = _affinity_client("prefix_aware")
+    req = _affinity_request()
+    req.data_parallel_rank = 0
+    client.get_core_engine_for_request(req)
+    output = EngineCoreOutput(req.request_id, [])
+    if transition == "preempted":
+        output.events = [EngineCoreEvent.new_event(EngineCoreEventType.PREEMPTED)]
+        output.new_token_ids = [7]
+    elif transition == "reset":
+        assert client.prefix_router is not None
+        client.prefix_router.invalidate_residency()
+        output.new_token_ids = [7]
+    asyncio.run(
+        DPLBAsyncMPClient.process_engine_outputs(
+            client,
+            EngineCoreOutputs(
+                outputs=[output],
+                finished_requests={req.request_id},
+            ),
+        )
+    )
+    client.lb_engines = [[0, 0, 0.0], [0, 0, 0.0]]
+    client.eng_start_index = 1
+    assert (
+        client.get_core_engine_for_request(_affinity_request())
+        == client.core_engines[1]
+    )
+
+
+def test_dplb_affinity_bounds_warm_prefixes_and_session_maps():
+    client = _affinity_client("session_aware", max_warm_requests=2)
+    for i in range(3):
+        req = _affinity_request([i] * 256)
+        req.session_id = str(i)
+        _warm_affinity(client, req)
+    assert client.prefix_router is not None
+    assert len(client.prefix_router._session_routes) == 2
+    assert len(client.prefix_router._warm_requests) == 2
+    evicted = _affinity_request([0] * 256)
+    evicted.session_id = "0"
+    assert client.get_core_engine_for_request(evicted) == client.core_engines[1]
 
 
 def test_apply_ready_response_syncs_block_size():

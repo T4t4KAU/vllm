@@ -172,6 +172,9 @@ if TYPE_CHECKING:
     VLLM_DP_RANK: int = 0
     VLLM_DP_RANK_LOCAL: int = -1
     VLLM_DP_SIZE: int = 1
+    VLLM_AGENTRIX_DP_ROUTING_POLICY: Literal[
+        "native", "prefix_aware", "session_aware", "session_sticky"
+    ] = "native"
     VLLM_USE_STANDALONE_COMPILE: bool = True
     VLLM_ENABLE_PREGRAD_PASSES: bool = True
     VLLM_USE_BREAKABLE_CUDAGRAPH: bool = False
@@ -1455,6 +1458,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # World size of the data parallel setting
     "VLLM_DP_SIZE": lambda: int(os.getenv("VLLM_DP_SIZE", "1")),
+    # Affinity policy for single-frontend internal DP; native keeps upstream LB.
+    "VLLM_AGENTRIX_DP_ROUTING_POLICY": env_with_choices(
+        "VLLM_AGENTRIX_DP_ROUTING_POLICY",
+        "native",
+        ["native", "prefix_aware", "session_aware", "session_sticky"],
+    ),
     # IP address of the master node in the data parallel setting
     "VLLM_DP_MASTER_IP": lambda: os.getenv("VLLM_DP_MASTER_IP", "127.0.0.1"),
     # Port of the master node in the data parallel setting

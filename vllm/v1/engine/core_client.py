@@ -50,6 +50,7 @@ from vllm.v1.engine import (
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
 from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.prefix_router import PrefixAwareDPRouter
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
@@ -1435,6 +1436,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
 
+    prefix_router: PrefixAwareDPRouter | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1468,8 +1471,31 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             len(self.core_engines) * self.client_index
         ) // client_count
 
+        policy = envs.VLLM_AGENTRIX_DP_ROUTING_POLICY
+        if policy != "native":
+            if client_count != 1 or vllm_config.parallel_config.enable_elastic_ep:
+                raise ValueError(
+                    "Agentrix DP affinity requires one API frontend and fixed DP ranks"
+                )
+            if not vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError("Agentrix DP affinity requires prefix caching")
+            self.prefix_router = PrefixAwareDPRouter(
+                num_ranks=len(self.core_engines),
+                block_size=vllm_config.cache_config.block_size,
+                load_slack=4,
+                warm_ttl_s=300,
+                min_prefix_blocks=4,
+                routing_policy=policy,
+            )
+            logger.info("Agentrix internal DP routing: %s", policy)
+
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
+        router = self.prefix_router
+        route_prefix = router is not None and router.should_route(request)
+        if router is not None:
+            router.last_route_reason = "explicit" if route_prefix else "ineligible"
+            router.last_affinity_blocks = 0
         if (eng_index := request.data_parallel_rank) is None and (
             eng_index := get_late_interaction_engine_index(
                 request.pooling_params, len(self.core_engines)
@@ -1480,6 +1506,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             num_engines = len(current_counts)
             min_score: float = sys.maxsize
             eng_index = 0
+            load_scores = [0.0] * num_engines if route_prefix else None
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
@@ -1502,9 +1529,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # the penalty stays off, preserving exact round-robin.
                     # Ramps from 0 at <=50% usage to 3x waiting at 100%.
                     score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
+                if load_scores is not None:
+                    load_scores[idx] = score
                 if score < min_score:
                     min_score = score
                     eng_index = idx
+            if route_prefix:
+                assert router is not None and load_scores is not None
+                eng_index = router.choose_rank(
+                    request, load_scores, eng_index, self.eng_start_index
+                )
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
             current_counts[eng_index][0] += self.client_count
@@ -1516,12 +1550,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self.eng_start_index = (self.eng_start_index + 1) % num_engines
 
         chosen_engine = self.core_engines[eng_index]
+        if route_prefix:
+            assert router is not None
+            router.add_request(request, eng_index)
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
         return chosen_engine
 
     async def call_utility_async(self, method: str, *args) -> Any:
+        if self.prefix_router is not None and method in (
+            "reset_prefix_cache",
+            "reset_encoder_cache",
+            "sleep",
+        ):
+            # Invalidate even if only some engines complete a collective reset.
+            self.prefix_router.invalidate_residency()
         # Only the result from the first engine is returned.
         return (
             await asyncio.gather(
@@ -1536,6 +1580,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if self.prefix_router is not None:
+            self.prefix_router.observe_outputs(
+                outputs.outputs, outputs.finished_requests
+            )
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
