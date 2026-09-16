@@ -409,16 +409,22 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       set(TORCH_SHADOW_INCLUDE_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/torch_patched_headers")
 
-      file(MAKE_DIRECTORY "${TORCH_SHADOW_INCLUDE_DIR}/torch/csrc/stable")
+      set(TORCH_SHADOW_STAGING_DIR "${TORCH_SHADOW_INCLUDE_DIR}/staging")
+      file(MAKE_DIRECTORY "${TORCH_SHADOW_STAGING_DIR}/torch/csrc/stable")
       file(COPY_FILE
         "${TORCH_INCLUDE_DIR}/${_stable_hdr_rel}"
-        "${TORCH_SHADOW_INCLUDE_DIR}/${_stable_hdr_rel}")
+        "${TORCH_SHADOW_STAGING_DIR}/${_stable_hdr_rel}")
 
       execute_process(
         COMMAND patch --batch --forward -p1
           "--input=${CMAKE_CURRENT_LIST_DIR}/cmake/patches/pytorch_stable_string.patch"
-        WORKING_DIRECTORY "${TORCH_SHADOW_INCLUDE_DIR}"
+        WORKING_DIRECTORY "${TORCH_SHADOW_STAGING_DIR}"
         COMMAND_ERROR_IS_FATAL ANY)
+
+      # Preserve the header timestamp when the patched contents are unchanged.
+      configure_file(
+        "${TORCH_SHADOW_STAGING_DIR}/${_stable_hdr_rel}"
+        "${TORCH_SHADOW_INCLUDE_DIR}/${_stable_hdr_rel}" COPYONLY)
 
       include_directories(BEFORE "${TORCH_SHADOW_INCLUDE_DIR}")
     endif()
@@ -1188,6 +1194,26 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
         "csrc/libtorch_stable/attention/fork/fork_fwd_hdim64.cu"
         "csrc/libtorch_stable/attention/fork/fork_fwd_hdim128.cu"
         "csrc/libtorch_stable/attention/fork/fork_fwd_hdim256.cu")
+      foreach(FORK_HEAD_DIM IN ITEMS 64 128 256)
+        foreach(FORK_DTYPE IN ITEMS fp16 bf16)
+          if(FORK_DTYPE STREQUAL "fp16")
+            set(FORK_CPP_DTYPE "cute::half_t")
+          else()
+            set(FORK_CPP_DTYPE "cutlass::bfloat16_t")
+          endif()
+          foreach(FORK_HEAD_RATIO IN ITEMS 1 2 4)
+            set(FORK_GENERATED_SRC
+              "${CMAKE_CURRENT_BINARY_DIR}/fork_attention/fork_fwd_hdim${FORK_HEAD_DIM}_${FORK_DTYPE}_r${FORK_HEAD_RATIO}.cu")
+            configure_file(
+              "csrc/libtorch_stable/attention/fork/fork_fwd_instantiation.cu.in"
+              "${FORK_GENERATED_SRC}" @ONLY)
+            set_source_files_properties("${FORK_GENERATED_SRC}" PROPERTIES
+              INCLUDE_DIRECTORIES
+                "${CMAKE_CURRENT_SOURCE_DIR}/csrc/libtorch_stable/attention/fork")
+            list(APPEND FORK_ATTN_SRCS "${FORK_GENERATED_SRC}")
+          endforeach()
+        endforeach()
+      endforeach()
       set_gencode_flags_for_srcs(
         SRCS "${FORK_ATTN_SRCS}"
         CUDA_ARCHS "${FORK_ARCHS}")

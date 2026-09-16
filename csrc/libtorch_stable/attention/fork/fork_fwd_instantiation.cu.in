@@ -1,0 +1,8 @@
+#include "fork_fwd_launch_template.h"
+
+namespace FORK_NAMESPACE {
+
+template void launch_head_group<@FORK_CPP_DTYPE@, @FORK_HEAD_DIM@, @FORK_HEAD_RATIO@>(
+    std::vector<fork_fwd_params>& params, cudaStream_t stream, int q_head_offset);
+
+}  // namespace FORK_NAMESPACE

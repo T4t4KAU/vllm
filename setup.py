@@ -326,6 +326,10 @@ class cmake_build_ext(build_ext):
         )
 
     def build_extensions(self) -> None:
+        # Editable wheel builds otherwise replace build_temp with a fresh directory.
+        if build_dir := os.environ.get("VLLM_BUILD_TEMP_DIR"):
+            self.build_temp = os.path.abspath(build_dir)
+
         # Ensure that CMake is present and working
         try:
             subprocess.check_output(["cmake", "--version"])
