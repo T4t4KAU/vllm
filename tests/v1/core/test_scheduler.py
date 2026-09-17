@@ -1228,6 +1228,158 @@ def test_prefix_cache_stats_counted_once_for_retried_then_scheduled_request():
     )
 
 
+def _capacity_bypass_setup(async_scheduling=False):
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        num_blocks=33,
+        max_num_batched_tokens=1024,
+        async_scheduling=async_scheduling,
+    )
+    running = create_requests(1, num_tokens=400, req_ids=["running"])[0]
+    scheduler.add_request(running)
+    scheduler.schedule()
+    return scheduler
+
+
+def _capacity_request(name, tokens):
+    # A different prefix from the running request, so it cannot borrow its KV.
+    return create_requests(2, num_tokens=tokens, req_ids=["unused", name])[1]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_capacity_bypass_admits_fitting_request_and_preserves_queue(
+    async_scheduling, enabled
+):
+    scheduler = _capacity_bypass_setup(async_scheduling)
+    assert scheduler.capacity_bypass_enabled is False
+    scheduler.capacity_bypass_enabled = enabled
+    head = _capacity_request("head", 200)
+    second = _capacity_request("second", 240)
+    short = _capacity_request("short", 32)
+    for request in (head, second, short):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert ("short" in output.num_scheduled_tokens) == enabled
+    assert list(scheduler.waiting) == (
+        [head, second] if enabled else [head, second, short]
+    )
+    assert "head" not in output.num_scheduled_tokens
+    assert "second" not in output.num_scheduled_tokens
+    if enabled:
+        assert scheduler._capacity_bypass_counts == {"head": 1, "second": 1}
+
+
+def test_capacity_bypass_bound_and_cancellation_release_waiters():
+    scheduler = _capacity_bypass_setup()
+    scheduler.capacity_bypass_enabled = True
+    head = _capacity_request("head", 200)
+    scheduler.add_request(head)
+    for i in range(5):
+        short = _capacity_request(f"short-{i}", 32)
+        scheduler.add_request(short)
+        output = scheduler.schedule()
+        assert (short.request_id in output.num_scheduled_tokens) == (i < 4)
+        if i < 4:
+            scheduler.finish_requests(short.request_id, RequestStatus.FINISHED_ABORTED)
+    assert scheduler._capacity_bypass_counts == {"head": 4}
+    scheduler.finish_requests("running", RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+    assert [r.req_id for r in output.scheduled_new_reqs] == ["head", "short-4"]
+    assert not scheduler._capacity_bypass_counts
+
+    # Cancelled waiters must not leave fairness state behind.
+    scheduler._capacity_bypass_counts["head"] = 2
+    scheduler.finish_requests("head", RequestStatus.FINISHED_ABORTED)
+    assert "head" not in scheduler._capacity_bypass_counts
+
+
+def test_capacity_bypass_failed_allocation_preserves_order_and_credits(monkeypatch):
+    scheduler = _capacity_bypass_setup()
+    scheduler.capacity_bypass_enabled = True
+    requests = [_capacity_request("head", 200), _capacity_request("short", 32)]
+    for request in requests:
+        scheduler.add_request(request)
+    original = scheduler.kv_cache_manager.allocate_slots
+
+    def reject_candidate(request, *args, **kwargs):
+        if request.request_id == "short":
+            return None
+        return original(request, *args, **kwargs)
+
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", reject_candidate)
+    assert "short" not in scheduler.schedule().num_scheduled_tokens
+    assert list(scheduler.waiting) == requests
+    assert not scheduler._capacity_bypass_counts
+
+
+def test_capacity_bypass_estimator_is_read_only_and_honors_watermark():
+    scheduler = _capacity_bypass_setup()
+    scheduler.capacity_bypass_enabled = True
+    head = _capacity_request("head", 200)
+    short = _capacity_request("short", 32)
+    for request in (head, short):
+        scheduler.add_request(request)
+    pool = scheduler.kv_cache_manager.block_pool
+    free = pool.get_num_free_blocks()
+    refs = [b.ref_cnt for b in pool.blocks]
+    assert scheduler._find_capacity_bypass(scheduler.waiting, 1024) == (short, [head])
+    assert pool.get_num_free_blocks() == free
+    assert [b.ref_cnt for b in pool.blocks] == refs
+    assert list(scheduler.waiting) == [head, short]
+    scheduler.kv_cache_manager.watermark_blocks = free
+    assert scheduler._find_capacity_bypass(scheduler.waiting, 1024) == (None, [])
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_capacity_bypass_reuses_active_prefix_without_recomputing(async_scheduling):
+    scheduler = _capacity_bypass_setup(async_scheduling)
+    scheduler.capacity_bypass_enabled = True
+    head = _capacity_request("head", 200)
+    warm = create_requests(1, num_tokens=420, req_ids=["warm"])[0]
+    scheduler.add_request(head)
+    scheduler.add_request(warm)
+    # Complete the simulated prefill before another request can reuse its KV.
+    running = scheduler.requests["running"]
+    scheduler.kv_cache_manager.cache_blocks(running, 400)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["warm"] == 20
+    assert scheduler.kv_cache_manager.prefix_cache_stats.hits == 400
+    assert list(scheduler.waiting) == [head]
+
+
+@pytest.mark.parametrize("guard", ["priority", "skipped", "connector", "fairness"])
+def test_capacity_bypass_respects_existing_queue_constraints(guard):
+    scheduler = _capacity_bypass_setup()
+    scheduler.capacity_bypass_enabled = True
+    head = _capacity_request("head", 200)
+    short = _capacity_request("short", 32)
+    for request in (head, short):
+        scheduler.add_request(request)
+    if guard == "priority":
+        scheduler.policy = type(scheduler.policy).PRIORITY
+    elif guard == "skipped":
+        scheduler.skipped_waiting.add_request(_capacity_request("skipped", 32))
+    elif guard == "connector":
+        scheduler.connector = Mock()
+    else:
+        scheduler._capacity_bypass_counts["head"] = 4
+    assert scheduler._find_capacity_bypass(scheduler.waiting, 1024) == (None, [])
+    assert list(scheduler.waiting) == [head, short]
+
+
+def test_capacity_bypass_lookahead_is_bounded():
+    scheduler = _capacity_bypass_setup()
+    scheduler.capacity_bypass_enabled = True
+    requests = [_capacity_request(str(i), 200) for i in range(9)]
+    short = _capacity_request("short", 32)
+    for request in [*requests, short]:
+        scheduler.add_request(request)
+    assert "short" not in scheduler.schedule().num_scheduled_tokens
+    assert list(scheduler.waiting) == [*requests, short]
+
+
 def test_scheduler_reset_prefix_cache():
     scheduler = create_scheduler(enable_prefix_caching=True)
     requests = create_requests(num_requests=10)

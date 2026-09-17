@@ -52,6 +52,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -307,6 +308,13 @@ class Scheduler(SchedulerInterface):
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
+        # Experimental, opt-in via --additional-config. Each waiting request
+        # may be overtaken at most four times before admission or cancellation.
+        self.capacity_bypass_enabled = (
+            isinstance(vllm_config.additional_config, dict)
+            and vllm_config.additional_config.get("agentrix_capacity_bypass") is True
+        )
+        self._capacity_bypass_counts: dict[str, int] = {}
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -472,6 +480,72 @@ class Scheduler(SchedulerInterface):
         if 0 < remaining < self.num_prefill_lookahead:
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
+
+    def _find_capacity_bypass(
+        self, queue: RequestQueue, token_budget: int
+    ) -> tuple[Request | None, list[Request]]:
+        """Find a fitting request without allocating blocks or changing the queue."""
+        manager = self.kv_cache_manager
+        coordinator = manager.coordinator
+        if (
+            not self.capacity_bypass_enabled
+            or self.policy != SchedulingPolicy.FCFS
+            or queue is not self.waiting
+            or self.skipped_waiting
+            or token_budget <= 0
+            or self.connector is not None
+            or self.ec_connector is not None
+            or self.lora_config is not None
+            or self.is_encoder_decoder
+            or self.use_pp
+            or self.parallel_config.data_parallel_size != 1
+            or self.num_lookahead_tokens
+            or self.num_prefill_lookahead
+            or not self.scheduler_reserve_full_isl
+            or not self.scheduler_config.enable_chunked_prefill
+            or len(coordinator.single_type_managers) != 1
+            or type(coordinator.single_type_managers[0]) is not FullAttentionManager
+            or self.block_size != self.hash_block_size
+        ):
+            return None, []
+
+        free = manager.block_pool.get_num_free_blocks()
+        overtaken: list[Request] = []
+        for request in itertools.islice(queue, 9):
+            if (
+                request.status != RequestStatus.WAITING
+                or request.num_computed_tokens
+                or request.has_encoder_inputs
+                or request.mm_features
+                or request.num_stale_output_tokens
+                or request.use_structured_output
+                or not manager.prefix_cache_lookup_enabled(request)
+            ):
+                break
+            if overtaken:
+                # Use the same full-sequence admission estimate as allocate_slots.
+                # Evictable cached blocks still consume free capacity when adopted.
+                blocks, cached, _ = coordinator.find_longest_cache_hit(
+                    request.block_hashes, request.num_tokens - 1
+                )
+                tokens = min(request.num_tokens, manager.max_model_len)
+                required = coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=tokens,
+                    new_computed_blocks=blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=cached,
+                    num_local_computed_tokens=cached,
+                    num_tokens_main_model=tokens,
+                    apply_admission_cap=True,
+                )
+                required += manager.watermark_blocks if self.running else 0
+                if required <= free:
+                    return request, overtaken
+            if self._capacity_bypass_counts.get(request.request_id, 0) >= 4:
+                break
+            overtaken.append(request)
+        return None, []
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -747,6 +821,8 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            capacity_candidate: Request | None = None
+            capacity_overtaken: list[Request] = []
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
@@ -760,7 +836,8 @@ class Scheduler(SchedulerInterface):
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
-                request = request_queue.peek_request()
+                request = capacity_candidate or request_queue.peek_request()
+                capacity_candidate = None
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -1051,6 +1128,17 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # A failed candidate stays in its original position. Do not
+                    # try another candidate or charge fairness credits on failure.
+                    if not capacity_overtaken and not step_skipped_waiting:
+                        capacity_candidate, capacity_overtaken = (
+                            self._find_capacity_bypass(
+                                request_queue,
+                                min(token_budget, input_budget - draft_slots),
+                            )
+                        )
+                        if capacity_candidate is not None:
+                            continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1079,7 +1167,22 @@ class Scheduler(SchedulerInterface):
                         request, num_new_local_computed_tokens
                     )
 
-                request = request_queue.pop_request()
+                if capacity_overtaken:
+                    request_queue.remove_request(request)
+                    for skipped in capacity_overtaken:
+                        skipped_id = skipped.request_id
+                        self._capacity_bypass_counts[skipped_id] = (
+                            self._capacity_bypass_counts.get(skipped_id, 0) + 1
+                        )
+                    logger.info(
+                        "Capacity bypass: request=%s overtaken=%s",
+                        request_id,
+                        [r.request_id for r in capacity_overtaken],
+                    )
+                    capacity_overtaken = []
+                else:
+                    request = request_queue.pop_request()
+                self._capacity_bypass_counts.pop(request_id, None)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -2389,6 +2492,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self._capacity_bypass_counts.pop(request.request_id, None)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
