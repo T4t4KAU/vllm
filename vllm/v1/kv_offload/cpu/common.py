@@ -4,6 +4,8 @@ from vllm.v1.kv_offload.base import BlockIDsLoadStoreSpec
 
 
 class CPUOffloadingMetrics:
+    CPU_CACHE_FILL_PERC = "vllm:kv_offload_cpu_cache_fill_perc"
+    CPU_EVICTED_BLOCKS = "vllm:kv_offload_cpu_evicted_blocks"
     STORES_SKIPPED = "vllm:kv_offload_stores_skipped"
     CPU_CACHE_USAGE_PERC = "vllm:kv_offload_cpu_cache_usage_perc"
     CPU_ALLOCATION_SIZE = "vllm:kv_offload_cpu_allocation_size"

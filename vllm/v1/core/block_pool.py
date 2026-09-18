@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import heapq
+from collections import OrderedDict
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+from itertools import count
+from math import isfinite
+from time import monotonic
 from typing import Any
 
 from vllm.distributed.kv_events import (
@@ -25,9 +31,132 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
     resolve_block_hashes,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _SessionTiming:
+    gap: float
+    finished: float | None = None
+    active: set[str] = field(default_factory=set)
+
+
+class _SessionCacheRetention:
+    """Experimental GPU cache leases; free leased blocks remain allocatable.
+
+    Only eviction order changes. Referenced blocks stay outside both free
+    lists, and leases never increment reference counts. Shared prefixes use
+    the latest lease regardless of which branch releases the last reference.
+    """
+
+    def __init__(
+        self,
+        queue: FreeKVCacheBlockQueue,
+        capacity: int,
+        protected_fraction: float = 0.25,
+        default_seconds: float = 15.0,
+        min_seconds: float = 2.0,
+        max_seconds: float = 30.0,
+        max_sessions: int = 256,
+    ):
+        if not isfinite(protected_fraction) or not 0 < protected_fraction <= 0.5:
+            raise ValueError("protected_fraction must be in (0, 0.5]")
+        if not all(isfinite(x) for x in (min_seconds, default_seconds, max_seconds)):
+            raise ValueError("Session retention times must be finite")
+        if not 0 < min_seconds <= default_seconds <= max_seconds:
+            raise ValueError(
+                "Require 0 < min_seconds <= default_seconds <= max_seconds"
+            )
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be positive")
+        self.queue = queue
+        self.max_blocks = int(capacity * protected_fraction)
+        self.default_seconds = default_seconds
+        self.min_seconds = min_seconds
+        self.max_seconds = max_seconds
+        self.max_sessions = max_sessions
+        self.sessions: OrderedDict[str, _SessionTiming] = OrderedDict()
+        self.leases: OrderedDict[int, tuple[float, int]] = OrderedDict()
+        self.free: OrderedDict[int, KVCacheBlock] = OrderedDict()
+        self.expirations: list[tuple[float, int, int]] = []
+        self._lease_order = count()
+
+    def on_request(self, request: Request) -> None:
+        sid = request.session_id
+        if not sid or request.resumable or request.lora_request or request.mm_features:
+            return
+        now = monotonic()
+        timing = self.sessions.get(sid)
+        if timing is None:
+            timing = _SessionTiming(self.default_seconds / 2)
+            self.sessions[sid] = timing
+        elif timing.finished is not None and not timing.active:
+            # Observe arrivals, never the replay trace's future timestamps.
+            gap = min(self.max_seconds, max(0.0, now - timing.finished))
+            timing.gap = 0.5 * timing.gap + 0.5 * gap
+            timing.finished = None
+        timing.active.add(request.request_id)
+        self.sessions.move_to_end(sid)
+        if len(self.sessions) > self.max_sessions:
+            self.sessions.popitem(last=False)
+
+    def on_finished(self, request: Request, blocks: Sequence[KVCacheBlock]) -> None:
+        timing = self.sessions.get(request.session_id) if request.session_id else None
+        if timing is None or request.request_id not in timing.active:
+            return
+        timing.active.remove(request.request_id)
+        if request.status not in (
+            RequestStatus.FINISHED_STOPPED,
+            RequestStatus.FINISHED_LENGTH_CAPPED,
+        ):
+            return
+        now = monotonic()
+        timing.finished = now
+        self.expire(now)
+        deadline = now + min(self.max_seconds, max(self.min_seconds, 2 * timing.gap))
+        # Retain a contiguous prefix, with earlier blocks surviving budget pressure.
+        for block in reversed(blocks[: self.max_blocks]):
+            if block.is_null or block.block_hash is None:
+                continue
+            bid = block.block_id
+            previous = self.leases.get(bid)
+            deadline_for_block = max(deadline, previous[0]) if previous else deadline
+            lease = (deadline_for_block, next(self._lease_order))
+            self.leases[bid] = lease
+            self.leases.move_to_end(bid)
+            heapq.heappush(self.expirations, (*lease, bid))
+            if len(self.leases) > self.max_blocks:
+                self.forget(next(iter(self.leases)))
+        # Repeated hits/evictions must not grow the expiry heap indefinitely.
+        if len(self.expirations) > 2 * self.max_blocks:
+            self.expirations = [(*lease, bid) for bid, lease in self.leases.items()]
+            heapq.heapify(self.expirations)
+
+    def forget(self, block_id: int, *, invalidated: bool = False) -> None:
+        self.leases.pop(block_id, None)
+        block = self.free.pop(block_id, None)
+        if block is not None:
+            if invalidated:
+                self.queue.prepend_n([block])
+            else:
+                # Rejoin the cached-block queue in logical tail-first order.
+                # Never put a reusable prefix ahead of empty scratch blocks.
+                self.queue.append(block)
+
+    def expire(self, now: float) -> None:
+        while self.expirations and self.expirations[0][0] <= now:
+            deadline, order, bid = heapq.heappop(self.expirations)
+            if self.leases.get(bid) == (deadline, order):
+                self.forget(bid)
+
+    def clear(self) -> None:
+        self.queue.prepend_n(list(self.free.values()))
+        self.free.clear()
+        self.leases.clear()
+        self.expirations.clear()
+        self.sessions.clear()
 
 
 class BlockHashToBlockMap:
@@ -194,6 +323,22 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+        self.session_retention: _SessionCacheRetention | None = None
+
+    def enable_session_retention(self, **config: Any) -> None:
+        """Enable experimental soft retention before any requests are admitted."""
+        if not self.enable_caching:
+            raise ValueError("GPU session retention requires prefix caching")
+        if self.session_retention is not None:
+            raise ValueError("GPU session retention is already configured")
+        self.session_retention = _SessionCacheRetention(
+            self.free_block_queue, self.num_gpu_blocks - 1, **config
+        )
+        logger.info(
+            "GPU session retention enabled: at most %d leased blocks; "
+            "all free leased blocks remain allocatable",
+            self.session_retention.max_blocks,
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -572,6 +717,8 @@ class BlockPool:
         self,
         block: KVCacheBlock,
     ) -> list[BlockHashWithGroupId]:
+        if self.session_retention is not None:
+            self.session_retention.forget(block.block_id, invalidated=True)
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
@@ -658,7 +805,19 @@ class BlockPool:
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        retention = self.session_retention
+        if retention is None:
+            ret = self.free_block_queue.popleft_n(num_blocks)
+        else:
+            retention.expire(monotonic())
+            ret = self.free_block_queue.popleft_n(
+                min(num_blocks, self.free_block_queue.num_free_blocks)
+            )
+            # Soft leases cannot reduce capacity or make allocation fail.
+            while len(ret) < num_blocks:
+                bid, block = retention.free.popitem(last=False)
+                retention.leases.pop(bid, None)
+                ret.append(block)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -710,7 +869,14 @@ class BlockPool:
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            if (
+                block.ref_cnt == 0
+                and not block.is_null
+                and (
+                    self.session_retention is None
+                    or self.session_retention.free.pop(block.block_id, None) is None
+                )
+            ):
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -727,12 +893,19 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        retention = self.session_retention
+        now = monotonic() if retention is not None else 0.0
         for block in ordered_blocks:
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif (
+                    retention is not None
+                    and retention.leases.get(block.block_id, (0.0, 0))[0] > now
+                ):
+                    retention.free[block.block_id] = block
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
@@ -782,6 +955,8 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        if self.session_retention is not None:
+            self.session_retention.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
@@ -803,7 +978,11 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.free_block_queue.num_free_blocks + (
+            len(self.session_retention.free)
+            if self.session_retention is not None
+            else 0
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

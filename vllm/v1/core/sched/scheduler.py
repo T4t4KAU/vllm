@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
@@ -54,7 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -65,6 +65,38 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _AgentPrefillBudget:
+    """Experimental prefill budget; decode and asynchronous KV loads are exempt."""
+
+    total: int
+    long: int
+    deferred: set[str] = field(default_factory=set)
+
+    @staticmethod
+    def remaining(request: Request, computed: int) -> int:
+        # Include replay of output tokens after preemption, but not live decode.
+        return max(request.num_prompt_tokens, request.num_tokens - 1) - computed
+
+    def limit(self, request: Request, computed: int, tokens: int) -> int:
+        remaining = self.remaining(request, computed)
+        if remaining <= 0 or tokens <= 0:
+            return tokens
+        allowed = min(tokens, self.total)
+        if remaining > 1024:
+            allowed = min(allowed, self.long)
+        if not allowed:
+            self.deferred.add(request.request_id)
+        return allowed
+
+    def consume(self, request: Request, computed: int, tokens: int) -> None:
+        remaining = self.remaining(request, computed)
+        used = min(tokens, max(0, remaining))
+        self.total -= used
+        if remaining > 1024:
+            self.long -= used
 
 
 class Scheduler(SchedulerInterface):
@@ -316,6 +348,80 @@ class Scheduler(SchedulerInterface):
         )
         self._capacity_bypass_counts: dict[str, int] = {}
 
+        self.adaptive_prefill_enabled = (
+            isinstance(vllm_config.additional_config, dict)
+            and vllm_config.additional_config.get("agentrix_adaptive_prefill") is True
+        )
+        self._adaptive_prefill_deferred: dict[str, int] = {}
+        if self.adaptive_prefill_enabled:
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                self.policy != SchedulingPolicy.FCFS
+                or not self.scheduler_config.enable_chunked_prefill
+                or not self.cache_config.enable_prefix_caching
+                or self.capacity_bypass_enabled
+                or self.lora_config is not None
+                or self.ec_connector is not None
+                or self.is_encoder_decoder
+                or self.scheduler_config.is_multimodal_model
+                or self.block_size != self.hash_block_size
+                or len(groups) != 1
+                or type(groups[0].kv_cache_spec) is not FullAttentionSpec
+                or groups[0].kv_cache_spec.sliding_window is not None
+                or groups[0].kv_cache_spec.attention_chunk_size is not None
+                or self.parallel_config.world_size != 1
+                or self.parallel_config.data_parallel_size != 1
+                or speculative_config is not None
+                or (
+                    kv_transfer_config is not None
+                    and kv_transfer_config.kv_connector != "OffloadingConnector"
+                )
+            ):
+                raise ValueError(
+                    "Adaptive prefill requires single-GPU full attention, FCFS, "
+                    "chunked prefill and prefix caching, without capacity bypass, "
+                    "LoRA, multimodal or speculative decoding; the optional "
+                    "connector must be OffloadingConnector"
+                )
+            logger.info(
+                "Adaptive prefill enabled: mixed_budget=2048 short_tokens=1024 "
+                "lookahead=8 full_probes=2 max_deferrals=4"
+            )
+
+        retention_config = (
+            vllm_config.additional_config.get("agentrix_gpu_session_retention")
+            if isinstance(vllm_config.additional_config, dict)
+            else None
+        )
+        if retention_config is not None:
+            groups = kv_cache_config.kv_cache_groups
+            if (
+                len(groups) != 1
+                or type(groups[0].kv_cache_spec) is not FullAttentionSpec
+                or groups[0].kv_cache_spec.sliding_window is not None
+                or groups[0].kv_cache_spec.attention_chunk_size is not None
+                or self.parallel_config.world_size != 1
+                or self.parallel_config.data_parallel_size != 1
+                or speculative_config is not None
+                or (
+                    vllm_config.kv_transfer_config is not None
+                    and vllm_config.kv_transfer_config.kv_connector
+                    != "OffloadingConnector"
+                )
+            ):
+                raise ValueError(
+                    "GPU session retention currently supports single-GPU full "
+                    "attention without speculative decoding, with an optional "
+                    "OffloadingConnector"
+                )
+            if not isinstance(retention_config, dict):
+                raise ValueError(
+                    "agentrix_gpu_session_retention must be a config object"
+                )
+            self.kv_cache_manager.block_pool.enable_session_retention(
+                **retention_config
+            )
+
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         # Blocks that async KV loads will overwrite this step, skipped from
@@ -547,6 +653,97 @@ class Scheduler(SchedulerInterface):
             overtaken.append(request)
         return None, []
 
+    def _agent_prefill_budget(self) -> _AgentPrefillBudget | None:
+        if not self.adaptive_prefill_enabled:
+            return None
+        if any(count >= 4 for count in self._adaptive_prefill_deferred.values()):
+            # Restore one ordinary FCFS step after four budget deferrals.
+            # This bounds policy-induced delay, not memory-admission waiting.
+            self._adaptive_prefill_deferred.clear()
+            return None
+
+        remaining = [
+            _AgentPrefillBudget.remaining(r, r.num_computed_tokens)
+            for r in self.running
+        ]
+        decoding = any(n <= 0 for n in remaining)
+        short_ready = any(0 < n <= 1024 for n in remaining)
+        manager = self.kv_cache_manager
+        coordinator = manager.coordinator
+        full_probes = 0
+        if (
+            not short_ready
+            and self._pause_state == PauseState.UNPAUSED
+            and len(self.running) + self.num_waiting_for_streaming_input
+            < self.max_num_running_reqs
+        ):
+            for request in itertools.islice(
+                itertools.chain(self.skipped_waiting, self.waiting), 8
+            ):
+                load_ready = (
+                    request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    and request.request_id in self.finished_recving_kv_req_ids
+                    and request.request_id not in self.failed_recving_kv_req_ids
+                )
+                if (
+                    (
+                        request.status
+                        not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                        and not load_ready
+                    )
+                    or request.num_stale_output_tokens
+                    or request.resumable
+                    or request.has_encoder_inputs
+                    or request.mm_features
+                ):
+                    continue
+                cached = request.num_computed_tokens
+                blocks = manager.empty_kv_cache_blocks.blocks
+                if not cached and manager.prefix_cache_lookup_enabled(request):
+                    min_cached = _AgentPrefillBudget.remaining(request, 0) - 1024
+                    if min_cached > 0:
+                        boundary = (min_cached - 1) // self.block_size
+                        if (
+                            boundary >= len(request.block_hashes)
+                            or manager.block_pool.get_cached_block(
+                                request.block_hashes[boundary], [0]
+                            )
+                            is None
+                        ):
+                            continue
+                    if full_probes == 2:
+                        break
+                    full_probes += 1
+                    # Read-only local probe: no connector lookups, touches,
+                    # allocation or cache-hit statistics until admission.
+                    # The boundary probe is only a negative filter: holes in
+                    # the earlier prefix still require this complete lookup.
+                    blocks, cached, _ = coordinator.find_longest_cache_hit(
+                        request.block_hashes, request.num_tokens - 1
+                    )
+                if _AgentPrefillBudget.remaining(request, cached) > 1024:
+                    continue
+                required = coordinator.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=min(request.num_tokens, self.max_model_len),
+                    new_computed_blocks=blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=cached,
+                    num_tokens_main_model=min(request.num_tokens, self.max_model_len),
+                    num_local_computed_tokens=cached,
+                    apply_admission_cap=True,
+                )
+                required += manager.watermark_blocks if self.running else 0
+                if required <= manager.block_pool.get_num_free_blocks():
+                    short_ready = True
+                    break
+        if not decoding and not short_ready:
+            return None
+        total = min(2048, self.max_num_scheduled_tokens)
+        return _AgentPrefillBudget(
+            total=total, long=total - min(1024, total // 2) if short_ready else total
+        )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -587,6 +784,7 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+        agent_prefill_budget = self._agent_prefill_budget()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
@@ -639,6 +837,10 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if agent_prefill_budget is not None:
+                num_new_tokens = agent_prefill_budget.limit(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -771,6 +973,10 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if agent_prefill_budget is not None:
+                agent_prefill_budget.consume(
+                    request, request.num_computed_tokens, num_new_tokens
+                )
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -823,6 +1029,7 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting = create_request_queue(self.policy)
             capacity_candidate: Request | None = None
             capacity_overtaken: list[Request] = []
+            prefill_skips = 0
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
@@ -1042,6 +1249,17 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    if agent_prefill_budget is not None:
+                        num_new_tokens = agent_prefill_budget.limit(
+                            request, num_computed_tokens, num_new_tokens
+                        )
+                        if not num_new_tokens:
+                            if agent_prefill_budget.total == 0 or prefill_skips >= 8:
+                                break
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            prefill_skips += 1
+                            continue
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1233,6 +1451,10 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if agent_prefill_budget is not None:
+                    agent_prefill_budget.consume(
+                        request, num_computed_tokens, num_new_tokens
+                    )
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1268,6 +1490,15 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        if agent_prefill_budget is not None:
+            for request_id in agent_prefill_budget.deferred:
+                self._adaptive_prefill_deferred[request_id] = (
+                    self._adaptive_prefill_deferred.get(request_id, 0) + 1
+                )
+        if self.adaptive_prefill_enabled:
+            for request_id in num_scheduled_tokens:
+                self._adaptive_prefill_deferred.pop(request_id, None)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -2420,6 +2651,9 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            retention = self.kv_cache_manager.block_pool.session_retention
+            if retention is not None:
+                retention.on_request(request)
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
@@ -2493,6 +2727,7 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
         self._capacity_bypass_counts.pop(request.request_id, None)
+        self._adaptive_prefill_deferred.pop(request.request_id, None)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -2520,6 +2755,11 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        retention = self.kv_cache_manager.block_pool.session_retention
+        if retention is not None:
+            retention.on_finished(
+                request, self.kv_cache_manager.get_blocks(request.request_id).blocks[0]
+            )
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 

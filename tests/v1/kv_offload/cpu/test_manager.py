@@ -23,6 +23,7 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+from vllm.v1.kv_offload.cpu.policies.lru import SessionLRUCachePolicy
 
 
 def make_req_context(
@@ -161,6 +162,139 @@ def test_cpu_eviction_removed_precedes_stored():
     assert removed_idx and stored_idx, events
     assert max(removed_idx) < min(stored_idx)
     assert all(event.medium == manager.medium for event in events)
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc", "session_lru"])
+def test_session_retention_survives_a_child_turn(monkeypatch, policy):
+    """A child renews its parent's lease without reading the parent's blocks."""
+    clock = [0.0]
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.cpu.policies.lru.monotonic", lambda: clock[0]
+    )
+    manager = CPUOffloadingManager(
+        num_blocks=4,
+        cache_policy=policy,
+        cache_policy_config={"retention_seconds": 10}
+        if policy == "session_lru"
+        else {},
+    )
+    parent = ReqContext(req_id="parent-turn", session_id="parent")
+    child = ReqContext(
+        req_id="child-turn",
+        session_id="child",
+        kv_transfer_params={"agentrix_session": {"root_session_id": "parent"}},
+    )
+    manager.on_new_request(parent)
+    manager.prepare_store(to_keys([1]), parent)
+    manager.touch(to_keys([1]), parent)
+    manager.complete_store(to_keys([1]), parent)
+    manager.on_request_finished(parent)
+    manager.prepare_store(to_keys([2, 3, 4]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([2, 3, 4]), _EMPTY_REQ_CTX)
+    clock[0] = 9
+    manager.on_new_request(child)
+    clock[0] = 20
+    manager.on_request_finished(child)
+    stored = manager.prepare_store(to_keys([5]), _EMPTY_REQ_CTX)
+    assert stored is not None
+    assert stored.evicted_keys == to_keys([2 if policy == "session_lru" else 1])
+    stats = manager.get_stats().reduce()
+    assert stats[CPUOffloadingMetrics.CPU_CACHE_FILL_PERC] == 1
+    assert stats[CPUOffloadingMetrics.CPU_EVICTED_BLOCKS] == 1
+    assert manager.get_stats().reduce()[CPUOffloadingMetrics.CPU_EVICTED_BLOCKS] == 0
+    if policy == "session_lru":
+        clock[0] = 31
+        stored = manager.prepare_store(to_keys([6]), _EMPTY_REQ_CTX)
+        assert stored is not None and stored.evicted_keys == to_keys([1])
+
+
+def test_session_retention_is_soft_and_transfer_safe():
+    """Leases cannot prevent stores or allow an in-flight load to be evicted."""
+    manager = CPUOffloadingManager(
+        num_blocks=3,
+        cache_policy="session_lru",
+        cache_policy_config={"protected_fraction": 1},
+    )
+    ctx = ReqContext(req_id="turn", session_id="agent")
+    manager.on_new_request(ctx)
+    manager.prepare_store(to_keys([1, 2, 3]), ctx)
+    manager.touch(to_keys([1, 2, 3]), ctx)
+    manager.complete_store(to_keys([1, 2, 3]), ctx)
+    manager.on_request_finished(ctx)
+    manager.prepare_load(to_keys([1]), ctx)
+    assert manager.prepare_store(to_keys([4, 5, 6]), ctx) is None
+    assert all(manager.lookup(k, ctx) == LookupResult.HIT for k in to_keys([1, 2, 3]))
+    stored = manager.prepare_store(to_keys([4, 5]), ctx)
+    assert stored is not None and set(stored.evicted_keys) == set(to_keys([2, 3]))
+    manager.complete_load(to_keys([1]), ctx)
+
+
+def test_session_retention_budget_shared_owners_and_cleanup(monkeypatch):
+    """Retention metadata is bounded; one expired owner cannot remove another."""
+    clock = [0.0]
+    monkeypatch.setattr(
+        "vllm.v1.kv_offload.cpu.policies.lru.monotonic", lambda: clock[0]
+    )
+    manager = CPUOffloadingManager(
+        num_blocks=4,
+        cache_policy="session_lru",
+        cache_policy_config={"retention_seconds": 10, "max_sessions": 2},
+    )
+    a = ReqContext(req_id="a-turn", session_id="a")
+    b = ReqContext(req_id="b-turn", session_id="b")
+    manager.on_new_request(a)
+    manager.prepare_store(to_keys([1, 2, 3, 4]), a)
+    manager.touch(to_keys([1, 2, 3, 4]), a)
+    manager.complete_store(to_keys([1, 2, 3, 4]), a)
+    manager.on_request_finished(a)
+    policy = manager._policy
+    assert isinstance(policy, SessionLRUCachePolicy)
+    assert set(policy._retained) == set(to_keys([1, 2]))
+    clock[0] = 5
+    manager.on_new_request(b)
+    manager.touch(to_keys([1]), b)
+    manager.on_request_finished(b)
+    manager.touch(to_keys([2, 3, 4]), _EMPTY_REQ_CTX)
+    clock[0] = 11
+    stored = manager.prepare_store(to_keys([5, 6, 7]), _EMPTY_REQ_CTX)
+    assert stored is not None and set(stored.evicted_keys) == set(to_keys([2, 3, 4]))
+    for i in range(6):
+        ctx = ReqContext(req_id=str(i), session_id=str(i))
+        manager.on_new_request(ctx)
+        manager.touch(to_keys([1]), ctx)
+        manager.on_request_finished(ctx)
+    assert len(policy._sessions) == 2
+    assert len(policy._retained[to_key(1)]) <= 4
+    manager.reset_cache()
+    manager.on_request_finished(b)
+    assert not policy._sessions and not policy._retained
+
+
+def test_session_retention_failure_is_atomic_and_missing_hints_use_lru():
+    manager = CPUOffloadingManager(num_blocks=3, cache_policy="session_lru")
+    manager.prepare_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1, 2, 3]), _EMPTY_REQ_CTX)
+    policy = manager._policy
+    assert policy.evict(2, set(to_keys([1, 2]))) is None
+    stored = manager.prepare_store(to_keys([4]), _EMPTY_REQ_CTX)
+    assert stored is not None and stored.evicted_keys == to_keys([1])
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"retention_seconds": 0},
+        {"retention_seconds": float("inf")},
+        {"protected_fraction": -1},
+        {"protected_fraction": 1.1},
+        {"max_sessions": 0},
+    ],
+)
+def test_session_retention_rejects_unbounded_configuration(config):
+    with pytest.raises(ValueError):
+        CPUOffloadingManager(
+            num_blocks=4, cache_policy="session_lru", cache_policy_config=config
+        )
 
 
 @pytest.mark.parametrize("eviction_policy", ["lru", "arc"])

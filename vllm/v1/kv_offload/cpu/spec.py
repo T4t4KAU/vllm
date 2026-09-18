@@ -32,6 +32,14 @@ class CPUOffloadingSpec(OffloadingSpec):
         cls, extra_config: dict[str, Any]
     ) -> dict[str, OffloadingMetricMetadata]:
         definitions: dict[str, OffloadingMetricMetadata] = {
+            CPUOffloadingMetrics.CPU_CACHE_FILL_PERC: OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of CPU cache slots containing KV data or pending stores."
+                ),
+            ),
+            CPUOffloadingMetrics.CPU_EVICTED_BLOCKS: OffloadingCounterMetadata(
+                documentation="Number of CPU cache blocks evicted to admit stores.",
+            ),
             CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(
                     "Fraction of CPU KV-cache space currently pinned by active "
@@ -138,6 +146,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                cache_policy_config=self.extra_config.get("cache_policy_config"),
             )
         return self._manager
 

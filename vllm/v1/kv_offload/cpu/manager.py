@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
+from typing import Any
 
 from typing_extensions import override
 
@@ -47,6 +48,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        cache_policy_config: dict[str, Any] | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
@@ -56,11 +58,14 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        self._policy: CachePolicy = policy_cls(
+            cache_capacity=num_blocks, **(cache_policy_config or {})
+        )
         # Track the number of blocks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
         self._num_write_pending_blocks: int = 0
+        self._evicted_blocks = 0
 
         self.store_threshold: int = store_threshold
         self.max_tracker_size: int = max_tracker_size
@@ -107,7 +112,12 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        self._policy.on_new_request(req_context)
         return RequestOffloadingContext()
+
+    @override
+    def on_request_finished(self, req_context: ReqContext) -> None:
+        self._policy.on_request_finished(req_context)
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -202,6 +212,7 @@ class CPUOffloadingManager(OffloadingManager):
 
             # cache-policy removes only idle blocks.
             self._num_evictable_cache_blocks -= len(evicted)
+            self._evicted_blocks += len(evicted)
             assert self._num_evictable_cache_blocks >= 0
 
             for key, block in evicted:
@@ -301,6 +312,15 @@ class CPUOffloadingManager(OffloadingManager):
         )
         usage = num_used / self._num_blocks if self._num_blocks > 0 else 0.0
         stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
+        resident = self._num_allocated_blocks - len(self._free_list)
+        stats.set_gauge(
+            CPUOffloadingMetrics.CPU_CACHE_FILL_PERC,
+            resident / self._num_blocks if self._num_blocks else 0.0,
+        )
+        stats.increase_counter(
+            CPUOffloadingMetrics.CPU_EVICTED_BLOCKS, self._evicted_blocks
+        )
+        self._evicted_blocks = 0
 
         for allocation_size in self.allocation_sizes_in_current_batch:
             stats.observe_histogram(
