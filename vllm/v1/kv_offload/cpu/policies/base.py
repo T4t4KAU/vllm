@@ -93,14 +93,6 @@ class CachePolicy(ABC):
         """Called when a block's ref_cnt transitions to 0."""
         return
 
-    def on_new_request(self, req_context: ReqContext) -> None:
-        """Observe a request joining the cache without acquiring block references."""
-        return
-
-    def on_request_finished(self, req_context: ReqContext) -> None:
-        """Observe the end of a turn; transfers may still be in flight."""
-        return
-
     def mark_non_evictable(self, key: OffloadKey) -> None:
         """Called when a block's ref_cnt transitions from 0."""
         return
