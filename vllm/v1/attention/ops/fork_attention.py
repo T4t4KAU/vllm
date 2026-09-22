@@ -160,6 +160,176 @@ def _fork_reduce(
         )
 
 
+@triton.jit
+def _fork_flatten_segment(
+    Q,
+    K,
+    V,
+    Metadata,
+    SplitOut,
+    SplitLSE,
+    q_batch: tl.constexpr,
+    q_head: tl.constexpr,
+    k_page: tl.constexpr,
+    k_row: tl.constexpr,
+    k_head: tl.constexpr,
+    v_page: tl.constexpr,
+    v_row: tl.constexpr,
+    v_head: tl.constexpr,
+    out_batch: tl.constexpr,
+    out_head: tl.constexpr,
+    out_split: tl.constexpr,
+    lse_batch: tl.constexpr,
+    lse_head: tl.constexpr,
+    metadata_width: tl.constexpr,
+    query_width: tl.constexpr,
+    chunk_tokens: tl.constexpr,
+    scale: tl.constexpr,
+    PAGE: tl.constexpr,
+    HEAD_RATIO: tl.constexpr,
+    RATIO: tl.constexpr,
+    D: tl.constexpr,
+    N: tl.constexpr,
+):
+    task, head, subgroup = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    base = Metadata + task * metadata_width
+    count = tl.load(base + 2 * query_width)
+    length = tl.load(base + 2 * query_width + 1)
+    if count > 0 and length > 0:
+        m = tl.arange(0, 32)
+        d = tl.arange(0, D)
+        query = tl.load(base + m // RATIO, mask=m // RATIO < count, other=0)
+        rank = tl.load(
+            base + query_width + m // RATIO, mask=m // RATIO < count, other=0
+        )
+        qh = head * HEAD_RATIO + subgroup * RATIO + m % RATIO
+        q = tl.load(
+            Q + query[:, None] * q_batch + qh[:, None] * q_head + d[None, :],
+            mask=(m // RATIO < count)[:, None],
+            other=0,
+        )
+        slots = base + 2 * query_width + 2
+        maximum = tl.full((32,), -float("inf"), tl.float32)
+        denominator = tl.full((32,), 0.0, tl.float32)
+        acc = tl.full((32, D), 0.0, tl.float32)
+        for start in tl.range(tl.cdiv(length, N), num_stages=2):
+            n = start * N + tl.arange(0, N)
+            bits = tl.load(slots + chunk_tokens + n, mask=n < length, other=0)
+            valid = (n < length) & (bits != 0)
+            slot = tl.load(slots + n, mask=valid, other=0)
+            page, row = slot // PAGE, slot % PAGE
+            k = tl.load(
+                K
+                + page[None, :] * k_page
+                + row[None, :] * k_row
+                + head * k_head
+                + d[:, None],
+                mask=valid[None, :],
+                other=0,
+            )
+            score = tl.dot(q, k) * (scale * 1.4426950408889634)
+            visible = (bits[None, :] & (1 << (m // RATIO))[:, None]) != 0
+            score = tl.where(visible & valid[None, :], score, -float("inf"))
+            next_maximum = tl.maximum(maximum, tl.max(score, 1))
+            safe_maximum = tl.where(next_maximum == -float("inf"), 0.0, next_maximum)
+            correction = tl.exp2(maximum - safe_maximum)
+            probability = tl.exp2(score - safe_maximum[:, None])
+            denominator = denominator * correction + tl.sum(probability, 1)
+            v = tl.load(
+                V
+                + page[:, None] * v_page
+                + row[:, None] * v_row
+                + head * v_head
+                + d[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            acc = tl.dot(probability.to(v.dtype), v, acc * correction[:, None])
+            maximum = next_maximum
+        result = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
+        lse = maximum + tl.log2(denominator)
+        tl.store(
+            SplitOut
+            + query[:, None] * out_batch
+            + qh[:, None] * out_head
+            + rank[:, None] * out_split
+            + d[None, :],
+            result,
+            mask=(m // RATIO < count)[:, None],
+        )
+        tl.store(
+            SplitLSE + query * lse_batch + qh * lse_head + rank,
+            lse,
+            mask=m // RATIO < count,
+        )
+
+
+def fork_flatten_attention(
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    split_out: torch.Tensor,
+    split_lse: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    counts: torch.Tensor,
+    metadata: torch.Tensor,
+    chunk_tokens: int,
+    max_splits: int,
+    scale: float,
+    *,
+    block_n: int = 128,
+    num_warps: int = 4,
+) -> None:
+    """Execute uniform cross-node KV chunks and one stable LSE reduction."""
+    heads, dim = q.shape[-2:]
+    head_ratio = heads // k.shape[2]
+    ratio = min(head_ratio, 4)
+    assert head_ratio % ratio == 0 and ratio in (1, 2, 4)
+    query_width = 32 // ratio
+    if dim == 256:
+        block_n = min(block_n, 64)
+    _fork_flatten_segment[(metadata.shape[0], k.shape[2], head_ratio // ratio)](
+        q,
+        k,
+        v,
+        metadata,
+        split_out,
+        split_lse,
+        q.stride(0),
+        q.stride(-2),
+        *k.stride()[:3],
+        *v.stride()[:3],
+        *split_out.stride()[:3],
+        *split_lse.stride()[:2],
+        metadata.shape[1],
+        query_width,
+        chunk_tokens,
+        scale,
+        k.shape[1],
+        head_ratio,
+        ratio,
+        dim,
+        block_n,
+        num_warps=num_warps,
+    )
+    _fork_reduce[(q.shape[0], heads)](
+        split_out,
+        split_lse,
+        counts,
+        out,
+        softmax_lse,
+        *split_out.stride()[:3],
+        *split_lse.stride()[:2],
+        out.stride(0),
+        out.stride(-2),
+        heads,
+        dim,
+        triton.next_power_of_2(max_splits),
+        num_warps=4,
+    )
+
+
 def fork_attention(
     out: torch.Tensor,
     softmax_lse: torch.Tensor,

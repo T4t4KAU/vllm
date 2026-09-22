@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.fork_attn import (
     ForkAttentionMetadataBuilder,
     _build_fork_plan,
     _flash_metadata_kwargs,
+    _flatten_fork_plan,
     _ForkCUDAGraphWorkspace,
     _ForkPlanError,
     _ForkSegment,
@@ -168,6 +169,39 @@ def test_fork_plan_preserves_hierarchical_prefixes_and_partial_blocks() -> None:
         [block for rank in sorted(segments) for block in segments[rank].block_ids]
         for segments in by_query
     ] == [[10, 11, 20], [10, 11, 21], [10, 12, 22]]
+
+
+@pytest.mark.parametrize("page,chunk", [(16, 64), (32, 80)])
+def test_flatten_crosses_nodes_without_changing_each_query_history(page, chunk):
+    batch = 19
+    rows = [[11, 12, 20 + i // 2, 100 + i] for i in range(batch)]
+    lengths = [3 * page + i % page + 1 for i in range(batch)]
+    plan = _build_fork_plan(
+        query_start_locs=list(range(batch + 1)),
+        seq_lens=lengths,
+        block_rows=rows,
+        num_actual_tokens=batch,
+        block_size=page,
+        head_ratio=4,
+        require_shared=True,
+    )
+    assert plan is not None
+    flat = _flatten_fork_plan(plan, page, chunk, 8)
+    histories: list[list[int]] = [[] for _ in range(batch)]
+    ranks: list[list[int]] = [[] for _ in range(batch)]
+    for segment in flat.segments:
+        assert sum(size for _, size, _ in segment.spans) == segment.num_kv_tokens
+        assert 0 < segment.num_kv_tokens <= chunk
+        for bit, query in enumerate(segment.query_ids):
+            ranks[query].append(segment.ranks[bit])
+            for slot, size, mask in segment.spans:
+                if mask & (1 << bit):
+                    histories[query].extend(range(slot, slot + size))
+    for query in range(batch):
+        expected = [block * page + i for block in rows[query] for i in range(page)]
+        assert histories[query] == expected[: lengths[query]]
+        assert ranks[query] == list(range(flat.num_splits_per_query[query]))
+    assert any(len({mask for _, _, mask in s.spans if mask}) > 1 for s in flat.segments)
 
 
 def test_fork_plan_uses_query_offsets_instead_of_request_indices() -> None:

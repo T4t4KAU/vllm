@@ -32,6 +32,14 @@ class AttentionConfig:
     """Minimum simultaneously decoded queries sharing the qualifying prefix
     before ForkAttention constructs a forest. Applies only to FORK_ATTN."""
 
+    fork_partition: Literal["node", "flatten"] = "node"
+    """Use node-local splits or balanced cross-node KV chunks in depth-first order."""
+
+    fork_flatten_chunk_tokens: int = Field(default=1024, ge=128)
+    """Target KV tokens per cross-node task, increased with active context length
+    to bound splits. Graph allocation reserves for the model's context limit.
+    Does not change physical KV page allocation."""
+
     minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "triton"
     """Sparse decode kernel used by the MiniMax M3 MSA backend."""
 

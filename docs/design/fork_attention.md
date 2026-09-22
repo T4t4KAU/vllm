@@ -48,6 +48,42 @@ they are not a hardware-independent performance crossover. Operator experiments
 can set them to 0 and 2 respectively. Admission uses the actual scheduled queries
 and physical KV at each decode step.
 
+## Cross-node balanced partitioning
+
+The optional `flatten` partition traverses the physical prefix forest depth
+first and divides its KV into uniform
+token chunks, allowing a chunk to cross node and page boundaries. Query cohorts
+split by the original planner are reunited before partitioning. Each chunk uses
+the union of its visible queries; compact visibility bits prevent a branch from
+reading sibling history. Attention uses one Triton CUDA segment kernel followed
+by LSE reduction, including per-query reduction slots for unbalanced trees.
+
+The depth-first partitioning and visibility masks follow the approach described
+in DeFT (ICLR 2025, arXiv:2404.00242). This implementation adapts that approach
+to ForkAttention's paged KV, query cohorts, and dynamic CUDA Graph metadata.
+
+```bash
+VLLM_USE_V2_MODEL_RUNNER=1 vllm serve <model> \
+    --attention-config '{"backend":"FORK_ATTN","fork_partition":"flatten","fork_flatten_chunk_tokens":1024}' \
+    --enable-prefix-caching --no-async-scheduling
+```
+
+`node` remains the default. Cross-node partitioning targets uneven, multi-level
+branch histories;
+it is not faster for every fanout or tail length. The target chunk size grows
+with the active context to bound the number of splits. Shapes exceeding captured
+CTA/split capacities or the 256 MiB workspace budget use the existing fallback.
+Graph allocation reserves for the configured context limit, while each batch
+uses its actual lengths for partitioning.
+
+This path reads the original paged KV through token-slot indices; it does not
+allocate a second KV cache or materialize a dense attention mask. Token maps and
+query masks occupy additional metadata memory. Their addresses remain fixed for
+CUDA Graph replay, unchanged prefix rows remain on the GPU, and only a changed
+range is transferred. A bounded address-span cache avoids repeatedly expanding
+contiguous physical pages on the host. Split outputs still require workspace;
+this optimization primarily changes attention execution and memory traffic.
+
 ## v0.28.0 integration
 
 - **KV cache:** inherit the upstream allocation and write path. Split the logical

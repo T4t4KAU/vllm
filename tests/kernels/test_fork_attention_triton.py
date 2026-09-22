@@ -12,7 +12,7 @@ from vllm.v1.attention.backends.fork_attn import (
     _build_fork_plan,
     _ForkCUDAGraphWorkspace,
 )
-from vllm.v1.attention.ops.fork_attention import fork_attention
+from vllm.v1.attention.ops.fork_attention import fork_attention, fork_flatten_attention
 
 pytestmark = pytest.mark.skipif(
     not (current_platform.is_cuda() and current_platform.has_device_capability(80)),
@@ -20,7 +20,76 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("heads,kvheads,dim", [(8, 8, 64), (16, 8, 128), (32, 4, 256)])
+def test_flatten_preserves_gqa_head_mapping(heads, kvheads, dim):
+    torch.manual_seed(11)
+    batch, page = 5, 16
+    rows = [[0, 1, 2 + i] for i in range(batch)]
+    lengths = [33 + i for i in range(batch)]
+    q = torch.randn(batch, 1, heads, dim, dtype=torch.float16, device="cuda")
+    cache = torch.randn(
+        batch + 2, 2, page, kvheads, dim, dtype=q.dtype, device=q.device
+    )
+    k, v = cache.unbind(1)
+    out = torch.empty_like(q)
+    plan = _build_fork_plan(
+        query_start_locs=list(range(batch + 1)),
+        seq_lens=lengths,
+        block_rows=rows,
+        num_actual_tokens=batch,
+        block_size=page,
+        head_ratio=heads // kvheads,
+        require_shared=True,
+    )
+    workspace = _ForkCUDAGraphWorkspace(
+        num_heads_q=heads,
+        num_heads_kv=kvheads,
+        head_dim=dim,
+        block_size=page,
+        max_model_len=64,
+        max_queries=batch,
+        max_ctas=16,
+        max_splits=4,
+        device=q.device,
+        flatten_chunk_tokens=32,
+    )
+    meta = workspace.pack(plan, query_capacity=batch, cta_capacity=16, split_capacity=4)
+    fork_flatten_attention(
+        out,
+        meta["fork_softmax_lse"],
+        meta["fork_split_out"],
+        meta["fork_split_lse"],
+        q,
+        k,
+        v,
+        meta["fork_num_split_per_seq"],
+        meta["fork_flat_metadata"],
+        meta["fork_flat_chunk_tokens"],
+        4,
+        dim**-0.5,
+    )
+    for query, (row, length) in enumerate(zip(rows, lengths)):
+        keys = (
+            k[row]
+            .reshape(-1, kvheads, dim)[:length]
+            .repeat_interleave(heads // kvheads, dim=1)
+            .float()
+        )
+        values = (
+            v[row]
+            .reshape(-1, kvheads, dim)[:length]
+            .repeat_interleave(heads // kvheads, dim=1)
+            .float()
+        )
+        scores = torch.einsum("hd,thd->ht", q[query, 0].float(), keys) * dim**-0.5
+        expected = torch.einsum("ht,thd->hd", scores.softmax(-1), values)
+        torch.testing.assert_close(
+            out[query, 0].float(), expected, atol=2e-3, rtol=2e-2
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("flatten", [False, True])
 @pytest.mark.parametrize(
     "batch,prefix,page,page_base",
     [
@@ -32,7 +101,9 @@ pytestmark = pytest.mark.skipif(
         pytest.param(2, 0, 16, 65536, id="kv-offset-above-int32"),
     ],
 )
-def test_fork_triton_replays_changed_forest(dtype, batch, prefix, page, page_base):
+def test_fork_triton_replays_changed_forest(
+    dtype, batch, prefix, page, page_base, flatten
+):
     torch.manual_seed(7)
     device = torch.device("cuda")
     heads, kvheads, dim = 32, 8, 128
@@ -69,12 +140,29 @@ def test_fork_triton_replays_changed_forest(dtype, batch, prefix, page, page_bas
         max_ctas=256,
         max_splits=32,
         device=device,
+        flatten_chunk_tokens=1024 if flatten else None,
     )
     meta = workspace.pack(
         None, query_capacity=capacity, cta_capacity=256, split_capacity=32
     )
 
     def run():
+        if flatten:
+            fork_flatten_attention(
+                out,
+                meta["fork_softmax_lse"],
+                meta["fork_split_out"],
+                meta["fork_split_lse"],
+                q,
+                k,
+                v,
+                meta["fork_num_split_per_seq"],
+                meta["fork_flat_metadata"],
+                meta["fork_flat_chunk_tokens"],
+                32,
+                1 / math.sqrt(dim),
+            )
+            return
         fork_attention(
             out,
             meta["fork_softmax_lse"],

@@ -5,6 +5,7 @@
 from collections import Counter, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass, field, fields, replace
+from functools import lru_cache
 from math import prod
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -36,6 +37,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.attention.ops.fork_attention import fork_attention as triton_fork_attention
+from vllm.v1.attention.ops.fork_attention import fork_flatten_attention
 from vllm.v1.utils import CpuGpuBuffer
 
 if TYPE_CHECKING:
@@ -72,6 +74,8 @@ class ForkAttentionMetadata(FlashAttentionMetadata):
     fork_split_out: torch.Tensor | None = None
     fork_split_lse: torch.Tensor | None = None
     fork_mixed_batch: _ForkMixedBatch | None = None
+    fork_flat_metadata: torch.Tensor | None = None
+    fork_flat_chunk_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,142 @@ class _ForkPlan:
     _cudagraph_segments: dict[
         tuple[int, int, int], tuple[tuple[int, _ForkSegment], ...]
     ] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _flat_plans: dict[tuple[int, int, int], "_ForkFlatPlan"] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True)
+class _ForkFlatSegment:
+    query_ids: tuple[int, ...]
+    ranks: tuple[int, ...]
+    # Physical token slot, span length, and visible-query bits within this task.
+    spans: tuple[tuple[int, int, int], ...]
+    num_kv_tokens: int
+
+
+@dataclass(frozen=True)
+class _ForkFlatPlan:
+    segments: tuple[_ForkFlatSegment, ...]
+    num_splits_per_query: tuple[int, ...]
+    max_block_id: int
+    chunk_tokens: int
+
+
+@lru_cache(maxsize=512)
+def _fork_page_spans(
+    block_ids: tuple[int, ...], length: int, block_size: int
+) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for block in block_ids:
+        slot, size = block * block_size, min(length, block_size)
+        if spans and spans[-1][0] + spans[-1][1] == slot:
+            spans[-1] = (spans[-1][0], spans[-1][1] + size)
+        else:
+            spans.append((slot, size))
+        length -= size
+    return tuple(spans)
+
+
+def _flatten_fork_plan(
+    plan: _ForkPlan, block_size: int, chunk_tokens: int, query_width: int
+) -> _ForkFlatPlan:
+    """Flatten the physical prefix forest without copying KV payloads.
+
+    Adjacent query cohorts for one KV edge are reunited before partitioning.
+    Partial leaf pages follow their last ancestor, including leaves that have
+    not yet produced a complete private page.
+    """
+    key = (block_size, chunk_tokens, query_width)
+    if key in plan._flat_plans:
+        return plan._flat_plans[key]
+    seq_lens = [0] * len(plan.num_splits_per_query)
+    for segment in plan.segments:
+        for query in segment.query_ids:
+            seq_lens[query] += segment.num_kv_tokens
+    chunk_tokens = max(
+        chunk_tokens, cdiv(cdiv(max(seq_lens), block_size), 24) * block_size
+    )
+    nodes: list[_ForkSegment] = []
+    partials: dict[int, _ForkSegment] = {}
+    for segment in plan.segments:
+        if len(segment.query_ids) == 1 and segment.num_kv_tokens < block_size:
+            partials[segment.query_ids[0]] = segment
+        elif (
+            nodes
+            and nodes[-1].block_ids == segment.block_ids
+            and nodes[-1].num_kv_tokens == segment.num_kv_tokens
+            and nodes[-1].rank == segment.rank
+            and not set(nodes[-1].query_ids).intersection(segment.query_ids)
+        ):
+            nodes[-1] = replace(
+                nodes[-1], query_ids=nodes[-1].query_ids + segment.query_ids
+            )
+        else:
+            nodes.append(segment)
+    last_node = {q: i for i, node in enumerate(nodes) for q in node.query_ids}
+    leaves: defaultdict[int, list[_ForkSegment]] = defaultdict(list)
+    for q, segment in partials.items():
+        leaves[last_node.get(q, -1)].append(segment)
+
+    counts = [0] * len(plan.num_splits_per_query)
+    segments: list[_ForkFlatSegment] = []
+    pieces: list[tuple[int, int, tuple[int, ...]]] = []
+    length = 0
+
+    def flush() -> None:
+        nonlocal length
+        query_sets = {qs for _, _, qs in pieces}
+        queries = sorted({q for qs in query_sets for q in qs})
+        for start in range(0, len(queries), query_width):
+            cohort = tuple(queries[start : start + query_width])
+            bits = {q: 1 << i for i, q in enumerate(cohort)}
+            masks = {qs: sum(bits.get(q, 0) for q in qs) for qs in query_sets}
+            spans = tuple((slot, size, masks[qs]) for slot, size, qs in pieces)
+            segments.append(
+                _ForkFlatSegment(
+                    cohort, tuple(counts[q] for q in cohort), spans, length
+                )
+            )
+            for q in cohort:
+                counts[q] += 1
+        pieces.clear()
+        length = 0
+
+    def append(node: _ForkSegment) -> None:
+        nonlocal length
+        for slot, valid in _fork_page_spans(
+            node.block_ids, node.num_kv_tokens, block_size
+        ):
+            offset = 0
+            while offset < valid:
+                take = min(valid - offset, chunk_tokens - length)
+                if (
+                    pieces
+                    and pieces[-1][0] + pieces[-1][1] == slot + offset
+                    and pieces[-1][2] == node.query_ids
+                ):
+                    pieces[-1] = (pieces[-1][0], pieces[-1][1] + take, node.query_ids)
+                else:
+                    pieces.append((slot + offset, take, node.query_ids))
+                length += take
+                offset += take
+                if length == chunk_tokens:
+                    flush()
+
+    for leaf in leaves[-1]:
+        append(leaf)
+    for index, node in enumerate(nodes):
+        append(node)
+        for leaf in leaves[index]:
+            append(leaf)
+    if pieces:
+        flush()
+    result = _ForkFlatPlan(
+        tuple(segments), tuple(counts), plan.max_block_id, chunk_tokens
+    )
+    plan._flat_plans[key] = result
+    return result
 
 
 @dataclass(frozen=True)
@@ -325,7 +465,14 @@ def _fork_cudagraph_metadata_bytes(
     block_size: int,
     head_ratio: int,
     cta_capacity: int,
+    flatten_chunk_tokens: int | None = None,
 ) -> int:
+    if flatten_chunk_tokens is not None:
+        flatten_chunk_tokens = max(
+            flatten_chunk_tokens, cdiv(cdiv(max_model_len, block_size), 24) * block_size
+        )
+        query_width = 32 // _kernel_head_ratio(head_ratio)
+        return cta_capacity * (2 * flatten_chunk_tokens + 2 * query_width + 2) * 8
     max_complete_blocks = max(1, max_model_len // block_size)
     block_capacity = _prefix_chunk_blocks(block_size, max_complete_blocks)
     kernel_ratio = _kernel_head_ratio(head_ratio)
@@ -404,6 +551,147 @@ def _get_cudagraph_segments(
     return plan._cudagraph_segments[key]
 
 
+class _ForkFlattenWorkspace:
+    """Fixed-address token maps; unchanged prefix tasks remain on the device."""
+
+    def __init__(
+        self,
+        *,
+        num_heads_q: int,
+        num_heads_kv: int,
+        head_dim: int,
+        block_size: int,
+        chunk_tokens: int,
+        max_queries: int,
+        max_ctas: int,
+        max_splits: int,
+        device: torch.device,
+        pin_memory: bool = False,
+        target_chunk_tokens: int | None = None,
+    ) -> None:
+        self.block_size, self.chunk_tokens = block_size, chunk_tokens
+        self.target_chunk_tokens = target_chunk_tokens or chunk_tokens
+        self.query_width = 32 // _kernel_head_ratio(num_heads_q // num_heads_kv)
+        self.max_queries, self.max_ctas, self.max_splits = (
+            max_queries,
+            max_ctas,
+            max_splits,
+        )
+        width = 2 * self.query_width + 2 + 2 * chunk_tokens
+        required = _fork_workspace_bytes(max_queries, num_heads_q, head_dim, max_splits)
+        if required + max_ctas * width * 8 > _MAX_FORK_WORKSPACE_BYTES:
+            raise _ForkWorkspaceLimitError("Flatten workspace exceeds 256 MiB")
+        self.metadata = CpuGpuBuffer(
+            max_ctas, width, dtype=torch.int64, device=device, pin_memory=pin_memory
+        )
+        self.counts = CpuGpuBuffer(
+            max_queries, dtype=torch.int32, device=device, pin_memory=pin_memory
+        )
+        self.split_out = torch.empty(
+            (max_queries, num_heads_q, max_splits, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.split_lse = torch.empty(
+            (max_queries, num_heads_q, max_splits), dtype=torch.float32, device=device
+        )
+        self.softmax_lse = torch.empty(
+            (max_queries, num_heads_q, 1), dtype=torch.float32, device=device
+        )
+        self.previous: tuple[_ForkFlatSegment, ...] = ()
+        self.capacity = 0
+        self.token_offsets = np.arange(chunk_tokens, dtype=np.int64)
+
+    def pack(
+        self,
+        plan: _ForkPlan | None,
+        *,
+        query_capacity: int,
+        cta_capacity: int,
+        split_capacity: int,
+    ) -> dict[str, Any]:
+        if not (
+            0 < query_capacity <= self.max_queries
+            and 0 < cta_capacity <= self.max_ctas
+            and 0 < split_capacity <= self.max_splits
+        ):
+            raise _ForkWorkspaceLimitError(
+                "Flatten capture exceeds its fixed workspace"
+            )
+        flat = (
+            _flatten_fork_plan(
+                plan, self.block_size, self.target_chunk_tokens, self.query_width
+            )
+            if plan is not None
+            else None
+        )
+        segments = flat.segments if flat is not None else ()
+        if flat is not None and (
+            len(segments) > cta_capacity
+            or len(flat.num_splits_per_query) > query_capacity
+            or max(flat.num_splits_per_query) > split_capacity
+            or flat.chunk_tokens > self.chunk_tokens
+        ):
+            raise _ForkWorkspaceLimitError("Flatten plan exceeds its captured capacity")
+        previous = self.previous if self.capacity == cta_capacity else ()
+        first, last = cta_capacity, 0
+        if self.capacity != cta_capacity:
+            self.metadata.np[:cta_capacity].fill(0)
+            first, last = 0, cta_capacity
+        elif len(segments) < len(previous):
+            self.metadata.np[len(segments) : len(previous), 2 * self.query_width].fill(
+                0
+            )
+            first, last = len(segments), len(previous)
+        self.capacity, self.previous = 0, ()
+        for index, segment in enumerate(segments):
+            if index < len(previous) and segment == previous[index]:
+                continue
+            row = self.metadata.np[index]
+            row.fill(0)
+            count = len(segment.query_ids)
+            row[:count] = segment.query_ids
+            row[self.query_width : self.query_width + count] = segment.ranks
+            row[2 * self.query_width : 2 * self.query_width + 2] = (
+                count,
+                segment.num_kv_tokens,
+            )
+            offset = 2 * self.query_width + 2
+            for slot, size, bits in segment.spans:
+                row[offset : offset + size] = slot + self.token_offsets[:size]
+                row[offset + self.chunk_tokens : offset + self.chunk_tokens + size] = (
+                    bits
+                )
+                offset += size
+            first, last = min(first, index), max(last, index + 1)
+        if first < last:
+            self.metadata.gpu[first:last].copy_(
+                self.metadata.cpu[first:last], non_blocking=True
+            )
+        self.counts.np[:query_capacity].fill(0)
+        if flat is not None:
+            self.counts.np[: len(flat.num_splits_per_query)] = flat.num_splits_per_query
+        counts = self.counts.copy_to_gpu(query_capacity)
+        self.capacity, self.previous = cta_capacity, segments
+        return {
+            "fork_enabled": True,
+            "fork_num_split_per_seq": counts,
+            "fork_query_tables": [],
+            "fork_block_tables": [],
+            "fork_num_seqs_per_ctas": [],
+            "fork_cta_ranks": [],
+            "fork_kv_in_ctas": [],
+            "fork_mnw": [],
+            "fork_max_split_per_seq": split_capacity,
+            "fork_max_block_id": flat.max_block_id if flat is not None else 0,
+            "fork_softmax_lse": self.softmax_lse[:query_capacity],
+            "fork_split_out": self.split_out[:query_capacity, :, :split_capacity],
+            "fork_split_lse": self.split_lse[:query_capacity, :, :split_capacity],
+            "fork_flat_metadata": self.metadata.gpu[:cta_capacity],
+            "fork_flat_chunk_tokens": self.chunk_tokens,
+        }
+
+
 class _ForkCUDAGraphWorkspace:
     """Fixed-address metadata and reduction workspace for one forest graph.
 
@@ -425,6 +713,7 @@ class _ForkCUDAGraphWorkspace:
         max_splits: int,
         device: torch.device,
         pin_memory: bool = False,
+        flatten_chunk_tokens: int | None = None,
     ) -> None:
         self.num_heads_q = num_heads_q
         self.head_dim = head_dim
@@ -435,6 +724,25 @@ class _ForkCUDAGraphWorkspace:
         self.device = device
         self.pin_memory = pin_memory
         self.kernel_head_ratio = _kernel_head_ratio(num_heads_q // num_heads_kv)
+        self.flatten_workspace = None
+        if flatten_chunk_tokens is not None:
+            self.flatten_workspace = _ForkFlattenWorkspace(
+                num_heads_q=num_heads_q,
+                num_heads_kv=num_heads_kv,
+                head_dim=head_dim,
+                block_size=block_size,
+                chunk_tokens=max(
+                    flatten_chunk_tokens,
+                    cdiv(cdiv(max_model_len, block_size), 24) * block_size,
+                ),
+                target_chunk_tokens=flatten_chunk_tokens,
+                max_queries=max_queries,
+                max_ctas=max_ctas,
+                max_splits=max_splits,
+                device=device,
+                pin_memory=pin_memory,
+            )
+            return
         max_complete_blocks = max(1, max_model_len // block_size)
         self.block_capacity = _prefix_chunk_blocks(block_size, max_complete_blocks)
 
@@ -537,6 +845,13 @@ class _ForkCUDAGraphWorkspace:
         cta_capacity: int,
         split_capacity: int,
     ) -> dict[str, Any]:
+        if self.flatten_workspace is not None:
+            return self.flatten_workspace.pack(
+                plan,
+                query_capacity=query_capacity,
+                cta_capacity=cta_capacity,
+                split_capacity=split_capacity,
+            )
         if query_capacity <= 0 or query_capacity > self.max_queries:
             raise _ForkWorkspaceLimitError(
                 "CUDA graph query capacity exceeds its fixed workspace"
@@ -1317,8 +1632,14 @@ def _get_plan_cudagraph_requirements(
     head_ratio: int,
     head_dim: int,
     block_size: int,
+    flatten_chunk_tokens: int | None = None,
 ) -> tuple[int, int]:
     """Return independent CTA and split buckets for graph dispatch."""
+    if flatten_chunk_tokens is not None:
+        flat = _flatten_fork_plan(
+            plan, block_size, flatten_chunk_tokens, 32 // _kernel_head_ratio(head_ratio)
+        )
+        return len(flat.segments), next_power_of_2(max(flat.num_splits_per_query))
     counts: defaultdict[int, int] = defaultdict(int)
     for tile_m, _ in _get_cudagraph_segments(
         plan,
@@ -1366,6 +1687,15 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         if envs.VLLM_BATCH_INVARIANT:
             return AttentionCGSupport.NEVER
         return cls._cudagraph_support
+
+    def _flatten_chunk_tokens(self) -> int | None:
+        policy = self.vllm_config.attention_config
+        if getattr(policy, "fork_partition", "node") != "flatten":
+            return None
+        ratio = self.num_heads_q // self.num_heads_kv
+        if ratio % _kernel_head_ratio(ratio) != 0:
+            return None
+        return policy.fork_flatten_chunk_tokens
 
     def _get_cudagraph_capture_limits(self) -> tuple[int, int, int]:
         """Return the largest captured (queries, CTAs, splits) workspace."""
@@ -1432,6 +1762,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 block_size=self.block_size,
                 head_ratio=self.num_heads_q // self.num_heads_kv,
                 cta_capacity=max_ctas,
+                flatten_chunk_tokens=self._flatten_chunk_tokens(),
             )
             if workspace_bytes <= _MAX_FORK_WORKSPACE_BYTES:
                 return max_queries, max_ctas, max_splits
@@ -1551,6 +1882,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
             head_ratio=self.num_heads_q // self.num_heads_kv,
             head_dim=self.headdim,
             block_size=self.block_size,
+            flatten_chunk_tokens=self._flatten_chunk_tokens(),
         )
 
     def set_cpu_metadata(
@@ -1678,13 +2010,59 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
         graph_max_splits = getattr(self, "_fork_cudagraph_max_splits", None)
         if graph_capacity is not None:
             assert graph_max_splits is not None
-            workspace = self._get_fork_cudagraph_workspace(metadata.block_table.device)
-            return workspace.pack(
+            graph_workspace = self._get_fork_cudagraph_workspace(
+                metadata.block_table.device
+            )
+            return graph_workspace.pack(
                 plan,
                 query_capacity=metadata.num_actual_tokens,
                 cta_capacity=graph_capacity,
                 split_capacity=graph_max_splits,
             )
+
+        chunk_tokens = self._flatten_chunk_tokens()
+        if chunk_tokens is not None:
+            flat = _flatten_fork_plan(
+                plan,
+                self.block_size,
+                chunk_tokens,
+                32 // _kernel_head_ratio(self.num_heads_q // self.num_heads_kv),
+            )
+            queries = next_power_of_2(len(flat.num_splits_per_query))
+            ctas = next_power_of_2(len(flat.segments))
+            splits = next_power_of_2(max(flat.num_splits_per_query))
+            if splits > _MAX_SPLITS_PER_QUERY:
+                return {}
+            workspace = getattr(self, "_fork_flat_workspace", None)
+            try:
+                if workspace is None or (
+                    queries > workspace.max_queries
+                    or ctas > workspace.max_ctas
+                    or splits > workspace.max_splits
+                    or flat.chunk_tokens > workspace.chunk_tokens
+                ):
+                    workspace = _ForkFlattenWorkspace(
+                        num_heads_q=self.num_heads_q,
+                        num_heads_kv=self.num_heads_kv,
+                        head_dim=self.headdim,
+                        block_size=self.block_size,
+                        chunk_tokens=flat.chunk_tokens,
+                        target_chunk_tokens=chunk_tokens,
+                        max_queries=queries,
+                        max_ctas=ctas,
+                        max_splits=splits,
+                        device=metadata.block_table.device,
+                        pin_memory=PIN_MEMORY,
+                    )
+                    self._fork_flat_workspace = workspace
+                return workspace.pack(
+                    plan,
+                    query_capacity=metadata.num_actual_tokens,
+                    cta_capacity=ctas,
+                    split_capacity=splits,
+                )
+            except _ForkWorkspaceLimitError:
+                return {}
 
         buffer_pool = getattr(self, "_fork_buffer_pool", None)
         if buffer_pool is None:
@@ -1864,6 +2242,7 @@ class ForkAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
                 max_splits=max_splits,
                 device=device,
                 pin_memory=PIN_MEMORY,
+                flatten_chunk_tokens=self._flatten_chunk_tokens(),
             )
             self._fork_cudagraph_workspace = workspace
         return workspace
@@ -2113,6 +2492,22 @@ class ForkAttentionImpl(FlashAttentionImpl):
             self.num_heads,
             self.head_size,
         )
+        if metadata.fork_flat_metadata is not None:
+            fork_flatten_attention(
+                out,
+                cast(torch.Tensor, metadata.fork_softmax_lse),
+                cast(torch.Tensor, metadata.fork_split_out),
+                cast(torch.Tensor, metadata.fork_split_lse),
+                q,
+                key_cache,
+                value_cache,
+                fork_num_split_per_seq,
+                metadata.fork_flat_metadata,
+                metadata.fork_flat_chunk_tokens,
+                metadata.fork_max_split_per_seq,
+                self.scale,
+            )
+            return
         use_triton = (
             self.head_size == 128
             and self.num_heads == 4 * self.num_kv_heads
