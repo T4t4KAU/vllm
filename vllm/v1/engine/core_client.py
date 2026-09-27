@@ -1566,15 +1566,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ):
             # Invalidate even if only some engines complete a collective reset.
             self.prefix_router.invalidate_residency()
-        # Only the result from the first engine is returned.
-        return (
-            await asyncio.gather(
-                *[
-                    self._call_utility_async(method, *args, engine=engine)
-                    for engine in self.core_engines
-                ]
-            )
-        )[0]
+        results = await asyncio.gather(
+            *[
+                self._call_utility_async(method, *args, engine=engine)
+                for engine in self.core_engines
+            ]
+        )
+        # A partial reset must not report that every replica's cache is cold.
+        if method == "reset_prefix_cache":
+            return all(results)
+        return results[0]
 
     @staticmethod
     async def process_engine_outputs(

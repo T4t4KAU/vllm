@@ -31,6 +31,7 @@ class _RequestPrefix:
     rank: int
     prefix: _Prefix
     work_units: int
+    remaining_output_tokens: int
     session_id: tuple[int, str] | None = None
     cacheable: bool = True
     resident: bool = False
@@ -289,6 +290,18 @@ class PrefixAwareDPRouter:
             + max_tokens * self.decode_token_weight
         )
 
+    def _refresh_work(self, record: _RequestPrefix, *, prefill_pending: bool) -> None:
+        work_units = record.remaining_output_tokens * self.decode_token_weight
+        if prefill_pending:
+            prefix = record.prefix
+            work_units += (
+                prefix.num_blocks * self.block_size
+                + len(prefix.tail)
+                + len(record.uncomputed_token_ids)
+            )
+        self._rank_work[record.rank] += work_units - record.work_units
+        record.work_units = work_units
+
     @staticmethod
     def _request_xarg(request: EngineCoreRequest, name: str) -> object | None:
         sampling_params = request.sampling_params
@@ -399,7 +412,7 @@ class PrefixAwareDPRouter:
             best = max(
                 eligible,
                 key=lambda r: (
-                    matches[r],
+                    matches[r][0],
                     -work[r],
                     -load_scores[r],
                     -((r - start_index) % self.num_ranks),
@@ -451,7 +464,11 @@ class PrefixAwareDPRouter:
         )
         session_id = self._request_session_id(request)
         self._requests[request.request_id] = _RequestPrefix(
-            rank, prefix, work_units, session_id=session_id
+            rank,
+            prefix,
+            work_units,
+            int(getattr(request.sampling_params, "max_tokens", 1) or 1),
+            session_id=session_id,
         )
         self._rank_work[rank] += work_units
         if (
@@ -508,9 +525,13 @@ class PrefixAwareDPRouter:
         """Discard active residency hints for requests whose blocks were freed."""
         for request_id in request_ids:
             record = self._requests.get(request_id)
-            if record is not None and record.resident:
+            if record is None:
+                continue
+            if record.resident:
                 self._decrement(self._resident[record.rank], record.prefix.keys)
                 record.resident = False
+            # Freed KV may need the entire context recomputed on resume.
+            self._refresh_work(record, prefill_pending=True)
 
     def observe_outputs(
         self,
@@ -528,6 +549,9 @@ class PrefixAwareDPRouter:
             record = self._requests.get(output.request_id)
             if record is None:
                 continue
+            record.remaining_output_tokens = max(
+                0, record.remaining_output_tokens - len(output.new_token_ids)
+            )
             events = output.events or ()
             # Events describe request history, so the latest scheduling
             # transition determines whether a prior preemption is still in
@@ -567,6 +591,7 @@ class PrefixAwareDPRouter:
                 # but none of its prefix may be advertised as resident until
                 # a later post-resume output confirms recomputation.
                 self._observe_generated_tokens(record, output.new_token_ids)
+                self._refresh_work(record, prefill_pending=True)
                 continue
             if event_resumed:
                 nonresident_requests.discard(output.request_id)
@@ -580,6 +605,10 @@ class PrefixAwareDPRouter:
                 and not output.new_token_ids
             ):
                 continue
+            if output.new_token_ids:
+                # A sampled token confirms prefill has completed. Subsequent
+                # output chunks reduce only the remaining decode budget.
+                self._refresh_work(record, prefill_pending=False)
             if not has_model_output or not record.cacheable:
                 continue
             if not record.resident:
