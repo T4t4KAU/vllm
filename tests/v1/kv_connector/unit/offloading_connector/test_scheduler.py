@@ -74,10 +74,11 @@ def _make_partial_tail_scheduler() -> OffloadingConnectorScheduler:
 
 def _make_partial_tail_request(
     scheduler: OffloadingConnectorScheduler,
+    max_offload_tokens: int | None = None,
 ) -> MagicMock:
     request = MagicMock()
     request.request_id = "req"
-    request.kv_transfer_params = None
+    request.kv_transfer_params = {"max_offload_tokens": max_offload_tokens}
     request.num_prompt_tokens = 30
     request.num_tokens = 30
     request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(7)]
@@ -107,8 +108,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -155,9 +156,40 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     assert recurrent_event.parent_block_hash is None
 
 
-def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
+@pytest.mark.parametrize("max_offload_tokens", [0, 16, 27, 28, None])
+def test_partial_tail_store_respects_request_offload_limit(max_offload_tokens):
+    """An excluded recurrent boundary must neither allocate nor abort a request."""
     scheduler = _make_partial_tail_scheduler()
-    request = _make_partial_tail_request(scheduler)
+    _make_partial_tail_request(scheduler, max_offload_tokens=max_offload_tokens)
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    req_status.group_states[1].block_ids[:] = [0, 21]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    if max_offload_tokens is None or max_offload_tokens >= 28:
+        assert len(jobs) == 1
+        [job] = jobs.values()
+        assert job.src_spec.block_ids.tolist() == [12, 99]
+        scheduler.manager.prepare_store.assert_called_once()
+    else:
+        assert not jobs
+        scheduler.manager.prepare_store.assert_not_called()
+        assert not req_status.transfer_jobs
+        assert not scheduler._block_id_to_pending_jobs
+        assert not scheduler._jobs
+
+
+@pytest.mark.parametrize("max_offload_tokens", [None, 0])
+def test_partial_lookup_returns_exact_boundary_and_group_load_keys(max_offload_tokens):
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(
+        scheduler, max_offload_tokens=max_offload_tokens
+    )
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()

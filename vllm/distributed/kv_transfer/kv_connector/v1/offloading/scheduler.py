@@ -1167,13 +1167,13 @@ class OffloadingConnectorScheduler:
             assert len(boundaries) == 1
             boundary = boundaries.pop()
             req = req_status.req
-            max_boundary = min(
-                req.num_prompt_tokens,
-                req_status.max_offload_tokens or req.num_prompt_tokens,
+            max_boundary = self._calc_num_offloadable_tokens(
+                req_status, req.num_prompt_tokens
             )
             assert boundary > 0
             assert boundary % self.config.tokens_per_hash == 0
-            assert boundary <= max_boundary
+            if boundary > max_boundary:
+                continue
 
             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
             assert self._cow_source_groups.issubset(cow_blocks)
